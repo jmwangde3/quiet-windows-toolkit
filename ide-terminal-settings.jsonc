@@ -1,0 +1,21 @@
+// Paste into each IDE's settings.json (back up the file first).
+// VS Code        : %APPDATA%\Code\User\settings.json
+// Cursor         : %APPDATA%\Cursor\User\settings.json
+// TRAE CN        : %APPDATA%\Trae CN\User\settings.json
+// TRAE SOLO CN   : %APPDATA%\TRAE SOLO CN\User\settings.json
+// Back up each IDE's settings.json before pasting; adjust profile paths for your machine.
+// "automationProfile.windows" is officially the task/debug profile in VS Code;
+// some AI IDEs reuse it for the agent shell. 不确定 具体版本是否走它，改完重启 IDE 验证。
+{
+  "terminal.integrated.profiles.windows": {
+    "PowerShell 7": {
+      "path": "%LOCALAPPDATA%\\Microsoft\\WindowsApps\\pwsh.exe",
+      "args": ["-NoLogo"]
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "PowerShell 7",
+  "terminal.integrated.automationProfile.windows": {
+    "path": "%LOCALAPPDATA%\\Microsoft\\WindowsApps\\pwsh.exe",
+    "args": ["-NoLogo", "-NoProfile"]
+  }
+}

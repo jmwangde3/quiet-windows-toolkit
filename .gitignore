@@ -1,0 +1,12 @@
+# 本机产物 / 临时文件不入库
+*.exe
+*.bak-*
+*.log
+Thumbs.db
+.DS_Store
+node_modules/
+_publish/
+bin/
+obj/
+.workbuddy/
+.trae/
