@@ -1,0 +1,59 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.30114.105
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{B11B9F4F-0BD8-4DFC-A70E-E75F8B3F7988}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuietMode.Core", "src\QuietMode.Core\QuietMode.Core.csproj", "{1891CE3C-9F93-4171-B123-8A5F8B28E959}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuietMode.Windows", "src\QuietMode.Windows\QuietMode.Windows.csproj", "{4B47BFAA-B60D-4B53-9E25-7362D6260668}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuietMode.Cli", "src\QuietMode.Cli\QuietMode.Cli.csproj", "{647BBD3F-80BF-4857-BD35-ED8C6502A3FD}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{A1B13623-D377-43AF-907C-84965C42EB05}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuietMode.Core.Tests", "tests\QuietMode.Core.Tests\QuietMode.Core.Tests.csproj", "{DDD77DBA-8C83-4169-957F-4329FE614443}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "QuietMode", "QuietMode", "{0640DC7B-A274-4859-8A5C-7E626A0912D5}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "QuietMode", "QuietMode\build\QuietMode.csproj", "{82DB1369-64FB-4558-B386-677736DB3C61}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{1891CE3C-9F93-4171-B123-8A5F8B28E959}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1891CE3C-9F93-4171-B123-8A5F8B28E959}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1891CE3C-9F93-4171-B123-8A5F8B28E959}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1891CE3C-9F93-4171-B123-8A5F8B28E959}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4B47BFAA-B60D-4B53-9E25-7362D6260668}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4B47BFAA-B60D-4B53-9E25-7362D6260668}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4B47BFAA-B60D-4B53-9E25-7362D6260668}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4B47BFAA-B60D-4B53-9E25-7362D6260668}.Release|Any CPU.Build.0 = Release|Any CPU
+		{647BBD3F-80BF-4857-BD35-ED8C6502A3FD}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{647BBD3F-80BF-4857-BD35-ED8C6502A3FD}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{647BBD3F-80BF-4857-BD35-ED8C6502A3FD}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{647BBD3F-80BF-4857-BD35-ED8C6502A3FD}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DDD77DBA-8C83-4169-957F-4329FE614443}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DDD77DBA-8C83-4169-957F-4329FE614443}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DDD77DBA-8C83-4169-957F-4329FE614443}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DDD77DBA-8C83-4169-957F-4329FE614443}.Release|Any CPU.Build.0 = Release|Any CPU
+		{82DB1369-64FB-4558-B386-677736DB3C61}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{82DB1369-64FB-4558-B386-677736DB3C61}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{82DB1369-64FB-4558-B386-677736DB3C61}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{82DB1369-64FB-4558-B386-677736DB3C61}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{1891CE3C-9F93-4171-B123-8A5F8B28E959} = {B11B9F4F-0BD8-4DFC-A70E-E75F8B3F7988}
+		{4B47BFAA-B60D-4B53-9E25-7362D6260668} = {B11B9F4F-0BD8-4DFC-A70E-E75F8B3F7988}
+		{647BBD3F-80BF-4857-BD35-ED8C6502A3FD} = {B11B9F4F-0BD8-4DFC-A70E-E75F8B3F7988}
+		{DDD77DBA-8C83-4169-957F-4329FE614443} = {A1B13623-D377-43AF-907C-84965C42EB05}
+		{82DB1369-64FB-4558-B386-677736DB3C61} = {0640DC7B-A274-4859-8A5C-7E626A0912D5}
+	EndGlobalSection
+EndGlobal

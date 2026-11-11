@@ -109,8 +109,24 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - `docs/LEGACY_AUDIT.md`：全部脚本入口、计划任务、注册表 / 服务 / 电源 / 磁盘 / 进程 / FanControl IPC 修改点，依赖图，缺口清单；未识别的系统修改 = 0。
   - `docs/LEGACY_BEHAVIOR.md`：夜间 / 白天 / 开机补跑 / Pause-ReArm / DISKIDLE / 自动静音的实测行为基线，含 2026-11-10 夜间实测异常。
   - `docs/ARCHITECTURE.md`：现状架构、v2 目标映射、Phase 0–7 路线与迁移安全要点。
-- **Phase 1 统一配置与快照 — 待开始**：`config.json` / `baseline.json` / 原子写 / ConfigValidator / ConfigMigrator / SnapshotManager，不改动运行时系统状态。
-- **Phase 2–7**：磁盘稳定身份、统一维护清单、单一 Worker 与调度、C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
+- **Phase 1 统一配置与快照 — 已完成**
+  - 新增 `src/QuietMode.Core`（配置模型、校验、迁移、原子写、快照模型、维护任务唯一清单）与 `src/QuietMode.Windows`（WMI / 任务 COM / 注册表 / 电源只读探测 + `SnapshotManager`）。
+  - `qmctl` 命令行：`config show|validate|init|migrate`、`snapshot create|verify|show`、`state show`、`disks list`。
+  - `C:\ProgramData\QuietMode\{config.json, state.json, baseline.json}`；`config.backup.json` 为 last-known-good，损坏自动回退。
+  - 21 项单测（`tests/QuietMode.Core.Tests`）+ `powershell\Test-QuietMode.ps1` 一键自检，全部通过。
+  - 实机演练：v1 `settings.ini` 迁移为 v2，磁盘 #0/#1 由编号解析为 `uniqueId`+`serialNumber`（非编号匹配）；baseline 采集 10 项任务 / SysMain / MaintenanceBoundary / DISKIDLE 1200s / 5 块磁盘。
+  - 详见 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)。本阶段所有代码路径均只读，不改系统状态。
+- **Phase 2–7**：磁盘稳定身份落地、统一维护执行、单一 Worker 与调度、C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
+
+```powershell
+# 编译 + 自检（不改系统状态）
+.\build\build.ps1
+.\powershell\Test-QuietMode.ps1
+
+# 查看当前配置 / 磁盘身份
+.\bin\qmctl.exe config validate
+.\bin\qmctl.exe disks list
+```
 
 审计结论：v1 存在两套并行闸门、维护任务清单在 6 处重复定义且不一致、白天恢复用硬编码默认值而非原始快照、磁盘身份只用磁盘编号、Worker 只报 `*_REQUESTED` 不回读验证等 10 项结构性缺陷。系统盘 / 页面文件保护与 DISKIDLE 独立性两项已满足，重构时不得回退。
 

@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 2,
+  "schedule": {
+    "enabled": true,
+    "mode": "override",
+    "nightStart": "23:58",
+    "dayStart": "10:02",
+    "startupOverrideEnabled": true,
+    "startupDayStart": "06:00",
+    "startupGraceMinutes": 15,
+    "reconcileIntervalMinutes": 10
+  },
+  "fan": {
+    "enabled": false,
+    "ipcPath": "",
+    "controlExe": "",
+    "normalProfile": "",
+    "silentProfile": "",
+    "flagPath": "",
+    "autoSwitch": {
+      "enabled": true,
+      "on": "23:58",
+      "off": "10:02"
+    }
+  },
+  "disks": {
+    "enabled": false,
+    "forceBusy": false,
+    "targets": []
+  },
+  "maintenance": {
+    "enabled": true,
+    "strictNightDisable": true,
+    "disableSysMainAtNight": true,
+    "maintenanceHour": 10,
+    "disableWake": true
+  },
+  "spinDown": {
+    "enabled": false,
+    "minutes": 20
+  },
+  "startup": {
+    "autoStart": false,
+    "restoreOnBoot": false
+  }
+}
