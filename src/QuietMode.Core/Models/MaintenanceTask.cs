@@ -36,6 +36,8 @@ namespace QuietMode.Core.Models
                 "存储完整性校验"),
             New(@"\Microsoft\Windows\Data Integrity Scan\", "Data Integrity Scan", "night-maintenance", true, false,
                 "存储完整性扫描（重复条目，v1 清单里出现两次）"),
+            New(@"\Microsoft\Windows\Data Integrity Scan\", "Data Integrity Scan for Crash Recovery", "crash-recovery", true, false,
+                "崩溃恢复完整性扫描；v1 清单整个漏掉这一条"),
             New(@"\Microsoft\Windows\Chkdsk\", "ProactiveScan", "night-maintenance", true, false,
                 "计划内 CHKDSK 预检"),
             New(@"\Microsoft\Windows\Shell\", "IndexerAutomaticMaintenance", "night-maintenance", true, false,
@@ -88,6 +90,46 @@ namespace QuietMode.Core.Models
         }
 
         public static List<MaintenanceTaskDefinition> GateTasks { get { return ForModule("gate"); } }
+
+        /// <summary>
+        /// 规格 §4.6：绝不允许被本工具停用的系统范围。清单里的人为错误会被 planner 拦下，
+        /// 而不是等到运行时才发现把 Windows Update 关了。
+        /// </summary>
+        private static readonly string[] _forbiddenPrefixes =
+        {
+            @"\Microsoft\Windows\WindowsUpdate\",
+            @"\Microsoft\Windows\Defender\",
+            @"\Microsoft\Windows\Windows Defender\",
+            @"\Microsoft\Windows\Firewall\",
+            @"\Microsoft\Windows\CertificateServicesClient\",
+            @"\Microsoft\Windows\BitLocker\"
+        };
+
+        public static IList<string> ForbiddenPathPrefixes { get { return Array.AsReadOnly(_forbiddenPrefixes); } }
+
+        /// <summary>返回命中的禁改前缀；允许时返回空字符串。</summary>
+        public static string ForbiddenPrefixOf(string taskPath)
+        {
+            string p = (taskPath ?? "").Trim();
+            foreach (string f in _forbiddenPrefixes)
+            {
+                if (p.StartsWith(f, StringComparison.OrdinalIgnoreCase)) return f;
+            }
+            return "";
+        }
+
+        /// <summary>清单自检：确认没有任何条目落在禁改范围内。空列表即通过。</summary>
+        public static List<string> SelfCheck()
+        {
+            List<string> problems = new List<string>();
+            foreach (MaintenanceTaskDefinition t in _all)
+            {
+                string hit = ForbiddenPrefixOf(t.Path);
+                if (hit.Length > 0) problems.Add(t.FullName + " 落在禁改范围 " + hit + "（规格 §4.6）");
+                if (t.NightDisableDefault && t.Protected) problems.Add(t.FullName + " 同时标记夜间停用与受保护，语义矛盾");
+            }
+            return problems;
+        }
 
         /// <summary>SysMain（原 SuperFetch）——夜间停用、白天按 baseline 恢复。</summary>
         public const string SysMainService = "SysMain";

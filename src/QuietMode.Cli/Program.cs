@@ -6,6 +6,7 @@ using System.Text;
 using QuietMode.Core.Configuration;
 using QuietMode.Core.Disks;
 using QuietMode.Core.Json;
+using QuietMode.Core.Maintenance;
 using QuietMode.Core.Models;
 using QuietMode.Core.Processes;
 using QuietMode.Windows;
@@ -82,6 +83,8 @@ namespace QuietMode.Cli
                     return StateCommand(paths, sub);
                 case "disks":
                     return DisksCommand(paths, sub, rest, force, apply, withProcess);
+                case "maint":
+                    return MaintCommand(paths, sub, rest, apply);
                 case "paths":
                     return PathsCommand(paths);
                 default:
@@ -633,6 +636,310 @@ namespace QuietMode.Cli
             return ctx;
         }
 
+        // ---------------- maint ----------------
+
+        private static int MaintCommand(QuietModePaths paths, string sub, List<string> rest, bool apply)
+        {
+            switch (sub)
+            {
+                case "list": return MaintList();
+                case "status": return MaintStatus(paths);
+                case "plan": return MaintPlan(paths, rest);
+                case "night":
+                case "day": return MaintSwitch(paths, sub, apply);
+                case "verify": return MaintVerify(paths, rest);
+                case "baseline-enable":
+                case "baseline-disable":
+                    return MaintBaselineSet(paths, rest, sub == "baseline-enable", apply);
+                default:
+                    Console.WriteLine("maint 子命令：list | status | plan <night|day> | night [--apply] | day [--apply] |");
+                    Console.WriteLine("              verify <night|day> | baseline-enable <序号|all> --apply");
+                    Console.WriteLine("              baseline-disable <序号|all> --apply");
+                    return 1;
+            }
+        }
+
+        private static int MaintList()
+        {
+            SystemObservation obs = MaintenanceProbe.Capture();
+            if (_json)
+            {
+                JsonObject o = new JsonObject();
+                JsonArray arr;
+                o.SetArray("tasks", out arr);
+                foreach (MaintenanceTaskDefinition def in MaintenanceCatalog.All)
+                {
+                    ObservedTask t = obs.FindTask(def.Path, def.Name);
+                    JsonObject item;
+                    arr.AddObject(out item);
+                    item.Set("module", def.Module);
+                    item.Set("fullName", def.FullName);
+                    item.Set("nightDisable", def.NightDisableDefault);
+                    item.Set("purpose", def.Purpose);
+                    item.Set("presence", t == null ? "Unknown" : t.Presence.ToString());
+                    item.Set("enabled", t != null && t.Enabled.HasValue ? (JsonNode)new JsonBool(t.Enabled.Value) : JsonNull.Instance);
+                    item.Set("state", t == null ? "" : (t.State ?? ""));
+                    item.Set("error", t == null ? "" : (t.Error ?? ""));
+                }
+                o.Set("elevated", obs.Elevated);
+                Emit(o);
+                return 0;
+            }
+            if (_quiet) return 0;
+
+            Console.WriteLine("MODULE           NIGHT TASK                                                        PRESENCE   ENABLED STATE");
+            foreach (MaintenanceTaskDefinition def in MaintenanceCatalog.All)
+            {
+                ObservedTask t = obs.FindTask(def.Path, def.Name);
+                string presence = t == null ? "Unknown" : t.Presence.ToString();
+                string enabled = t != null && t.Enabled.HasValue ? (t.Enabled.Value ? "on" : "off") : "?";
+                Console.WriteLine(Pad(def.Module, 17) + Pad(def.NightDisableDefault ? "y" : "-", 6)
+                                  + Pad(ShortTaskName(def.FullName), 60) + Pad(presence, 11) + Pad(enabled, 8)
+                                  + (t == null ? "" : t.State));
+            }
+            Console.WriteLine();
+            Console.WriteLine("禁改范围（规格 §4.6）：" + string.Join(" ", MaintenanceCatalog.ForbiddenPathPrefixes));
+            Console.WriteLine("elevated=" + obs.Elevated);
+            return 0;
+        }
+
+        /// <summary>表格里省掉公共前缀，避免长任务名被截断；JSON 里仍是全名。</summary>
+        private static string ShortTaskName(string fullName)
+        {
+            const string prefix = @"\Microsoft\Windows\";
+            string n = fullName ?? "";
+            if (n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) return n.Substring(prefix.Length);
+            return n;
+        }
+
+        private static int MaintStatus(QuietModePaths paths)
+        {
+            QuietModeConfig cfg;
+            int rc = LoadConfig(paths, out cfg);
+            if (rc != 0) return rc;
+
+            BaselineSnapshot baseline = new SnapshotManager(paths, cfg).Load();
+            SystemObservation obs = MaintenanceProbe.Capture();
+
+            if (_json)
+            {
+                JsonObject o = new JsonObject();
+                o.Set("observation", obs.ToJson());
+                o.Set("config", cfg.Maintenance.ToJson());
+                if (baseline != null) o.Set("baseline", baseline.ToJson());
+                JsonArray anomalies;
+                o.SetArray("baselineAnomalies", out anomalies);
+                foreach (string s in BaselineAnomalies(baseline)) anomalies.Add(s);
+                Emit(o);
+                return 0;
+            }
+            if (_quiet) return 0;
+
+            Console.WriteLine("maintenance.enabled        = " + cfg.Maintenance.Enabled);
+            Console.WriteLine("maintenanceHour            = " + cfg.Maintenance.MaintenanceHour);
+            Console.WriteLine("disableWake                = " + cfg.Maintenance.DisableWake);
+            Console.WriteLine("disableSysMainAtNight      = " + cfg.Maintenance.DisableSysMainAtNight);
+            Console.WriteLine("baseline.json              = " + (baseline == null ? "(未建立)" : paths.BaselinePath));
+            Console.WriteLine("elevated                   = " + obs.Elevated);
+            Console.WriteLine();
+
+            ObservedService svc = obs.FindService(MaintenanceCatalog.SysMainService);
+            Console.WriteLine("SysMain " + (svc == null || !svc.Exists
+                ? "不存在"
+                : "Start=" + svc.StartValue + " (" + svc.StartupType + ") Status=" + svc.Status));
+            foreach (ObservedRegistryValue r in obs.Registry)
+            {
+                Console.WriteLine(r.ValueName + " " + (r.Exists ? "= " + r.Value + " (" + r.Kind + ")" : "不存在"));
+            }
+            Console.WriteLine();
+
+            Console.WriteLine("TASK                                                        BASELINE NOW");
+            foreach (MaintenanceTaskDefinition def in MaintenanceCatalog.NightDisableTargets)
+            {
+                TaskSnapshot b = MaintenancePlanner.FindTask(baseline, def.Path, def.Name);
+                ObservedTask t = obs.FindTask(def.Path, def.Name);
+                string bText = b == null ? "?" : (!b.Exists.HasValue ? "?" : (b.Exists.Value ? (b.Enabled.HasValue ? (b.Enabled.Value ? "启用" : "禁用") : "?") : "不存在"));
+                string nText = t == null ? "?" : (t.Presence == TaskPresence.NotPresent ? "不存在"
+                                                 : t.Presence == TaskPresence.Unknown ? "读取失败"
+                                                 : (t.Enabled.HasValue ? (t.Enabled.Value ? "启用" : "禁用") : "?"));
+                Console.WriteLine(Pad(ShortTaskName(def.FullName), 60) + Pad(bText, 9) + nText);
+            }
+
+            List<string> pending = BaselineAnomalies(baseline);
+            if (pending.Count > 0)
+            {
+                Console.WriteLine();
+                Console.WriteLine("需要你决定的 baseline 异常：");
+                foreach (string s in pending) Console.WriteLine("  - " + s);
+                Console.WriteLine("  修正方式：qmctl maint baseline-enable <序号> --apply");
+            }
+            return 0;
+        }
+
+        /// <summary>baseline 里记为「禁用」的任务，白天永远不会被启用 —— 大概率是早期版本遗留。</summary>
+        private static List<string> BaselineAnomalies(BaselineSnapshot baseline)
+        {
+            List<string> list = new List<string>();
+            if (baseline == null) return list;
+            foreach (MaintenanceTaskDefinition def in MaintenanceCatalog.NightDisableTargets)
+            {
+                TaskSnapshot b = MaintenancePlanner.FindTask(baseline, def.Path, def.Name);
+                if (b == null || b.Exists != true || !b.Enabled.HasValue || b.Enabled.Value) continue;
+                list.Add(def.FullName + " 在 baseline 里就是「禁用」，白天不会恢复启用"
+                         + "（若这不是你的本意，说明快照拍在旧版本已禁用之后）");
+            }
+            return list;
+        }
+
+        private static int MaintPlan(QuietModePaths paths, List<string> rest)
+        {
+            string phase = rest.Count > 0 ? rest[0].ToLowerInvariant() : "";
+            if (phase != "night" && phase != "day") return Fail("用法：qmctl maint plan <night|day>");
+
+            QuietModeConfig cfg;
+            int rc = LoadConfig(paths, out cfg);
+            if (rc != 0) return rc;
+            BaselineSnapshot baseline = new SnapshotManager(paths, cfg).Load();
+            SystemObservation obs = MaintenanceProbe.Capture();
+
+            MaintenancePlan plan = phase == "night"
+                ? MaintenancePlanner.BuildNight(cfg, baseline, obs)
+                : MaintenancePlanner.BuildDay(cfg, baseline, obs);
+
+            if (_json) { Emit(plan.ToJson()); return 0; }
+            if (!_quiet) PrintPlan(plan);
+            return 0;
+        }
+
+        private static void PrintPlan(MaintenancePlan plan)
+        {
+            Console.WriteLine("计划阶段 " + plan.Phase + "，共 " + plan.Steps.Count + " 步：");
+            foreach (MaintenanceStep s in plan.Steps)
+            {
+                Console.WriteLine("  " + s.Order.ToString(CultureInfo.InvariantCulture).PadLeft(2) + ". "
+                                  + Pad(s.ActionText, 14) + s.Target
+                                  + (string.IsNullOrEmpty(s.DesiredValue) ? "" : " = " + s.DesiredValue)
+                                  + (s.Critical ? "" : "   (非关键)"));
+            }
+            if (plan.Notes.Count > 0)
+            {
+                Console.WriteLine("说明：");
+                foreach (string n in plan.Notes) Console.WriteLine("  - " + n);
+            }
+        }
+
+        private static int MaintSwitch(QuietModePaths paths, string phase, bool apply)
+        {
+            QuietModeConfig cfg;
+            int rc = LoadConfig(paths, out cfg);
+            if (rc != 0) return rc;
+            BaselineSnapshot baseline = new SnapshotManager(paths, cfg).Load();
+            if (baseline == null)
+            {
+                if (_json) Emit(new JsonObject().Set("ok", false).Set("error", "baseline.json 不存在，先运行 qmctl snapshot create"));
+                else Console.Error.WriteLine("baseline.json 不存在：先运行 qmctl snapshot create（白天恢复需要原始状态）");
+                return 2;
+            }
+
+            MaintenanceRun run = MaintenanceController.Run(paths, cfg, baseline, phase, apply, 240000);
+
+            if (_json)
+            {
+                JsonObject o = run.ToJson();
+                Emit(o);
+                if (!apply) return 0;
+                return run.Ok ? 0 : 2;
+            }
+            if (_quiet) return !apply ? 0 : (run.Ok ? 0 : 2);
+
+            PrintPlan(run.Plan);
+            Console.WriteLine();
+            if (!string.IsNullOrEmpty(run.Error)) Console.WriteLine("错误：" + run.Error);
+            if (!apply)
+            {
+                Console.WriteLine("（演练：未改动任何状态。加 --apply 才真正执行）");
+                return 0;
+            }
+
+            Console.WriteLine("执行结果：");
+            foreach (MaintenanceStep s in run.Plan.Steps) Console.WriteLine("  " + s.ToLine());
+            Console.WriteLine();
+            Console.WriteLine(run.Verification.ToText());
+            return run.Ok ? 0 : 2;
+        }
+
+        private static int MaintVerify(QuietModePaths paths, List<string> rest)
+        {
+            string phase = rest.Count > 0 ? rest[0].ToLowerInvariant() : "night";
+            if (phase != "night" && phase != "day") return Fail("用法：qmctl maint verify <night|day>");
+
+            QuietModeConfig cfg;
+            int rc = LoadConfig(paths, out cfg);
+            if (rc != 0) return rc;
+            BaselineSnapshot baseline = new SnapshotManager(paths, cfg).Load();
+            SystemObservation obs = MaintenanceProbe.Capture();
+
+            MaintenanceVerification v = phase == "night"
+                ? MaintenanceVerifier.VerifyNight(cfg, obs)
+                : MaintenanceVerifier.VerifyDay(cfg, baseline, obs);
+
+            if (_json) { JsonObject o = v.ToJson(); o.Set("elevated", obs.Elevated); Emit(o); return v.Verdict == MaintenanceVerdict.Ok ? 0 : 2; }
+            if (!_quiet) Console.WriteLine(v.ToText());
+            return v.Verdict == MaintenanceVerdict.Ok ? 0 : 2;
+        }
+
+        private static int MaintBaselineSet(QuietModePaths paths, List<string> rest, bool enable, bool apply)
+        {
+            if (rest.Count == 0) return Fail("用法：qmctl maint baseline-" + (enable ? "enable" : "disable") + " <序号|all> --apply");
+
+            QuietModeConfig cfg;
+            int rc = LoadConfig(paths, out cfg);
+            if (rc != 0) return rc;
+
+            SnapshotManager mgr = new SnapshotManager(paths, cfg);
+            BaselineSnapshot baseline = mgr.Load();
+            if (baseline == null) return Fail("baseline.json 不存在，先运行 qmctl snapshot create");
+
+            List<MaintenanceTaskDefinition> targets = MaintenanceCatalog.NightDisableTargets;
+            List<TaskSnapshot> changed = new List<TaskSnapshot>();
+
+            if (string.Equals(rest[0], "all", StringComparison.OrdinalIgnoreCase))
+            {
+                foreach (MaintenanceTaskDefinition def in targets)
+                {
+                    TaskSnapshot b = MaintenancePlanner.FindTask(baseline, def.Path, def.Name);
+                    if (b != null && b.Exists == true) { b.Enabled = enable; changed.Add(b); }
+                }
+            }
+            else
+            {
+                int index;
+                if (!int.TryParse(rest[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out index))
+                    return Fail("序号必须是整数或 all");
+                if (index < 0 || index >= targets.Count) return Fail("序号超出范围（0-" + (targets.Count - 1) + "）");
+                MaintenanceTaskDefinition def = targets[index];
+                TaskSnapshot b = MaintenancePlanner.FindTask(baseline, def.Path, def.Name);
+                if (b == null) return Fail("baseline 里没有 " + def.FullName);
+                b.Enabled = enable;
+                changed.Add(b);
+            }
+
+            if (changed.Count == 0) return Fail("没有可修改的条目");
+
+            if (!_json) foreach (TaskSnapshot b in changed)
+                Console.WriteLine("baseline " + b.FullName + " -> enabled=" + (enable ? "true" : "false"));
+            if (!_json && !apply)
+            {
+                Console.WriteLine("（演练：未写入。加 --apply 才修改 baseline.json）");
+                return 0;
+            }
+
+            mgr.Save(baseline, true);
+            if (_json) Emit(new JsonObject().Set("ok", true).Set("changed", changed.Count).Set("enabled", enable));
+            else if (!_quiet) Console.WriteLine("已写回 baseline.json（完整性哈希已重算）");
+            return 0;
+        }
+
         private static int PathsCommand(QuietModePaths paths)
         {
             if (_json)
@@ -685,6 +992,13 @@ namespace QuietMode.Cli
             Console.WriteLine("  disks offline [索引|all]     脱机（默认演练，--apply 才执行，--force 越过普通占用）");
             Console.WriteLine("  disks online  [索引|all]     联机（默认演练，--apply 才执行）");
             Console.WriteLine("  disks verify  [索引|all]     只回读当前状态");
+            Console.WriteLine("  maint list                  维护任务清单与当前存在/启用状态");
+            Console.WriteLine("  maint status                配置 + baseline 对照 + 需要决定的异常");
+            Console.WriteLine("  maint plan night|day        只算计划，不动系统");
+            Console.WriteLine("  maint night|day [--apply]   夜间禁用 / 白天恢复（默认演练）");
+            Console.WriteLine("  maint verify night|day      只读验证当前是否达成目标状态");
+            Console.WriteLine("  maint baseline-enable  <序号|all> --apply  把 baseline 纠正为「启用」");
+            Console.WriteLine("  maint baseline-disable <序号|all> --apply  把 baseline 纠正为「禁用」");
             Console.WriteLine();
             Console.WriteLine("退出码: 0 成功 / 1 一般失败 / 2 校验失败或操作未达成");
         }

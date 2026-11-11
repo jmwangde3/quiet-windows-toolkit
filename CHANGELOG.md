@@ -1,5 +1,40 @@
 # 变更记录
 
+## 2.0.0-phase3 — 2026-11-11
+
+Windows 维护管理重构。**不改变运行中的系统状态**：默认演练，`--apply` 才动手，未提权必然失败。
+
+### 新增
+
+- `src/QuietMode.Core/Maintenance/`
+  - `MaintenanceObservation.cs`：一次系统观测（任务 / 服务 / 注册表），`Present` / `NotPresent` / `Unknown` 三态。
+  - `MaintenancePlan.cs`：步骤模型（8 种动作）+ 5 种执行状态，新增 `NotRun` 区分「没跑」与「跳过」。
+  - `MaintenancePlanner.cs`：纯计划器，把规格 §4.2 / §4.3 的顺序固化成步骤列表。
+  - `MaintenanceVerifier.cs`：纯验证器，输出 `Ok` / `Degraded` / `Failed`。
+- `src/QuietMode.Windows/MaintenanceProbe.cs`：只读观测（Task Scheduler COM / 服务注册表 / 维护注册表）。
+- `src/QuietMode.Windows/MaintenanceController.cs`：出计划 → 脚本执行 → **重新观测并独立验证**。
+- `powershell/Modules/QuietMode.Maintenance.psm1`：每个写动作 `-ErrorAction Stop` + 写后复读。
+- `powershell/Maintenance/Invoke-MaintenanceOperation.ps1`：维护写操作唯一入口。
+- `powershell/Test-MaintenanceSafety.ps1`：只读集成测试（清单三态、计划只读、未提权必须失败）。
+- `qmctl maint list|status|plan|night|day|verify|baseline-enable|baseline-disable`。
+- `docs/MAINTENANCE.md`。
+- `MaintenanceCatalog.SelfCheck()`：清单自检，禁止条目落进 Windows Update / Defender / Firewall 等禁改范围。
+
+### 修正（相对 v1）
+
+- v1 的六处 `$MaintTasks` 数组漏掉 `Data Integrity Scan for Crash Recovery`，还重复了一条 `Data Integrity Scan`；v2 只有一处清单，且有自检。
+- `Regular Maintenance` 在本机**不存在**，v1 的"夜间禁用"一直是空操作；v2 按 `NotPresent` 处理并在输出里明说。
+- v1 只禁不恢复（`Regular Maintenance` 尤其）；v2 白天按 baseline 恢复，baseline 没记录的值一律不写。
+- v1 直接杀进程解决问题；v2 只按任务路径 `Stop-ScheduledTask`，不碰同名进程。
+- v1 靠"命令没报错"判断成功；v2 每次写后复读，再由 C# 独立复观测定结论。
+
+### 验证
+
+- 单测 60 项全过（新增 17 项：清单自检 2、夜间计划/验证 5、白天计划/验证 7、状态语义 3）。
+- `Test-QuietMode.ps1` → `ALL PASS`（新增「维护管理（只读集成测试）」「维护计划与验证」两步）。
+- 实机：`maint plan night` 11 步、`maint plan day` 2 步、`maint verify night` → `Failed`（7 个任务仍启用 + SysMain 未禁用，符合当前真实状态）；`maint night --apply` 未提权 → 全部步骤标 `[未执行]`、退出码 2。
+- 顺带修正 Phase 2 遗留的一处测试脆弱点：数据盘被占用时 `SAFETY_BLOCKED` 先于 `ELEVATION_REQUIRED` 生效，原断言只认后者。
+
 ## 2.0.0-phase2 — 2026-11-11
 
 磁盘管理重构。**不改变任何运行中的磁盘状态**：默认演练，`--apply` 才动手，且未提权必然失败。

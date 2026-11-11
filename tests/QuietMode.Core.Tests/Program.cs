@@ -48,6 +48,7 @@ namespace QuietMode.Core.Tests
             Run("时间解析边界", TestTimeText);
 
             RunDiskTests();
+            RunMaintenanceTests();
 
             Console.WriteLine();
             Console.WriteLine("通过 " + _pass + " / 失败 " + _fail);

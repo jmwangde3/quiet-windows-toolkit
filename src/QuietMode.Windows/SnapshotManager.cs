@@ -101,6 +101,14 @@ namespace QuietMode.Windows
                     s.Metadata.Complete = false;
                     s.CaptureNotes.Add(def.FullName + "：存在但未取到 XML 备份（" + t.Error + "）");
                 }
+                else if (t.Exists == true && t.Enabled == false && def.NightDisableDefault)
+                {
+                    // 拍快照时就是禁用：白天只会「恢复到禁用」，等于永远不开。
+                    // 这多半是旧版本禁用后没恢复留下的，必须让人知道而不是悄悄接受。
+                    s.CaptureNotes.Add(def.FullName + "：快照记录为「禁用」，白天不会恢复启用。"
+                                       + "若这不是你的本意，说明快照拍在旧版本已禁用之后；"
+                                       + "确认后可用 qmctl maint baseline-enable 修正");
+                }
 
                 s.ScheduledTasks.Add(t);
             }

@@ -128,8 +128,15 @@ try {
         $op = if ([bool]$disks[$dataIndex].isOffline) { 'online' } else { 'offline' }
         $r = Invoke-Qm @('--root', $tmp, 'disks', $op, "$dataIndex", '--apply')
         if ($r.Text -match ('OK ' + $op.ToUpperInvariant())) { throw "未提权却报告成功：$($r.Text)" }
-        if ($r.Text -notmatch 'ELEVATION_REQUIRED') { throw "未返回 ELEVATION_REQUIRED：$($r.Text)" }
         if ($r.Exit -ne 2) { throw "期望退出码 2，实际 $($r.Exit)" }
+
+        # 只要没成功就是正确行为。具体是被哪一道闸门挡住取决于现场：
+        # 磁盘正被占用 → SAFETY_BLOCKED；干净但没提权 → ELEVATION_REQUIRED。
+        if ($r.Text -match 'SAFETY_BLOCKED') {
+            Write-Host '    SAFETY_BLOCKED（检测到占用，先于提权检查生效）' -ForegroundColor DarkGray
+        } elseif ($r.Text -notmatch 'ELEVATION_REQUIRED') {
+            throw "既没成功也没给出拒绝原因：$($r.Text)"
+        }
     }
 }
 finally {

@@ -110,6 +110,29 @@ Step '磁盘安全闸门（只读集成测试）' {
     if ($LASTEXITCODE -ne 0) { throw "磁盘安全测试失败（退出码 $LASTEXITCODE）" }
 }
 
+Step '维护管理（只读集成测试）' {
+    $script = Join-Path $PSScriptRoot 'Test-MaintenanceSafety.ps1'
+    $out = & $script
+    $out | ForEach-Object { Write-Host ("    " + $_) }
+    if ($LASTEXITCODE -ne 0) { throw "维护管理测试失败（退出码 $LASTEXITCODE）" }
+}
+
+Step '维护计划与验证（只读）' {
+    $paths = Get-QuietModePaths -Root $Root
+    if (-not (Test-Path -LiteralPath $paths.baseline)) {
+        Write-Host '    SKIP  尚未建立 baseline' -ForegroundColor DarkGray
+        return
+    }
+    foreach ($phase in @('night', 'day')) {
+        $p = Invoke-QuietModeToolJson -Arguments @('maint', 'plan', $phase) -Root $Root
+        if ($null -eq $p.Data) { throw "maint plan $phase 无输出" }
+        Write-Host ("    {0,-5} 计划 {1} 步" -f $phase, @($p.Data.steps).Count)
+    }
+    $v = Invoke-QuietModeToolJson -Arguments @('maint', 'verify', 'night') -Root $Root
+    if ($null -eq $v.Data) { throw 'maint verify night 无输出' }
+    Write-Host ("    verify night -> " + $v.Data.verdictText) -ForegroundColor DarkGray
+}
+
 Write-Host ''
 if ($failures.Count -eq 0) {
     Write-Host 'ALL PASS' -ForegroundColor Green

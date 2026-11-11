@@ -7,6 +7,10 @@ namespace QuietMode.Windows.Native
     {
         public bool? Exists;
         public bool? Enabled;
+        /// <summary>TASK_STATE 名称：Unknown / Disabled / Queued / Ready / Running。</summary>
+        public string State = "";
+        public string LastRunTime = "";
+        public string LastResult = "";
         public string Xml = "";
         public string Error = "";
     }
@@ -68,6 +72,16 @@ namespace QuietMode.Windows.Native
                     r.Exists = true;
                     try { r.Enabled = (bool)task.Enabled; }
                     catch (Exception ex) { r.Error = "读取 Enabled 失败：" + Short(ex); }
+                    try { r.State = StateName((int)task.State); }
+                    catch (Exception ex) { r.Error = Append(r.Error, "读取 State 失败：" + Short(ex)); }
+                    try
+                    {
+                        DateTime last = (DateTime)task.LastRunTime;
+                        r.LastRunTime = last.ToString("yyyy-MM-dd HH:mm:ss", System.Globalization.CultureInfo.InvariantCulture);
+                    }
+                    catch { }
+                    try { r.LastResult = ((int)task.LastTaskResult).ToString(System.Globalization.CultureInfo.InvariantCulture); }
+                    catch { }
                     try { r.Xml = (string)task.Xml; }
                     catch (Exception ex) { r.Error = Append(r.Error, "读取 XML 失败：" + Short(ex)); }
                     return r;
@@ -133,6 +147,20 @@ namespace QuietMode.Windows.Native
                 if (service != null) { try { System.Runtime.InteropServices.Marshal.ReleaseComObject(service); } catch { } }
             }
             return names;
+        }
+
+        /// <summary>TASK_STATE 枚举转名字。直接 ToString 在部分系统上会得到数字。</summary>
+        public static string StateName(int state)
+        {
+            switch (state)
+            {
+                case 0: return "Unknown";
+                case 1: return "Disabled";
+                case 2: return "Queued";
+                case 3: return "Ready";
+                case 4: return "Running";
+                default: return "State" + state.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
         }
 
         private static string NormalizeFolder(string folderPath)

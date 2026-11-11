@@ -125,7 +125,15 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - `qmctl disks resolve|inspect|offline|online|verify`，默认演练，`--apply` 才动手。
   - 单测 43 项 + `powershell\Test-DiskSafety.ps1` 只读集成测试（系统盘必须被拦住），全部通过。
   - 详见 [`docs/DISK_MANAGEMENT.md`](docs/DISK_MANAGEMENT.md)。
-- **Phase 3–7**：统一维护执行、单一 Worker 与调度、C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
+- **Phase 3 Windows 维护管理重构 — 已完成**
+  - 唯一维护清单（`MaintenanceCatalog`）+ 禁改范围自检：Windows Update / Defender / Firewall / BitLocker 等路径写进清单也会被拦下。
+  - 补齐 v1 漏掉的 `Data Integrity Scan for Crash Recovery`；`Regular Maintenance` 按 `NotPresent` 处理（本机确实不存在）。
+  - `MaintenancePlanner` 把夜间顺序固化为步骤：StopTask → DisableTask → SysMain → MaintenanceBoundary / WakeUp；白天严格按 baseline 恢复，baseline 没记录的值一律不写。
+  - `MaintenanceVerifier` 三态结论：`Ok` / `Degraded`（任务仍 Running、读取失败）/ `Failed`（仍未禁用、注册表没写进去）。
+  - 每个写动作 `-ErrorAction Stop` + 写后复读；C# 再独立复观测一次才下结论。未提权 `--apply` 步骤标 `[未执行]`，退出码 2。
+  - 单测 60 项 + `powershell\Test-MaintenanceSafety.ps1` 只读集成测试，全部通过。
+  - 详见 [`docs/MAINTENANCE.md`](docs/MAINTENANCE.md)。
+- **Phase 4–7**：单一 Worker 与调度、C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
 
 ```powershell
 # 编译 + 自检（不改系统状态）

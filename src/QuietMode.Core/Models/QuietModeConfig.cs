@@ -368,7 +368,7 @@ namespace QuietMode.Core.Models
     /// <summary>工具版本常量，写入 baseline 元数据。</summary>
     public static class ProductInfo
     {
-        public const string Version = "2.0.0-phase1";
+        public const string Version = "2.0.0-phase3";
         public const string Name = "QuietMode";
     }
 
