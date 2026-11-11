@@ -1,5 +1,23 @@
 # 变更记录
 
+## 2.0.0-phase6.2 — 2026-11-12
+
+### 新增：reconcile 心跳（`logs/reconcile.log`）
+
+- 每次 reconcile 都追加一行，**包括决策为 `none` / `verify` 的那种**：
+  `时间 trigger=… action=… apply=0/1 verdict=… state=…`
+- 修的是一个观测盲区：无事可做时既不写请求文件、也不写 `worker.log`，
+  于是「任务没触发」和「触发了但没活干」在磁盘上完全同形。首夜之后 00:28 / 00:38
+  两次「消失」就是这么来的 —— 查无可查。
+- 超过 2 MB 自动滚到 `reconcile.log.1`。
+- `qmctl task status` 增加「调度心跳」一行与 JSON 字段 `heartbeat` / `heartbeatMinutesAgo`。
+
+### 修复：`task status` 误报重复调度
+
+- `\QuietHDD\` 两个闸门在 ACL 挡住时 `Exists=true / Enabled=null`，
+  旧逻辑把 `Enabled` 为 null 当成「仍在启用」，于是每次都输出「存在重复调度」。
+  现在算「无法确认」，按「可能有重复调度」处理但不再断言。
+
 ## 2.0.0-phase6.1 — 2026-11-12
 
 `DISKIDLE` 进入 reconcile 链。**这是一次会改系统状态的变更**：首轮 reconcile 会把

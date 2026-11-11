@@ -142,6 +142,20 @@ namespace QuietMode.Core.Scheduling
     /// </summary>
     public static class ReconcileVerifier
     {
+        /// <summary>
+        /// 是否需要「漂移修复」：自动决策说不用动（action=none），但回读判定 Failed。
+        /// 这正是首夜之后的形态 —— 状态机认为「已经在夜间」，可电源方案还是旧值，
+        /// 于是每个周期都安静地判定失败，谁都不去修。
+        /// 返回需要重跑的相位（night / day）；不需要修复返回 null。
+        /// </summary>
+        public static string RepairTarget(bool apply, string action, bool targetNight, ReconcileVerdict verdict)
+        {
+            if (!apply) return null;
+            if (!string.Equals(action ?? "", "none", StringComparison.OrdinalIgnoreCase)) return null;
+            if (verdict != ReconcileVerdict.Failed) return null;
+            return targetNight ? "night" : "day";
+        }
+
         public static ReconcileVerification Verify(string action, QuietModeConfig cfg, BaselineSnapshot baseline,
                                                    SystemObservation obs, IList<DiskStateObservation> disks,
                                                    FanObservation fan, SpinDownObservation spinDown = null)

@@ -1109,6 +1109,8 @@ namespace QuietMode.Cli
                         o.Set("lastResult", st.LastResult ?? "");
                         o.Set("conflict", st.Conflict);
                         o.Set("error", st.Error ?? "");
+                        o.Set("heartbeat", LastHeartbeat(paths));
+                        o.Set("heartbeatMinutesAgo", (int)HeartbeatAgeMinutes(paths));
                         JsonArray arr;
                         o.SetArray("legacy", out arr);
                         for (int i = 0; i < st.LegacyNames.Count; i++)
@@ -1126,6 +1128,9 @@ namespace QuietMode.Cli
                     }
                     if (_quiet) return st.Conflict ? 2 : 0;
                     Console.WriteLine(st.ToText());
+                    string hb = LastHeartbeat(paths);
+                    if (hb.Length > 0)
+                        Console.WriteLine("  调度心跳  : " + hb + "（" + HeartbeatAgeMinutes(paths).ToString("0") + " 分钟前）");
                     return st.Conflict ? 2 : 0;
                 }
 
@@ -1610,6 +1615,33 @@ namespace QuietMode.Cli
         private static void Info(string message)
         {
             if (!_quiet) Console.WriteLine(message);
+        }
+
+        /// <summary>最后一次 reconcile 心跳。任务「跑了但没活干」时也写，用来证明调度还活着。</summary>
+        private static string LastHeartbeat(QuietModePaths paths)
+        {
+            try
+            {
+                string path = paths.ReconcileLogPath;
+                if (!File.Exists(path)) return "";
+                string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+                for (int i = lines.Length - 1; i >= 0; i--)
+                    if (!string.IsNullOrWhiteSpace(lines[i])) return lines[i].Trim();
+                return "";
+            }
+            catch { return ""; }
+        }
+
+        /// <summary>距离上一次心跳过了多少分钟；读不到返回 -1。</summary>
+        private static double HeartbeatAgeMinutes(QuietModePaths paths)
+        {
+            try
+            {
+                string path = paths.ReconcileLogPath;
+                if (!File.Exists(path)) return -1;
+                return Math.Max(0, (DateTime.Now - File.GetLastWriteTime(path)).TotalMinutes);
+            }
+            catch { return -1; }
         }
 
         private static void Emit(JsonNode node)

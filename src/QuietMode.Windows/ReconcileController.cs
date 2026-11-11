@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using QuietMode.Core.Configuration;
 using QuietMode.Core.Disks;
 using QuietMode.Core.Json;
@@ -140,9 +141,56 @@ namespace QuietMode.Windows
             return run;
         }
 
-        /// <summary>执行一次 reconcile（apply=true 才会写系统状态）。</summary>
+        /// <summary>执行一次 reconcile（apply=true 才会写系统状态）。无论有没有活干都留一行心跳。</summary>
         public static ReconcileRun Run(QuietModePaths paths, QuietModeConfig cfg, BaselineSnapshot baseline,
                                        QuietModeState state, string action, string trigger, bool apply, int timeoutMs)
+        {
+            ReconcileRun run = RunCore(paths, cfg, baseline, state, action, trigger, apply, timeoutMs);
+            WriteHeartbeat(paths, run, trigger, apply);
+            return run;
+        }
+
+        /// <summary>
+        /// 心跳日志。决策为 none / verify 时根本不写请求文件、不写 worker.log，
+        /// 于是「任务没触发」和「触发了但无事可做」在磁盘上完全同形 —— 这条日志就是分界。
+        /// </summary>
+        private static void WriteHeartbeat(QuietModePaths paths, ReconcileRun run, string trigger, bool apply)
+        {
+            if (paths == null || run == null) return;
+            try
+            {
+                Directory.CreateDirectory(paths.LogDir);
+                string path = paths.ReconcileLogPath;
+                try
+                {
+                    FileInfo fi = new FileInfo(path);
+                    if (fi.Exists && fi.Length > 2 * 1024 * 1024)
+                    {
+                        string old = path + ".1";
+                        if (File.Exists(old)) File.Delete(old);
+                        File.Move(path, old);
+                    }
+                }
+                catch { }
+
+                string verdict = run.Verification != null
+                    ? run.Verification.Verdict.ToString()
+                    : (string.IsNullOrEmpty(run.Error) ? "NotRun" : "Failed");
+                string line = NowIso()
+                              + " trigger=" + (trigger ?? "")
+                              + " action=" + (string.IsNullOrEmpty(run.Action) ? "none" : run.Action)
+                              + " apply=" + (apply ? "1" : "0")
+                              + " verdict=" + verdict
+                              + (run.Decision == null ? "" : " state=" + run.Decision.State)
+                              + (string.IsNullOrEmpty(run.Error) ? "" : " error=" + ProcessRunner.Flatten(run.Error))
+                              + Environment.NewLine;
+                File.AppendAllText(path, line, new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        private static ReconcileRun RunCore(QuietModePaths paths, QuietModeConfig cfg, BaselineSnapshot baseline,
+                                           QuietModeState state, string action, string trigger, bool apply, int timeoutMs)
         {
             ReconcileRun run = Plan(paths, cfg, baseline, state, action, trigger, apply, timeoutMs);
             if (!string.IsNullOrEmpty(run.Error)) return run;
@@ -154,8 +202,25 @@ namespace QuietMode.Windows
                 run.Ok = run.Verification != null && run.Verification.Verdict == ReconcileVerdict.Ok;
                 if (!apply && run.Action == "none") run.Ok = true;
                 if (state != null && run.Decision != null) state.ControllerState = run.Decision.State.ToString();
-                run.EndUtc = NowIso();
-                return run;
+
+                // 漂移修复：决策说「已经到位、不用动」，但回读是 Failed。此时直接返回，
+                // 偏差就会一直挂着（配置 20 分钟、电源方案 300 秒就是这种形态）。
+                // 按目标相位重跑一次，把「判定」变成「动作」。
+                string repair = run.Decision == null
+                    ? null
+                    : ReconcileVerifier.RepairTarget(apply, run.Action, run.Decision.TargetNight,
+                                                    run.Verification == null ? ReconcileVerdict.Unknown
+                                                                             : run.Verification.Verdict);
+                if (string.IsNullOrEmpty(repair))
+                {
+                    run.EndUtc = NowIso();
+                    return run;
+                }
+
+                ReconcileRun forced = Plan(paths, cfg, baseline, state, repair, trigger, apply, timeoutMs);
+                forced.Plan.Notes.Add("漂移修复：自动判定为「无需动作」但回读 Failed，按 " + repair + " 强制重跑");
+                forced.Decision = forced.Decision ?? run.Decision;
+                run = forced;
             }
 
             string repo = RepoLocator.FindForExecutingAssembly();

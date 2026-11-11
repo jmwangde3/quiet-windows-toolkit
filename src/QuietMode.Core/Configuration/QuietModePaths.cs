@@ -47,6 +47,9 @@ namespace QuietMode.Core.Configuration
 
         public string WorkerLogPath { get { return Path.Combine(LogDir, "worker.log"); } }
 
+        /// <summary>每次 reconcile 的心跳（含「无事可做」），用来区分「没触发」和「触发了但没活干」。</summary>
+        public string ReconcileLogPath { get { return Path.Combine(LogDir, "reconcile.log"); } }
+
         public void EnsureLayout()
         {
             Directory.CreateDirectory(Root);

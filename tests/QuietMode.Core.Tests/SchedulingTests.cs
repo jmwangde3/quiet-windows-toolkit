@@ -212,6 +212,20 @@ namespace QuietMode.Core.Tests
                 True(p.Steps[2].Critical == false, "关闭的停转不应是关键步骤");
             });
 
+            Run("漂移修复：无需动作但回读 Failed → 按目标相位重跑", delegate
+            {
+                Eq("night", ReconcileVerifier.RepairTarget(true, "none", true, ReconcileVerdict.Failed));
+                Eq("day", ReconcileVerifier.RepairTarget(true, "none", false, ReconcileVerdict.Failed));
+            });
+
+            Run("漂移修复：达标 / 降级 / 非 apply / 已有动作时都不触发", delegate
+            {
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, ReconcileVerdict.Ok));
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, ReconcileVerdict.Degraded));
+                Eq<string>(null, ReconcileVerifier.RepairTarget(false, "none", true, ReconcileVerdict.Failed));
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "night", true, ReconcileVerdict.Failed));
+            });
+
             Run("计划：停转开启时带上目标秒数，关闭时不下发", delegate
             {
                 QuietModeConfig cfg = FullConfig();

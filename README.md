@@ -155,6 +155,8 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - 风扇改用 `IpcCtl.exe list` 的 `current=` 回读真实配置（v1 注释里「FanControl 不暴露当前配置名」不成立）。
   - `qmctl reconcile [auto|night|day|restore|verify] [--trigger X] [--apply]`、`qmctl task status|print|install|uninstall|disable-legacy`、`qmctl state pause|resume|rearm|manual-quiet|manual-normal|auto`。
   - 单测 76 项 + `powershell\Test-SchedulingSafety.ps1` 只读集成测试（任务 XML 唯一性、演练不改状态、未提权必失败），全部通过。
+  - 漂移修复：自动决策为「无需动作」但回读 `Failed` 时，按当前相位强制重跑一次（`ReconcileVerifier.RepairTarget`），把「以为到位」变成「真的到位」。
+  - 心跳日志 `logs/reconcile.log`：每次 reconcile 都留一行（含无事可做），`qmctl task status` 直接显示最后一条与距今分钟数 —— 调度没跑和跑了没事，终于是两件事。
   - 详见 [`docs/SCHEDULING.md`](docs/SCHEDULING.md)。
 - **Phase 5 C# 托盘重构 — 已完成**
   - 2424 行单文件拆成 `Program` + `App`（路径/日志/自启）+ `Core`（qmctl 契约 + 只读 JSON）+ `Ui`（托盘/设置/图标）+ `Diag`。

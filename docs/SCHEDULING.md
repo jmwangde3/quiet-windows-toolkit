@@ -124,6 +124,27 @@ DayActive         ← 默认
 
 `qmctl reconcile` 的退出码：`0` 成功或无动作，`2` 有失败，`1` 配置不可用。
 
+### 6.1 漂移修复（判定 Failed 就自己动手）
+
+自动决策可能给出 `action=none`（「已经在目标相位，不用动」），但如果回读仍然是 `Failed`，
+说明「以为到位」和「实际到位」之间有偏差。此时 `ReconcileVerifier.RepairTarget()` 返回目标相位，
+`ReconcileController` 按 night / day **强制重跑一次完整计划**，把判定变成动作。
+
+首夜之后就是这种形态：配置写 `spinDown.minutes=20`，电源方案还是 300 秒，
+每个周期都安静地判 `Failed`，没有任何人去修。加了这条之后，下一个周期会自己写回去。
+
+### 6.2 心跳日志（`logs/reconcile.log`）
+
+每次 reconcile 都追加一行，**包括无事可做的那种**：
+
+```
+2026-11-11T16:58:01Z trigger=schedule action=none apply=1 verdict=Failed state=NightActive
+```
+
+没有它，「任务没触发」和「触发了但没活干」在磁盘上完全同形 —— 前者要修调度，后者不用管，
+但两者都只剩「run 目录没有新文件」这一个现象。日志超过 2 MB 滚到 `reconcile.log.1`。
+`qmctl task status` 会把它最后一行打成「调度心跳」，并给出距今分钟数。
+
 ## 7. 手动控制
 
 ```powershell

@@ -29,6 +29,9 @@ namespace QuietMode.Windows
                 foreach (TaskQueryResult t in Legacy)
                 {
                     if (!t.Exists.HasValue) return true;
+                    // 「存在但读不到是否启用」同样是未知：ACL 挡住的时候 Enabled 为 null，
+                    // 早先这条被当成「仍在启用」，于是每次查状态都误报重复调度。
+                    if (t.Exists.Value && !t.Enabled.HasValue) return true;
                 }
                 return false;
             }
