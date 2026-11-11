@@ -1,5 +1,65 @@
 # 变更记录
 
+## 2.0.0-phase5 — 2026-11-11
+
+托盘重构：从“什么都干”的单文件变成 `qmctl` 的前端。**不改变运行中的系统状态**：
+本阶段只动代码与只读探测，未执行任何 `--apply`。
+
+### 新增
+
+- `QuietMode/` 分层（原 2424 行 `QuietMode.cs` 已删除）：
+  - `Program.cs`：入口、单实例、`--diag` / `--status` / `--selftest`。
+  - `App/AppPaths.cs`、`App/AutoStart.cs`、`App/TrayLog.cs`：路径与 qmctl 定位、HKCU 自启与托盘常显、日志。
+  - `Core/QmctlClient.cs`：唯一的 qmctl 调用通道（含 `runas` 提权与 UAC 取消识别）。
+  - `Core/MiniJson.cs`：只读 JSON 解析，托盘不引用 `QuietMode.Core.dll`。
+  - `Ui/TrayApp.cs`、`Ui/SettingsForm.cs`、`Ui/Icons.cs`：菜单、设置、图标。
+  - `Diag/Diagnostics.cs`：自检输出。
+- `qmctl status [--json]`：一次性观测（窗口、决策、控制器状态、风扇、磁盘、停转、计划任务、baseline）。
+- `qmctl apply <manual-quiet|manual-normal|auto|pause|resume|rearm> [--apply]`：
+  一次用户动作 = 一次提权 = 一次 reconcile，意图与结果分离。
+- `qmctl config set <key> <value>`：白名单键 + 类型先挡 + `ConfigStore` 强校验；
+  `--force` 跳过文件存在性检查。
+- `qmctl spin show` / `qmctl spin set <分钟> [--apply]` + `SpinDownController`：
+  DISKIDLE 独立开关，`powercfg` 写入后独立回读（`powercfg /query` 优先，注册表兜底）。
+- `docs/TRAY.md`：分层、JSON 契约、图标语义、失败语义、已知取舍。
+- 单测新增 5 项（`SystemClock`、`IsLastRunFailed`、状态快照契约）；
+  `Test-QuietMode.ps1` 新增“编译托盘”“托盘契约：status 字段齐全（只读）”两步。
+
+### 修正
+
+- **开机超过 24.9 天后夜间窗口会被误判成白天**。`Environment.TickCount & 0x7FFFFFFF`
+  回绕后算出的“运行时长”变成几毫秒，落进 `schedule.startupGraceMinutes`（15 分钟），
+  于是 06:00–10:02 被判为“刚开机、按白天处理”。改用 `GetTickCount64`（`SystemClock.Uptime()`），
+  `ReconcileController` 与 `StatusProbe` 共用。
+- **`IsLastRunFailed` 有两份实现**（ReconcileController 私有 + 托盘将要有自己的）。
+  收进 `StateMachine.IsLastRunFailed`，`NotRun` 明确不算失败。
+- **托盘状态显示不再“看不见就当正常”**：`offline` / `exists` 读不到时 JSON 给 `null`，
+  界面显示“状态未知”；计划任务未注册、v1 闸门仍启用/读不到都变成常驻警告。
+
+### 移除
+
+- 托盘里的 `Apply()`、`CheckAutoSilent()`、`BootReconcile()`、`Sys.BuildWorker/BuildGateScript/BuildSpinScript`、
+  `--fixgate`、`--fixhwinfo`：这些行为全部由 `qmctl reconcile` 与计划任务接管。
+- 托盘对 `settings.ini` / `state.ini` 的读写：配置与状态只剩 `config.json` / `state.json` 一个写入口。
+- 托盘的 `System.Management` 依赖（WMI 探测移到 `qmctl status`）。
+
+### 升级注意
+
+- 托盘现在需要同目录的 `qmctl.exe`（或 `tray.ini` 的 `QmctlPath`）。找不到时菜单全部禁用并提示，
+  **不会**退回旧逻辑。
+- 每次切换静音模式会弹一次 UAC：v1 在“夜间自动静音中手动关闭”时不弹，v2 为了“意图+执行+验证”
+  原子化接受这个代价（见 `docs/TRAY.md` §7）。
+- 自动切换仍依赖 `\QuietMode\QuietMode-Reconcile`；本阶段**未注册**该任务（Phase 6 做迁移安装），
+  所以当前运行环境下自动切换不会发生 —— 托盘会在菜单第三行常驻提示。
+
+### 测试
+
+- 单测 81 项全过。
+- `Test-QuietMode.ps1` 全绿：编译 3 项、单测、配置校验、托盘契约、磁盘安全 5 项、维护安全 6 项、调度安全 10 项。
+- 实机只读验证：`qmctl status` 报 `DayActive` / `action=none`，风扇 `disabled`（临时 root 默认策略）、
+  DISKIDLE `AC=300s DC=0s`；`task status` 正确报“v2 任务不存在 + v1 闸门可能仍在”。
+- 托盘冒烟：`--selftest` 三条路径（正常配置 / 配置缺失 / qmctl 缺失）均无异常退出，日志无堆栈。
+
 ## 2.0.0-phase4 — 2026-11-11
 
 统一 Worker 与调度。**不改变运行中的系统状态**：默认演练，`--apply` 才动手，未提权必然失败。

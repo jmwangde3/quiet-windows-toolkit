@@ -191,7 +191,47 @@ qmctl [--root PATH] [--quiet] [--json] [--out FILE] <command>
 | `snapshot verify` | 校验哈希与任务 XML 备份 |
 | `snapshot show` | 摘要 |
 | `state show` | 打印 state.json |
+| `config set <key> <value>` | 改单个配置项（白名单键，写前强校验；`--force` 跳过文件存在性检查） |
+| `status` | 一次性观测：窗口 / 决策 / 风扇 / 磁盘 / 停转 / 任务 / baseline |
+| `spin show` | 只读当前 DISKIDLE（AC/DC 秒） |
+| `spin set <分钟> [--apply]` | 改 DISKIDLE（0 = 永不），写后独立回读验证 |
 | `disks list` | 磁盘与稳定身份 |
+
+### 8.1 `config set` 可用键
+
+布尔值接受 `true/false/1/0/on/off/yes/no`；时间必须是 `HH:mm`。
+
+| 键 | 取值 |
+|---|---|
+| `schedule.enabled` / `schedule.mode` | 布尔 / `override`\|`coexist` |
+| `schedule.nightStart` / `schedule.dayStart` | `HH:mm` |
+| `schedule.startupOverrideEnabled` / `schedule.startupDayStart` | 布尔 / `HH:mm` |
+| `schedule.startupGraceMinutes` / `schedule.reconcileIntervalMinutes` | 整数 |
+| `fan.enabled` | 布尔 |
+| `fan.ipcPath` / `fan.controlExe` / `fan.normalProfile` / `fan.silentProfile` / `fan.flagPath` | 绝对路径 |
+| `fan.autoSwitch.enabled` / `.on` / `.off` | 仅承接 v1 迁移，调度不使用 |
+| `disks.enabled` / `disks.forceBusy` | 布尔 |
+| `maintenance.enabled` / `.strictNightDisable` / `.disableSysMainAtNight` / `.disableWake` | 布尔 |
+| `maintenance.maintenanceHour` | 0–23 |
+| `spinDown.enabled` / `spinDown.minutes` | 布尔 / 0–180 |
+| `startup.autoStart` / `startup.restoreOnBoot` | 布尔 |
+
+写入流程固定为：`ConfigValidator.Validate` → 原子写 → 复读再校验。
+校验失败时**文件不变**，退出码 2，并提示可用 `--force` 跳过“文件是否存在”这一类检查。
+
+### 8.2 `status` 的契约
+
+`qmctl status --json` 是托盘唯一的数据来源，字段说明见 [`TRAY.md`](TRAY.md) §2.1。
+两条约定必须守住：
+
+- 可空布尔（`disks.targets[].offline`、`task.exists`）在“读不到”时输出 `null`，**不能**输出 `false`；
+- 配置不可用时退出码为 2，但**仍然输出完整 JSON**，让界面能显示“为什么不可用”。
+
+### 8.3 `spin` 与静音模式解耦
+
+`spin set` 只改当前电源方案的 `DISKIDLE`（AC/DC 同时写，再 `powercfg /setactive`），
+不碰磁盘联机状态、不碰静音模式。写入后先用 `powercfg /query`（与写入不同的读取路径）回读，
+失败才读注册表；值与目标不一致返回 `VERIFY_MISMATCH`，绝不报成功。
 
 退出码：`0` 成功、`1` 一般失败、`2` 校验失败。`--quiet` 静默（只留退出码，供 PowerShell 调用）；`--json --out FILE` 把机器可读结果写 UTF-8 文件，绕开控制台代码页（zh-CN 代码页 936 会把 UTF-8 输出解成乱码）。
 

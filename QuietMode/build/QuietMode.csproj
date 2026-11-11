@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net46</TargetFramework>
+    <TargetFramework>net481</TargetFramework>
     <AssemblyName>QuietMode</AssemblyName>
     <RootNamespace>QuietMode</RootNamespace>
     <LangVersion>7.3</LangVersion>
@@ -12,20 +12,28 @@
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <AssemblyVersion>2.0.0.0</AssemblyVersion>
+    <FileVersion>2.0.0.0</FileVersion>
+    <Product>QuietMode Tray</Product>
+    <Description>QuietMode 托盘：只显示 qmctl 报回的事实，不复刻业务逻辑</Description>
     <EnableDefaultItems>false</EnableDefaultItems>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <NoWarn>CS0618</NoWarn>
   </PropertyGroup>
 
+  <!-- 分层：Program 入口 / App 外壳 / Core 与 qmctl 的契约 / Ui 界面 / Diag 自检 -->
   <ItemGroup>
-    <Compile Include="..\QuietMode.cs" />
+    <Compile Include="..\Program.cs" />
+    <Compile Include="..\App\*.cs" />
+    <Compile Include="..\Core\*.cs" />
+    <Compile Include="..\Ui\*.cs" />
+    <Compile Include="..\Diag\*.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <Reference Include="System" />
     <Reference Include="System.Core" />
-    <Reference Include="System.Management" />
     <Reference Include="System.Windows.Forms" />
     <Reference Include="System.Drawing" />
   </ItemGroup>

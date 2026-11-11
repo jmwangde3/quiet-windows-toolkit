@@ -51,6 +51,11 @@ if (-not $SkipBuild) {
         & $dotnet build (Join-Path $repoRoot 'src\QuietMode.Cli\QuietMode.Cli.csproj') -c $Configuration -v quiet --nologo | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "dotnet build 退出码 $LASTEXITCODE" }
     }
+
+    Step '编译托盘（Phase 5 分层结构）' {
+        & $dotnet build (Join-Path $repoRoot 'QuietMode\build\QuietMode.csproj') -c $Configuration -v quiet --nologo | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "dotnet build 退出码 $LASTEXITCODE" }
+    }
 }
 
 Step 'Core 单测' {
@@ -86,6 +91,22 @@ Step 'baseline 校验' {
     if (-not $v.Complete) {
         Write-Host '    WARN  baseline 不完整（受保护任务需管理员读取）' -ForegroundColor Yellow
     }
+}
+
+Step '托盘契约：status 字段齐全（只读）' {
+    $r = Invoke-QuietModeToolJson -Arguments @('status') -Root $Root
+    if ($null -eq $r.Data) { throw "status 无 JSON 输出（退出码 $($r.ExitCode)）" }
+    $required = @('ok', 'config', 'schedule', 'startup', 'window', 'controller', 'state', 'fan', 'disks', 'spinDown', 'task')
+    foreach ($k in $required) {
+        if ($null -eq $r.Data.PSObject.Properties[$k]) { throw "status 缺少字段 $k（托盘按名取值）" }
+    }
+    if ($null -eq $r.Data.controller.PSObject.Properties['state']) { throw 'status 缺少 controller.state' }
+    if ($r.Data.PSObject.Properties['config'].Value.PSObject.Properties['exists'] -eq $null) {
+        throw 'status 缺少 config.exists（托盘据此决定是否对账自启）'
+    }
+    Write-Host ("    state={0} action={1} disks={2}" -f $r.Data.controller.state,
+                $r.Data.controller.action, @($r.Data.disks.targets).Count)
+    if ($null -eq $r.Data.spinDown.PSObject.Properties['acSeconds']) { throw 'status 缺少 spinDown.acSeconds' }
 }
 
 Step '磁盘身份解析' {

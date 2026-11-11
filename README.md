@@ -28,7 +28,11 @@ ide-terminal-settings.jsonc VS Code / Cursor / Trae 终端配置示例
 fix-rtss-scanlinesync.ps1   RTSS 扫描线同步修复
 quiet-hdd-*.ps1             机械盘夜间闸门的安装 / 状态 / 暂停 / 磁盘号配置
 QuietMode/
-  QuietMode.cs              托盘程序完整源码（C# / .NET Framework 4.6）
+  Program.cs                托盘入口（单实例 / --diag / --status / --selftest）
+  App/                      路径与日志、HKCU 自启、Win11 托盘常显
+  Core/                     qmctl 调用通道 + 只读 JSON 解析（与引擎跨进程只走 JSON）
+  Ui/                       托盘菜单 / 设置窗口 / 图标
+  Diag/                     自检输出
   QuietMode.exe.config      运行时配置
   build.cmd                 一键编译
   build/QuietMode.csproj    SDK 风格工程文件
@@ -36,11 +40,20 @@ QuietMode/
 
 ## 快速开始
 
-### 1. 编译托盘程序
+### 1. 编译
 
 需要 .NET SDK（6.0 或更高）与 `Microsoft.NETFramework.ReferenceAssemblies` 包
-（首次构建会自动还原，需要网络）。双击 `QuietMode/build.cmd`，产物写到
-`QuietMode/QuietMode.exe`。
+（首次构建会自动还原，需要网络）。
+
+```
+dotnet build QuietMode.sln -c Release     # Core / Windows / qmctl / 托盘 / 单测
+QuietMode\build\build.cmd                # 只编托盘，产物复制到 QuietMode\QuietMode.exe
+```
+
+v2 的托盘只是 `qmctl` 的前端，**部署时必须把 `qmctl.exe` 放在 `QuietMode.exe` 同目录**
+（或在 `%APPDATA%\QuietMode\tray.ini` 写 `QmctlPath=<完整路径>`）。
+找不到 qmctl 时托盘会把所有操作标成不可用，不会退回旧的自带逻辑。
+布局与契约见 [`docs/TRAY.md`](docs/TRAY.md)。
 
 ### 2. 改配置
 
@@ -97,7 +110,7 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
 ## 环境要求
 
 - Windows 10 / 11，PowerShell 5.1
-- .NET Framework 4.6 运行时（托盘程序）+ .NET SDK（编译）
+- .NET Framework 4.8.1 运行时（托盘 / qmctl）+ .NET SDK（编译）
 - 脱机 / 联机磁盘、启停计划任务需要管理员权限（托盘程序会按需弹 UAC）
 - FanControl（风扇曲线切换，用户态命名管道，无需管理员）
 
@@ -143,7 +156,16 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - `qmctl reconcile [auto|night|day|restore|verify] [--trigger X] [--apply]`、`qmctl task status|print|install|uninstall|disable-legacy`、`qmctl state pause|resume|rearm|manual-quiet|manual-normal|auto`。
   - 单测 76 项 + `powershell\Test-SchedulingSafety.ps1` 只读集成测试（任务 XML 唯一性、演练不改状态、未提权必失败），全部通过。
   - 详见 [`docs/SCHEDULING.md`](docs/SCHEDULING.md)。
-- **Phase 5–7**：C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
+- **Phase 5 C# 托盘重构 — 已完成**
+  - 2424 行单文件拆成 `Program` + `App`（路径/日志/自启）+ `Core`（qmctl 契约 + 只读 JSON）+ `Ui`（托盘/设置/图标）+ `Diag`。
+  - 删除 `Apply()` 与 `CheckAutoSilent()`：托盘不再自己算窗口、不再拼提权脚本、不再直接碰 WMI / 注册表 / 电源方案。
+  - 新增 `qmctl status`（一次调用给出窗口/决策/风扇/磁盘/停转/任务的完整事实）、`qmctl apply <intent>`（一次用户动作 = 一次提权 = 一次 reconcile）、`qmctl config set`、`qmctl spin show|set`。
+  - 新增 `SpinDownController`：DISKIDLE 独立开关，`powercfg` 写入后独立回读，不一致即 `VERIFY_MISMATCH`。
+  - 修正 `Environment.TickCount & 0x7FFFFFFF` 在开机 24.9 天后回绕成“刚开机几分钟”、导致 06:00–10:02 夜间窗口被误判成白天的问题（改用 `GetTickCount64`）。
+  - 界面只显示观测值：`offline`/`exists` 读不到时序列化为 `null`，显示“状态未知”而不是“正常”；计划任务未注册、v1 闸门仍启用都会常驻警告。
+  - 单测 81 项（新增 5 项托盘契约）+ `Test-QuietMode.ps1` 新增“托盘契约：status 字段齐全（只读）”，全部通过。
+  - 详见 [`docs/TRAY.md`](docs/TRAY.md)。
+- **Phase 6–7**：安装迁移恢复、测试与 CI 收尾，见规格 §11。
 
 ```powershell
 # 编译 + 自检（不改系统状态）

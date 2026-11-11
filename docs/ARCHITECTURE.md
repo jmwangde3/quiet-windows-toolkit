@@ -114,8 +114,8 @@
 | `night.ps1` 的 SysMain / Boundary / WakeUp | `ServiceManager` + 注册表快照恢复（按原始存在状态） | 3 |
 | `gate.ps1` / `diskgate.ps1` / `worker.ps1` | `Invoke-QuietModeWorker.ps1` + 8 个 psm1 | 4 |
 | `\QuietHDD\` 两个任务 | `\QuietMode\QuietMode-Reconcile` 单一任务 | 4 |
-| `Sys.Run` 动态拼接 | `ProcessRunner`（并行异步读 stdout/stderr、真超时、区分启动失败/UAC 取消/超时） | 5 |
-| `QuietMode.cs` 单文件 | `Program/TrayApp/MainMenu/SettingsForm/StatusView`，`net481` | 5 |
+| `Sys.Run` 动态拼接 | `ProcessRunner`（并行异步读 stdout/stderr、真超时、区分启动失败/UAC 取消/超时） | 2 |
+| `QuietMode.cs` 单文件（2424 行） | `Program` + `App` + `Core`（qmctl 契约）+ `Ui` + `Diag`，业务逻辑全部移出托盘 | 5 |
 | 7 个旧脚本 | 兼容包装器 → 统一 Worker | 6 |
 | 无安装器 | `Install` / `Uninstall` / `Repair` + 迁移 + 回滚 | 6 |
 | 无测试 | Pester / C# 单测 / VM 集成 / GitHub Actions Windows CI | 7 |
@@ -131,7 +131,7 @@
 | 2 | 磁盘管理 | `DiskIdentityResolver` / 唯一匹配 / 系统盘与页面文件保护 / 实状态验证 | 无法唯一匹配的盘绝不操作；操作后必验实际状态 |
 | 3 | 维护管理 | 唯一清单（8 项）/ Stop+Disable+Verify / SysMain / Boundary / WakeUp / baseline 恢复 | 夜间全部现存目标 Disabled；白天严格恢复原始状态 |
 | 4 | 统一 Worker 与调度 | 静态 Worker / 单一 Reconcile / 状态机 / 启动与睡眠补偿 / 周期校验 / Pause-ReArm | 任意时刻只有一个权威调度控制器 |
-| 5 | C# 托盘重构 | 拆分 6 文件 / net481 / ProcessRunner / 接入统一配置与状态机 / 全组件验证显示 | 托盘与计划任务调用同一套业务逻辑 |
+| **5** | C# 托盘重构 | 分层拆分（App/Core/Ui/Diag）/ 只认 `qmctl status` 的 JSON / 删除 `Apply` 与 `CheckAutoSilent` | ✅ 托盘与计划任务调用同一套业务逻辑；托盘不再有第二份策略 |
 | 6 | 安装迁移恢复 | Install / Uninstall / Repair / 迁移 / 回滚 / 安装后自检 | 能从 v1 安全升级并完整恢复旧系统配置 |
 | 7 | 测试与发布 | Pester / C# 测试 / Windows CI / VM 集成 / README / CHANGELOG / SAFETY / v2.0 Release | 全部测试通过，实机夜间验证通过 |
 

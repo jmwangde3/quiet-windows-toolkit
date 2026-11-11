@@ -102,14 +102,14 @@ namespace QuietMode.Windows
             if (cfg == null) { run.Error = "未提供配置"; run.EndUtc = NowIso(); return run; }
             if (timeoutMs <= 0) timeoutMs = DefaultTimeoutMs;
 
-            run.Window = ScheduleWindow.Evaluate(cfg.Schedule, DateTime.Now, Uptime());
+            run.Window = ScheduleWindow.Evaluate(cfg.Schedule, DateTime.Now, SystemClock.Uptime());
 
             DecisionInput input = new DecisionInput();
             input.Schedule = cfg.Schedule;
             input.State = state ?? new QuietModeState();
             input.Window = run.Window;
             input.Trigger = run.Trigger;
-            input.LastRunFailed = IsLastRunFailed(input.State);
+            input.LastRunFailed = StateMachine.IsLastRunFailed(input.State);
             run.Decision = StateMachine.Decide(input);
 
             string resolved = ResolveAction(action, run.Decision);
@@ -313,15 +313,6 @@ namespace QuietMode.Windows
             }
         }
 
-        private static bool IsLastRunFailed(QuietModeState st)
-        {
-            if (st == null) return false;
-            string v = st.LastVerdict ?? "";
-            if (v.Length == 0) return false;
-            return !string.Equals(v, "Ok", StringComparison.OrdinalIgnoreCase)
-                   && !string.Equals(v, "NotRun", StringComparison.OrdinalIgnoreCase);
-        }
-
         private static string ResolveAction(string requested, Decision decision)
         {
             string a = (requested ?? "").Trim().ToLowerInvariant();
@@ -379,12 +370,6 @@ namespace QuietMode.Windows
         }
 
         /// <summary>Environment.TickCount 是系统启动以来的毫秒数，即机器开机时长。</summary>
-        private static TimeSpan? Uptime()
-        {
-            try { return TimeSpan.FromMilliseconds(Environment.TickCount & 0x7FFFFFFF); }
-            catch { return null; }
-        }
-
         private static string NowIso()
         {
             return DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture);

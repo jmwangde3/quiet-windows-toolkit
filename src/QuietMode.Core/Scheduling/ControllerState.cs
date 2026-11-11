@@ -122,6 +122,19 @@ namespace QuietMode.Core.Scheduling
     /// </summary>
     public static class StateMachine
     {
+        /// <summary>
+        /// 上一次执行是否算失败。NotRun 是「未执行」（没提权 / 没有动作），不当作失败，
+        /// 否则界面上会一直挂着「重试」而实际什么都没跑。
+        /// </summary>
+        public static bool IsLastRunFailed(QuietModeState st)
+        {
+            if (st == null) return false;
+            string v = st.LastVerdict ?? "";
+            if (v.Length == 0) return false;
+            return !string.Equals(v, "Ok", StringComparison.OrdinalIgnoreCase)
+                   && !string.Equals(v, "NotRun", StringComparison.OrdinalIgnoreCase);
+        }
+
         public static Decision Decide(DecisionInput input)
         {
             Decision d = new Decision();
