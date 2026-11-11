@@ -63,8 +63,17 @@ namespace QuietMode.Windows.Native
                     }
                     catch (Exception ex)
                     {
-                        // 0x80070002 = 任务不存在；其它按错误上报
+                        // 0x80070002 = 任务不存在
                         if (IsNotFound(ex)) { r.Exists = false; return r; }
+                        // 0x80070005 = 拒绝访问。文件夹都打开了，说明任务大概率在，
+                        // 只是当前令牌（未提权的管理员过滤令牌）没读权限 —— 不能报成「不存在」。
+                        if (IsAccessDenied(ex))
+                        {
+                            r.Exists = true;
+                            r.Enabled = null;
+                            r.Error = "无读取权限（任务已注册；提权或授予读取权限后可看到状态）";
+                            return r;
+                        }
                         r.Error = "读取任务失败：" + Short(ex);
                         return r;
                     }
@@ -167,6 +176,23 @@ namespace QuietMode.Windows.Native
         {
             if (string.IsNullOrWhiteSpace(folderPath)) return "";
             return folderPath.Trim().Trim('\\');
+        }
+
+        /// <summary>0x80070005 = 拒绝访问。不可读 ≠ 不存在，单独区分。</summary>
+        private static bool IsAccessDenied(Exception ex)
+        {
+            Exception cur = ex;
+            while (cur != null)
+            {
+                System.Runtime.InteropServices.COMException com = cur as System.Runtime.InteropServices.COMException;
+                if (com != null && (uint)com.HResult == 0x80070005u) return true;
+                if (cur is UnauthorizedAccessException) return true;
+                string msg = cur.Message ?? "";
+                if (msg.IndexOf("0x80070005", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                if (msg.IndexOf("拒绝访问", StringComparison.Ordinal) >= 0) return true;
+                cur = cur.InnerException;
+            }
+            return false;
         }
 
         private static bool IsNotFound(Exception ex)

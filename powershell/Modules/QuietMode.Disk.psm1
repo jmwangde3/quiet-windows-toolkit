@@ -365,9 +365,14 @@ function Get-QmDiskOccupancy {
         if ($occupants.Count -gt 0) { $report.notes += '进程线索只是辅助判断，不代表真的持有句柄' }
     }
 
+    # 只有 I/O 才是「占用」的硬指标。进程线索只是提示：
+    # 装了软件的盘（D:/E: 这种）长期有一堆进程的 exe 落在盘上，但那不等于正在读写。
+    # 早期版本把「进程线索 > 0」直接判成 busy，结果这类盘永远无法在夜间脱机。
     $ioBusy = $report.countersAvailable -and ($report.bytesPerSecond -gt 262144 -or $report.percentDiskTime -gt 15)
-    $procBusy = @($report.occupants).Count -gt 0
-    $report.busy = ($ioBusy -or $procBusy)
+    $report.busy = $ioBusy
+    if (-not $ioBusy -and @($report.occupants).Count -gt 0) {
+        $report.warnings += ('有 {0} 个进程的可执行文件或命令行指向该盘（当前无 I/O）；脱机后这些程序会失去对该盘的数据访问' -f @($report.occupants).Count)
+    }
 
     $parts = @()
     if ($report.bytesPerSecond -ge 0) {

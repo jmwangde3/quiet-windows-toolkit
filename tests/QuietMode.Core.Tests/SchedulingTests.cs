@@ -172,6 +172,28 @@ namespace QuietMode.Core.Tests
                 Eq("normal", p.Steps[2].Action);
             });
 
+            Run("计划：维护明细必须随计划下发（否则 worker 空转）", delegate
+            {
+                MaintenancePlan maint = NightMaintenance();
+                ReconcilePlan p = ReconcilePlanner.Build("night", "timer", "", FullConfig(), maint);
+                True(p.Maintenance != null, "计划必须挂上 MaintenancePlan 引用");
+                True(ReferenceEquals(p.Maintenance, maint), "必须是同一个对象，不能是副本");
+                Eq(maint.Steps.Count, p.Maintenance.Steps.Count);
+                True(p.Maintenance.Steps.Count > 0, "夜间维护至少要有一步");
+                // 请求 JSON 里必须真的带上 maintenance 节点
+                string json = p.ToJson().ToJson(true);
+                True(json.IndexOf("\"maintenance\"", StringComparison.Ordinal) >= 0, "请求 JSON 缺少 maintenance 节点");
+            });
+
+            Run("计划：维护关闭时不下发维护明细", delegate
+            {
+                QuietModeConfig cfg = FullConfig();
+                cfg.Maintenance.Enabled = false;
+                ReconcilePlan p = ReconcilePlanner.Build("night", "timer", "", cfg, NightMaintenance());
+                True(p.Maintenance == null, "关闭维护时不应携带维护步骤");
+                Eq("skipped", p.Steps[0].Status);
+            });
+
             Run("计划：关闭的模块标为跳过而不是消失", delegate
             {
                 QuietModeConfig cfg = FullConfig();

@@ -61,6 +61,9 @@ namespace QuietMode.Core.Scheduling
                 return;
             }
             int count = maintenance == null ? 0 : maintenance.Steps.Count;
+            // 必须把明细挂到计划上：worker 只认 request.maintenance，漏了这一步
+            // 就会「日志写着 11 个维护步骤、实际一个都没执行」。
+            p.Maintenance = maintenance;
             p.Add("maintenance", phase, count + " 个维护步骤", true);
             if (maintenance == null) p.Notes.Add("注意：维护计划为空，执行层不会做任何维护动作");
         }

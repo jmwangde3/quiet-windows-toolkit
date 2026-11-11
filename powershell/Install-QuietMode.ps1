@@ -410,6 +410,27 @@ Copy-Binaries -From $cliBin -To $DeployDir -BackupDir $backupRoot `
 Copy-Binaries -From $trayBin -To $DeployDir -BackupDir $backupRoot `
     -Names @('QuietMode.exe', 'QuietMode.exe.config') -Apply $apply
 
+# 脚本树必须跟二进制放在一起：qmctl 用 RepoLocator 从自身目录向上找 powershell\Modules，
+# 部署目录不含这份脚本时，夜间任务会报「找不到仓库根目录」而整夜不动作。
+$psSrc = Join-Path $repoRoot 'powershell'
+$psDst = Join-Path $DeployDir 'powershell'
+if (-not (Test-Path -LiteralPath $psSrc)) {
+    Write-Bad ("缺少脚本树：" + $psSrc)
+} elseif (-not $apply) {
+    Write-Note ("将复制 " + $psSrc + " → " + $psDst)
+} else {
+    try {
+        if (Test-Path -LiteralPath $psDst) { Remove-Item -LiteralPath $psDst -Recurse -Force }
+        Copy-Item -LiteralPath $psSrc -Destination $psDst -Recurse -Force
+        $n = @(Get-ChildItem -LiteralPath $psDst -Recurse -File).Count
+        if (Test-Path -LiteralPath (Join-Path $psDst 'Worker\Invoke-QuietModeWorker.ps1')) {
+            Write-Ok ("脚本树已部署（" + $n + " 个文件），Worker 可达")
+        } else {
+            Write-Bad '脚本树复制后找不到 Worker，编译产物将无法执行任何计划步骤'
+        }
+    } catch { Write-Bad ("复制脚本树失败：" + $_.Exception.Message) }
+}
+
 $script:QmctlPath = Join-Path $DeployDir 'qmctl.exe'
 if (-not (Test-Path -LiteralPath $script:QmctlPath)) { $script:QmctlPath = $srcQmctl }
 
@@ -477,7 +498,45 @@ if ($st.Data -and $st.Data.exists -eq $true) { Write-Ok ("v2 任务已存在，�
 elseif ($apply) { Write-Bad '注册后回读不到 v2 任务' }
 else { Write-Note '当前未注册（符合 DryRun 预期）' }
 
-# ================================================================ 6 停用 v1
+# ================================================================ 6 授权读取
+Write-Step '授予普通用户读取计划任务（托盘免提权才看得到状态）'
+$taskFiles = @(
+    (Join-Path $env:WINDIR 'System32\Tasks\QuietMode\QuietMode-Reconcile'),
+    (Join-Path $env:WINDIR 'System32\Tasks\QuietHDD\QuietHDD_NightGate'),
+    (Join-Path $env:WINDIR 'System32\Tasks\QuietHDD\QuietHDD_DiskGate')
+)
+$usersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+foreach ($tf in $taskFiles) {
+    if (-not (Test-Path -LiteralPath $tf)) { Write-Note "不存在：$tf"; continue }
+    try {
+        $acl = Get-Acl -LiteralPath $tf
+        $hasRead = $false
+        foreach ($ace in $acl.Access) {
+            if ($ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $usersSid.Value -and
+                ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read) -ne 0) {
+                $hasRead = $true
+            }
+        }
+        if ($hasRead) { Write-Ok ("已有读取权限：" + (Split-Path -Leaf $tf)); continue }
+        if (-not $apply) { Write-Note ("将授予 Users 读取：" + (Split-Path -Leaf $tf)); continue }
+
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, 'ReadAndExecute', 'Allow')
+        $acl.AddAccessRule($rule) | Out-Null
+        Set-Acl -LiteralPath $tf -AclObject $acl
+        $after = Get-Acl -LiteralPath $tf
+        $ok = $false
+        foreach ($ace in $after.Access) {
+            if ($ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $usersSid.Value -and
+                ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read) -ne 0) {
+                $ok = $true
+            }
+        }
+        if ($ok) { Write-Ok ("已授予读取：" + (Split-Path -Leaf $tf)) }
+        else { Write-Bad ("授予读取后回读不到 ACE：" + (Split-Path -Leaf $tf)) }
+    } catch { Write-Warn2 ("处理 " + $tf + " 失败：" + $_.Exception.Message) }
+}
+
+# ================================================================ 7 停用 v1
 Write-Step '停用 v1 闸门'
 if ($KeepLegacy) {
     Write-Warn2 '按 -KeepLegacy 保留 v1 闸门（两套调度会互相覆盖，仅用于短时观察）'
@@ -496,7 +555,7 @@ if ($KeepLegacy) {
     }
 }
 
-# ================================================================ 7 交回自动
+# ================================================================ 8 交回自动
 Write-Step '交回自动调度'
 if ($apply) {
     $rc = Invoke-Qmctl -Arguments @('state', 'auto')
@@ -506,7 +565,7 @@ if ($apply) {
     Write-Note '将执行 qmctl state auto（清掉手动静音与「今晚不再自动开」的抑制标记）'
 }
 
-# ================================================================ 8 立即对齐一次
+# ================================================================ 9 立即对齐一次
 Write-Step '立即对齐当前时间窗口'
 if ($apply) {
     $rc = Invoke-Qmctl -Arguments @('reconcile', '--apply', '--trigger', 'install')
@@ -517,7 +576,7 @@ if ($apply) {
     Write-Note '将执行 qmctl reconcile --apply --trigger install'
 }
 
-# ================================================================ 9 托盘
+# ================================================================ 10 托盘
 Write-Step '托盘'
 Start-Tray -ExePath (Join-Path $DeployDir $script:ExeName) -Apply $apply
 
