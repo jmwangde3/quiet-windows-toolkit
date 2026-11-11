@@ -76,6 +76,18 @@ namespace QuietMode.Core
                        timeoutMs, apply);
         }
 
+        /// <summary>
+        /// 只改调度开关（暂停/恢复）：先按普通权限跑，被拒绝再提权重试。
+        /// 这两种意图不会触发磁盘/维护动作，通常不需要 UAC，不该无谓弹框。
+        /// </summary>
+        public static QmctlCall ApplyIntentLight(string intent, int timeoutMs = 300000)
+        {
+            QmctlCall c = Run(new string[] { "apply", intent, "--apply" }, timeoutMs, false);
+            if (c.Ok) return c;
+            TrayLog.Write("apply " + intent + " 未成功（" + c.FailureText + "），改提权重试");
+            return Run(new string[] { "apply", intent, "--apply" }, timeoutMs, true);
+        }
+
         public static QmctlCall State(string sub, int timeoutMs = 60000)
         {
             return Run(new string[] { "state", sub }, timeoutMs, false);

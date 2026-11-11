@@ -22,7 +22,7 @@ namespace QuietMode.Ui
         private ContextMenuStrip menu;
         private readonly ToolStripMenuItem[] st = new ToolStripMenuItem[4];
         private ToolStripMenuItem toggle, reapply, bringOnline;
-        private ToolStripMenuItem gateToggle, spinToggle, spinMinutesItem;
+        private ToolStripMenuItem gateToggle, pauseItem, spinToggle, spinMinutesItem;
         private System.Windows.Forms.Timer timer;
         private System.Windows.Forms.Timer signalTimer;
         private System.Windows.Forms.Timer promoteTimer;
@@ -156,6 +156,11 @@ namespace QuietMode.Ui
             gateToggle = new ToolStripMenuItem("计划闸门");
             gateToggle.Click += delegate { ToggleGate(); };
             menu.Items.Add(gateToggle);
+
+            // 暂停 = 保留任务但不下手（v1 的 Pause/ReArm 语义），与「关闭闸门」区分开
+            pauseItem = new ToolStripMenuItem("暂停计划调度");
+            pauseItem.Click += delegate { TogglePause(); };
+            menu.Items.Add(pauseItem);
 
             spinToggle = new ToolStripMenuItem("硬盘空闲停转");
             spinToggle.Click += delegate { ToggleSpin(); };
@@ -309,7 +314,7 @@ namespace QuietMode.Ui
                 st[2].Text = "";
                 st[3].Text = "";
                 toggle.Text = "开启静音模式（不可用）";
-                foreach (ToolStripMenuItem m in new ToolStripMenuItem[] { toggle, reapply, bringOnline, gateToggle, spinToggle, spinMinutesItem })
+                foreach (ToolStripMenuItem m in new ToolStripMenuItem[] { toggle, reapply, bringOnline, gateToggle, pauseItem, spinToggle, spinMinutesItem })
                     m.Enabled = false;
                 SetIcon(Icons.Kind.Error, "QuietMode：找不到 qmctl");
                 return;
@@ -369,6 +374,11 @@ namespace QuietMode.Ui
                               + nightStart + " 脱机 → " + dayStart + " 联机";
             gateToggle.Checked = schedEnabled;
             gateToggle.Enabled = !busy;
+
+            bool paused = status["state"]["schedulePaused"].AsBool(false);
+            pauseItem.Text = paused ? "恢复计划调度（当前已暂停）" : "暂停计划调度（临时，重启保留）";
+            pauseItem.Checked = paused;
+            pauseItem.Enabled = !busy && schedEnabled;
 
             // ---- 停转 ----
             int ac = status["spinDown"]["acSeconds"].AsInt(-1);
@@ -496,6 +506,22 @@ namespace QuietMode.Ui
                     enable ? "已启用：夜间到点脱机、白天到点联机。"
                            : "已关闭：今晚不会自动脱机。正在脱机的盘需要手动「立即联机硬盘」。",
                     ToolTipIcon.Info);
+            });
+        }
+
+        private void TogglePause()
+        {
+            if (busy) return;
+            bool paused = status["state"]["schedulePaused"].AsBool(false);
+            string intent = paused ? "resume" : "pause";
+            RunAction(paused ? "恢复计划调度" : "暂停计划调度", delegate
+            {
+                QmctlCall c = QmctlClient.ApplyIntentLight(intent);
+                if (c.ElevationCancelled) return new ActionResult(false, "管理员权限被取消，调度状态未改变。", ToolTipIcon.Warning);
+                if (!c.Ok) return new ActionResult(false, "调度状态未改变：" + c.FailureText, ToolTipIcon.Warning);
+                return new ActionResult(true, paused
+                    ? "已恢复：下一次 reconcile 会按时间窗口正常进入夜间/白天。"
+                    : "已暂停：任务仍在，到点不会动手；恢复后按当前时间重新判定。", ToolTipIcon.Info);
             });
         }
 
