@@ -165,7 +165,12 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - 界面只显示观测值：`offline`/`exists` 读不到时序列化为 `null`，显示“状态未知”而不是“正常”；计划任务未注册、v1 闸门仍启用都会常驻警告。
   - 单测 81 项（新增 5 项托盘契约）+ `Test-QuietMode.ps1` 新增“托盘契约：status 字段齐全（只读）”，全部通过。
   - 详见 [`docs/TRAY.md`](docs/TRAY.md)。
-- **Phase 6–7**：安装迁移恢复、测试与 CI 收尾，见规格 §11。
+- **Phase 6 安装 / 迁移 / 回滚 — 脚本已就绪**
+  - `Install-QuietMode.ps1 -Mode DryRun|Apply|Rollback`（在 `powershell/` 下）：预检 → 部署二进制 → 迁移配置 → 校验 → 抓 baseline → 注册 `\QuietMode\QuietMode-Reconcile` → 停用 v1 闸门 → 交回自动调度 → 立即对齐一次 → 重启托盘。
+  - 默认 DryRun 只读；Apply 需管理员；Rollback 删 v2 任务、恢复 v1 闸门与安装前的二进制，配置与 baseline 保留便于复诊。
+  - 二进制从编译输出复制到部署目录，逐文件 SHA256 比对，覆盖前备份到 `recovery\install-<时间戳>\`。
+  - `\QuietHDD\` 下的 v1 任务对普通用户不可见，脚本未提权时输出「无法确认」而不是「不存在」。
+- **Phase 7**：测试与 CI 收尾，见规格 §11。
 
 ```powershell
 # 编译 + 自检（不改系统状态）
