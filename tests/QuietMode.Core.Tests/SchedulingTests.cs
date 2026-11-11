@@ -212,6 +212,16 @@ namespace QuietMode.Core.Tests
                 True(p.Steps[2].Critical == false, "关闭的停转不应是关键步骤");
             });
 
+            Run("核对口径：无动作时按目标相位，夜里不套白天条件", delegate
+            {
+                ReconcilePlan night = ReconcilePlanner.Build("none", "schedule", "", FullConfig(), NightMaintenance(), true);
+                Eq("verify", night.Steps[0].Module);
+                Eq("night", night.Steps[0].Action);
+                ReconcilePlan day = ReconcilePlanner.Build("none", "schedule", "", FullConfig(), NightMaintenance(), false);
+                Eq("verify", day.Steps[0].Module);
+                Eq("day", day.Steps[0].Action);
+            });
+
             Run("漂移修复：无需动作但回读 Failed → 按目标相位重跑", delegate
             {
                 Eq("night", ReconcileVerifier.RepairTarget(true, "none", true, ReconcileVerdict.Failed));

@@ -128,7 +128,11 @@ namespace QuietMode.Windows
                     : MaintenancePlanner.BuildDay(cfg, baseline ?? new BaselineSnapshot(), obs);
             }
 
-            run.Plan = ReconcilePlanner.Build(resolved, run.Trigger, run.Decision == null ? "" : run.Decision.Reason, cfg, maint);
+            bool targetNight = run.Decision != null
+                ? run.Decision.TargetNight
+                : string.Equals(resolved, "night", StringComparison.OrdinalIgnoreCase);
+            run.Plan = ReconcilePlanner.Build(resolved, run.Trigger, run.Decision == null ? "" : run.Decision.Reason,
+                                              cfg, maint, targetNight);
 
             string asked = (action ?? "").Trim().ToLowerInvariant();
             if (asked.Length > 0 && asked != "auto" && asked != "reconcile"
@@ -353,11 +357,16 @@ namespace QuietMode.Windows
                 }
             }
 
+            // 核对口径跟目标相位走，而不是跟 action 字符串走：action=none 时夜里仍是 night。
+            string verifyAction = string.Equals(run.Action, "none", StringComparison.OrdinalIgnoreCase)
+                ? (run.Decision != null && run.Decision.TargetNight ? "night" : "day")
+                : run.Action;
+
             FanObservation fan = null;
             if (cfg.Fan.Enabled)
             {
-                bool wantSilent = string.Equals(run.Action, "night", StringComparison.OrdinalIgnoreCase)
-                                  || run.Action == "verify-night";
+                bool wantSilent = string.Equals(verifyAction, "night", StringComparison.OrdinalIgnoreCase)
+                                  || verifyAction == "verify-night";
                 fan = FanProbe.Read(cfg.Fan, wantSilent);
             }
 
@@ -375,7 +384,7 @@ namespace QuietMode.Windows
             }
 
             run.Verification = ReconcileVerifier.Verify(
-                run.Action == "none" ? "day" : run.Action, cfg, baseline, obs, disks, fan, spin);
+                verifyAction, cfg, baseline, obs, disks, fan, spin);
         }
 
         private static void PersistState(QuietModePaths paths, ReconcileRun run, QuietModeState state)

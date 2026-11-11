@@ -14,6 +14,17 @@ namespace QuietMode.Core.Scheduling
         public static ReconcilePlan Build(string action, string trigger, string reason,
                                           QuietModeConfig cfg, MaintenancePlan maintenance)
         {
+            return Build(action, trigger, reason, cfg, maintenance, (bool?)null);
+        }
+
+        /// <summary>
+        /// targetNight 只在 action=none / verify（即「只回读核对」）时有意义：
+        /// 夜里核对必须按夜间的期望来，否则「维护任务应当启用」这种白天条件会把一个
+        /// 完全正常的夜间状态判成 Failed。早期固定成 day，正是漂移修复每十分钟空转的原因。
+        /// </summary>
+        public static ReconcilePlan Build(string action, string trigger, string reason,
+                                          QuietModeConfig cfg, MaintenancePlan maintenance, bool? targetNight)
+        {
             if (cfg == null) throw new ArgumentNullException("cfg");
             ReconcilePlan p = new ReconcilePlan();
             p.Action = NormalizeAction(action);
@@ -21,7 +32,7 @@ namespace QuietMode.Core.Scheduling
             p.Reason = reason ?? "";
             p.CreatedUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture);
 
-            bool night = p.Action == "night";
+            bool night = targetNight.HasValue ? targetNight.Value : p.Action == "night";
             int enabledTargets = CountEnabledTargets(cfg);
 
             if (p.Action == "verify")
