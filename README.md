@@ -133,7 +133,17 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - 每个写动作 `-ErrorAction Stop` + 写后复读；C# 再独立复观测一次才下结论。未提权 `--apply` 步骤标 `[未执行]`，退出码 2。
   - 单测 60 项 + `powershell\Test-MaintenanceSafety.ps1` 只读集成测试，全部通过。
   - 详见 [`docs/MAINTENANCE.md`](docs/MAINTENANCE.md)。
-- **Phase 4–7**：单一 Worker 与调度、C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
+- **Phase 4 统一 Worker 与调度 — 已完成**
+  - 只保留一个计划任务 `\QuietMode\QuietMode-Reconcile`：23:58 / 10:02 / 开机+2min / 睡眠恢复 / 解锁 / 登录，夜间每 10 分钟校验一次；SYSTEM + Highest、`WakeToRun=false`、忽略并发、10 分钟执行上限。
+  - `StateMachine` 是唯一决策点（10 个状态，优先级：恢复 → 手动 → 暂停 → 时间 → 默认白天），`StateMachine.ApplyRun` 是唯一状态写回点。
+  - `ScheduleWindow` 用完整 `HH:mm` 判跨午夜窗口，开机补偿显式配置（默认开机 15 分钟内、06:00 之后算白天）。
+  - `ReconcilePlanner` 固定顺序：夜间 维护→磁盘→风扇→验证，白天 磁盘→维护→风扇→验证。
+  - `Invoke-QuietModeWorker.ps1` 是唯一执行器：接收请求 JSON，只按步骤做事，不做判断；未提权时全部步骤标 `notrun`，绝不做一半。
+  - 风扇改用 `IpcCtl.exe list` 的 `current=` 回读真实配置（v1 注释里「FanControl 不暴露当前配置名」不成立）。
+  - `qmctl reconcile [auto|night|day|restore|verify] [--trigger X] [--apply]`、`qmctl task status|print|install|uninstall|disable-legacy`、`qmctl state pause|resume|rearm|manual-quiet|manual-normal|auto`。
+  - 单测 76 项 + `powershell\Test-SchedulingSafety.ps1` 只读集成测试（任务 XML 唯一性、演练不改状态、未提权必失败），全部通过。
+  - 详见 [`docs/SCHEDULING.md`](docs/SCHEDULING.md)。
+- **Phase 5–7**：C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
 
 ```powershell
 # 编译 + 自检（不改系统状态）

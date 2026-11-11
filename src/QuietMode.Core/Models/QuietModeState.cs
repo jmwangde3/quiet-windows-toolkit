@@ -10,13 +10,22 @@ namespace QuietMode.Core.Models
     /// </summary>
     public sealed class QuietModeState
     {
-        public const int CurrentSchemaVersion = 2;
+        public const int CurrentSchemaVersion = 3;
 
         public int SchemaVersion = CurrentSchemaVersion;
         public bool ModeOn;
         public bool SchedulePaused;
         public bool AutoSilentActive;
         public bool AutoSilentSuppressed;
+        /// <summary>最近一次 reconcile 的结论：Ok | Degraded | Failed | NotRun。</summary>
+        public string LastVerdict = "";
+        public string LastErrorCode = "";
+        /// <summary>最近一次 reconcile 执行的动作：night | day | restore | none。</summary>
+        public string LastReconcileAction = "";
+        /// <summary>连续失败次数；成功清零。用于 UI 区分「正在重试」和「一直失败」。</summary>
+        public int ConsecutiveFailures;
+        /// <summary>最近一次决策出的控制器状态，仅作展示与排查用。</summary>
+        public string ControllerState = "";
         /// <summary>当日已执行过一次「完整关闭静音模式」的日期戳（yyyy-MM-dd）。</summary>
         public string AutoOffDayStamp = "";
         public string LastNightRunUtc = "";
@@ -33,6 +42,11 @@ namespace QuietMode.Core.Models
             o.Set("schedulePaused", SchedulePaused);
             o.Set("autoSilentActive", AutoSilentActive);
             o.Set("autoSilentSuppressed", AutoSilentSuppressed);
+            o.Set("lastVerdict", LastVerdict ?? "");
+            o.Set("lastErrorCode", LastErrorCode ?? "");
+            o.Set("lastReconcileAction", LastReconcileAction ?? "");
+            o.Set("consecutiveFailures", ConsecutiveFailures);
+            o.Set("controllerState", ControllerState ?? "");
             o.Set("autoOffDayStamp", AutoOffDayStamp ?? "");
             o.Set("lastNightRunUtc", LastNightRunUtc ?? "");
             o.Set("lastDayRunUtc", LastDayRunUtc ?? "");
@@ -51,6 +65,11 @@ namespace QuietMode.Core.Models
             s.SchedulePaused = o.GetBool("schedulePaused", false);
             s.AutoSilentActive = o.GetBool("autoSilentActive", false);
             s.AutoSilentSuppressed = o.GetBool("autoSilentSuppressed", false);
+            s.LastVerdict = o.GetString("lastVerdict", "");
+            s.LastErrorCode = o.GetString("lastErrorCode", "");
+            s.LastReconcileAction = o.GetString("lastReconcileAction", "");
+            s.ConsecutiveFailures = o.GetInt("consecutiveFailures", 0);
+            s.ControllerState = o.GetString("controllerState", "");
             s.AutoOffDayStamp = o.GetString("autoOffDayStamp", "");
             s.LastNightRunUtc = o.GetString("lastNightRunUtc", "");
             s.LastDayRunUtc = o.GetString("lastDayRunUtc", "");

@@ -49,6 +49,7 @@ namespace QuietMode.Core.Tests
 
             RunDiskTests();
             RunMaintenanceTests();
+            RunSchedulingTests();
 
             Console.WriteLine();
             Console.WriteLine("通过 " + _pass + " / 失败 " + _fail);

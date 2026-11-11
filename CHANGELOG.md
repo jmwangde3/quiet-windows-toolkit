@@ -1,5 +1,37 @@
 # 变更记录
 
+## 2.0.0-phase4 — 2026-11-11
+
+统一 Worker 与调度。**不改变运行中的系统状态**：默认演练，`--apply` 才动手，未提权必然失败。
+
+### 新增
+
+- `src/QuietMode.Core/Scheduling/`
+  - `ScheduleWindow.cs`：完整 `HH:mm` 的跨午夜窗口判定 + 显式开机补偿，带原因输出。
+  - `ControllerState.cs`：10 个控制器状态 + `StateMachine`（唯一决策点）+ `ApplyRun`（唯一状态写回点）。
+  - `ReconcileModels.cs`：reconcile 计划 / 步骤结果 / 磁盘与风扇观测 / 三档验证结论。
+  - `ReconcilePlanner.cs`：夜间与白天两条固定顺序 + `ReconcileVerifier`（全组件验证，缺一项不报成功）。
+- `src/QuietMode.Windows/ReconcileController.cs`：决策 → 计划 → 调 Worker → 复观测 → 独立验证 → 写回状态。
+- `src/QuietMode.Windows/SchedulerInstaller.cs`：`\QuietMode\QuietMode-Reconcile` 的 XML 生成、注册、卸载、v1 闸门检查与停用。
+- `src/QuietMode.Windows/Native/FanProbe.cs`：`IpcCtl.exe list` 解析 `current=`，风扇配置真实回读。
+- `powershell/Worker/Invoke-QuietModeWorker.ps1`：唯一执行器（`-Reconcile/-EnterNight/-EnterDay/...` 统一到请求 JSON）。
+- `powershell/Modules/QuietMode.Fan.psm1`：风扇切换唯一写入口，切换后回读比对。
+- `powershell/Test-SchedulingSafety.ps1`：只读集成测试 9 项。
+- `qmctl reconcile`、`qmctl task status|print|install|uninstall|disable-legacy`、`qmctl state pause|resume|rearm|manual-quiet|manual-normal|auto`。
+- `docs/SCHEDULING.md`。
+
+### 修正
+
+- **风扇状态不再靠猜**。v1 注释写「FanControl 未暴露当前配置名」，实测 `IpcCtl.exe list` 直接返回 `current=<文件名> folder=<目录>`，v2 用它做回读验证。
+- **v1 闸门读取失败不再等于「没有冲突」**。`\QuietHDD\` 的 ACL 让普通用户读不到任务，`task status` 现在把「读不到」判为可能冲突，而不是报「没有重复调度」。
+- `QuietModeState` schema 3：新增 `lastVerdict` / `lastErrorCode` / `lastReconcileAction` / `consecutiveFailures` / `controllerState`。
+
+### 测试
+
+- 单测 76 项（新增 16 项：时间窗口 3、状态机 6、计划顺序 3、验证 4）。
+- `Test-SchedulingSafety.ps1` 9 项全过，并挂进 `Test-QuietMode.ps1`。
+- 实机：`reconcile` 演练在 22:47 正确判为白天并给出 `DayActive`；`reconcile night` 演练输出 4 步计划与逐项失败原因（7 个任务仍启用、SysMain `Start=2`、两块盘 Online、风扇当前 `FanControl.json`），全程未改动任何状态。
+
 ## 2.0.0-phase3 — 2026-11-11
 
 Windows 维护管理重构。**不改变运行中的系统状态**：默认演练，`--apply` 才动手，未提权必然失败。

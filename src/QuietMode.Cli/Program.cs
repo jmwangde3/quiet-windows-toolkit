@@ -9,6 +9,7 @@ using QuietMode.Core.Json;
 using QuietMode.Core.Maintenance;
 using QuietMode.Core.Models;
 using QuietMode.Core.Processes;
+using QuietMode.Core.Scheduling;
 using QuietMode.Windows;
 using QuietMode.Windows.Native;
 
@@ -24,6 +25,7 @@ namespace QuietMode.Cli
         private static bool _json;
         private static string _root;
         private static string _outPath;
+        private static string _trigger = "cli";
 
         public static int Main(string[] args)
         {
@@ -44,6 +46,10 @@ namespace QuietMode.Cli
                     case "--reset": reset = true; break;
                     case "--apply": apply = true; break;
                     case "--processes": withProcess = true; break;
+                    case "--trigger":
+                        if (i + 1 < args.Length) { _trigger = args[++i]; }
+                        else return Fail("--trigger 需要一个参数（boot|resume|unlock|schedule|timer|manual|cli）");
+                        break;
                     case "--out":
                         if (i + 1 < args.Length) { _outPath = args[++i]; }
                         else return Fail("--out 需要一个路径参数");
@@ -85,6 +91,10 @@ namespace QuietMode.Cli
                     return DisksCommand(paths, sub, rest, force, apply, withProcess);
                 case "maint":
                     return MaintCommand(paths, sub, rest, apply);
+                case "reconcile":
+                    return ReconcileCommand(paths, sub, apply);
+                case "task":
+                    return TaskCommand(paths, sub, apply);
                 case "paths":
                     return PathsCommand(paths);
                 default:
@@ -302,13 +312,60 @@ namespace QuietMode.Cli
         {
             StateStore store = new StateStore(paths);
             QuietModeState s = store.Load();
-            if (sub == "show" || sub == "")
+
+            switch (sub)
             {
-                if (_json) { Emit(s.ToJson()); return 0; }
-                if (!_quiet) Console.WriteLine(s.ToJson().ToJson(true));
-                return 0;
+                case "":
+                case "show":
+                    if (_json) { Emit(s.ToJson()); return 0; }
+                    if (!_quiet) Console.WriteLine(s.ToJson().ToJson(true));
+                    return 0;
+
+                // 只改状态，不碰系统。真正的生效由下一次 reconcile 完成，
+                // 这样「谁决定」和「谁执行」不会分裂成两套。
+                case "pause":
+                    s.SchedulePaused = true;
+                    return SaveState(store, s, "调度已暂停");
+
+                case "resume":
+                    s.SchedulePaused = false;
+                    return SaveState(store, s, "调度已恢复");
+
+                case "rearm":
+                    s.SchedulePaused = false;
+                    s.AutoSilentSuppressed = false;
+                    s.ModeOn = false;
+                    return SaveState(store, s, "已重新武装：清除暂停与今晚的抑制标记");
+
+                case "manual-quiet":
+                    s.ModeOn = true;
+                    s.AutoSilentSuppressed = false;
+                    return SaveState(store, s, "手动静音已记录（下一次 reconcile 执行）");
+
+                case "manual-normal":
+                    s.ModeOn = false;
+                    s.AutoSilentSuppressed = true;
+                    return SaveState(store, s, "手动关闭已记录（今晚不再自动开启）");
+
+                case "auto":
+                    s.ModeOn = false;
+                    s.AutoSilentSuppressed = false;
+                    s.SchedulePaused = false;
+                    return SaveState(store, s, "已交回自动调度");
+
+                default:
+                    Console.WriteLine("state 子命令：show | pause | resume | rearm | manual-quiet | manual-normal | auto");
+                    return 1;
             }
-            return Fail("state 子命令：show");
+        }
+
+        private static int SaveState(StateStore store, QuietModeState s, string message)
+        {
+            try { store.Save(s); }
+            catch (Exception ex) { return Fail("写 state.json 失败：" + ex.Message); }
+            if (_json) Emit(s.ToJson());
+            else if (!_quiet) Console.WriteLine(message);
+            return 0;
         }
 
         private static int DisksCommand(QuietModePaths paths, string sub, List<string> rest, bool force, bool apply, bool withProcess)
@@ -940,6 +997,181 @@ namespace QuietMode.Cli
             return 0;
         }
 
+        // ---------------- reconcile / task ----------------
+
+        /// <summary>
+        /// 唯一调度入口。不带 --apply 只做决策与计划，不碰系统状态。
+        /// </summary>
+        private static int ReconcileCommand(QuietModePaths paths, string sub, bool apply)
+        {
+            QuietModeConfig cfg;
+            int rc = LoadConfig(paths, out cfg);
+            if (rc != 0) return rc;
+
+            SnapshotManager snapshots = new SnapshotManager(paths, cfg);
+            BaselineSnapshot baseline = snapshots.Load();
+            StateStore stateStore = new StateStore(paths);
+            QuietModeState state = stateStore.Load();
+
+            string action = string.IsNullOrEmpty(sub) ? "auto" : sub;
+            bool writes = apply && action != "verify";
+
+            if (writes && baseline == null)
+            {
+                if (_json) Emit(new JsonObject().Set("ok", false).Set("error", "baseline.json 不存在，先运行 qmctl snapshot create"));
+                else Console.Error.WriteLine("baseline.json 不存在：先运行 qmctl snapshot create（白天恢复和夜间边界都需要原始状态）");
+                return 2;
+            }
+
+            ReconcileRun run = ReconcileController.Run(paths, cfg, baseline, state, action, _trigger, apply, 300000);
+
+            if (_json)
+            {
+                JsonObject o = run.ToJson();
+                Emit(o);
+                if (!apply) return 0;
+                if (!string.IsNullOrEmpty(run.Error) && run.Action == "none") return 2;
+                return run.Ok ? 0 : 2;
+            }
+            if (_quiet)
+            {
+                if (!apply) return 0;
+                return run.Ok ? 0 : 2;
+            }
+
+            Console.WriteLine("触发：" + run.Trigger + "    时间：" + (run.Window == null ? "" : run.Window.ToLine()));
+            Console.WriteLine("决策：" + (run.Decision == null ? "(无)" : run.Decision.ToLine()));
+            Console.WriteLine();
+
+            if (run.Plan != null) Console.WriteLine(run.Plan.ToText());
+
+            if (!apply || run.Action == "none")
+            {
+                Console.WriteLine();
+                if (run.Verification != null) Console.WriteLine(run.Verification.ToText());
+                Console.WriteLine();
+                Console.WriteLine(run.Action == "none"
+                    ? "（无需动作）"
+                    : "（演练：未改动任何状态。加 --apply 才真正执行）");
+                return 0;
+            }
+
+            Console.WriteLine();
+            Console.WriteLine("执行结果：");
+            foreach (ReconcileStep s in run.Plan.Steps) Console.WriteLine("  " + s.ToLine());
+            if (!string.IsNullOrEmpty(run.Error)) Console.WriteLine("错误：" + run.Error);
+            Console.WriteLine();
+            if (run.Verification != null) Console.WriteLine(run.Verification.ToText());
+            Console.WriteLine();
+            Console.WriteLine("状态：" + (run.StateSaved ? "已写回 state.json" : "未写回"));
+            return run.Ok ? 0 : 2;
+        }
+
+        private static int TaskCommand(QuietModePaths paths, string sub, bool apply)
+        {
+            QuietModeConfig cfg;
+            int rc = LoadConfig(paths, out cfg);
+            if (rc != 0) return rc;
+
+            switch (sub)
+            {
+                case "":
+                case "status":
+                {
+                    SchedulerStatus st = SchedulerInstaller.Inspect();
+                    if (_json)
+                    {
+                        JsonObject o = new JsonObject();
+                        o.Set("taskPath", st.TaskPath);
+                        o.Set("taskName", st.TaskName);
+                        o.Set("exists", st.Exists.HasValue ? (JsonNode)new JsonBool(st.Exists.Value) : JsonNull.Instance);
+                        o.Set("state", st.State ?? "");
+                        o.Set("lastRunTime", st.LastRunTime ?? "");
+                        o.Set("lastResult", st.LastResult ?? "");
+                        o.Set("conflict", st.Conflict);
+                        o.Set("error", st.Error ?? "");
+                        JsonArray arr;
+                        o.SetArray("legacy", out arr);
+                        for (int i = 0; i < st.LegacyNames.Count; i++)
+                        {
+                            TaskQueryResult t = st.Legacy[i];
+                            JsonObject item;
+                            arr.AddObject(out item);
+                            item.Set("name", st.LegacyNames[i]);
+                            item.Set("exists", t.Exists.HasValue ? (JsonNode)new JsonBool(t.Exists.Value) : JsonNull.Instance);
+                            item.Set("enabled", t.Enabled.HasValue ? (JsonNode)new JsonBool(t.Enabled.Value) : JsonNull.Instance);
+                            item.Set("error", t.Error ?? "");
+                        }
+                        Emit(o);
+                        return 0;
+                    }
+                    if (_quiet) return st.Conflict ? 2 : 0;
+                    Console.WriteLine(st.ToText());
+                    return st.Conflict ? 2 : 0;
+                }
+
+                case "print":
+                {
+                    string command, arguments, workingDir;
+                    SchedulerInstaller.BuildCommandLine(paths.Root, out command, out arguments, out workingDir);
+                    string xml = SchedulerInstaller.BuildXml(cfg.Schedule, command, arguments, workingDir, "QuietMode 统一调度");
+                    Console.WriteLine(xml);
+                    return 0;
+                }
+
+                case "install":
+                {
+                    string xml;
+                    string err = SchedulerInstaller.Install(cfg.Schedule, paths.Root, apply, out xml);
+                    if (!apply)
+                    {
+                        if (!_quiet)
+                        {
+                            string command, arguments, workingDir;
+                            SchedulerInstaller.BuildCommandLine(paths.Root, out command, out arguments, out workingDir);
+                            Console.WriteLine(SchedulerInstaller.BuildXml(cfg.Schedule, command, arguments, workingDir, "QuietMode 统一调度"));
+                            Console.WriteLine();
+                            Console.WriteLine("（演练：未注册。加 --apply 才写入计划任务，需要管理员）");
+                        }
+                        return 0;
+                    }
+                    if (!string.IsNullOrEmpty(err)) return Fail(err);
+                    SchedulerStatus after = SchedulerInstaller.Inspect();
+                    if (!_quiet)
+                    {
+                        Console.WriteLine("已注册 " + SchedulerInstaller.FullName + "，回读状态：" + (after.Exists == true ? after.State : "未找到"));
+                        if (after.Conflict) Console.WriteLine("警告：v1 闸门仍在启用，先运行 qmctl task disable-legacy --apply");
+                    }
+                    return after.Exists == true ? 0 : 2;
+                }
+
+                case "uninstall":
+                {
+                    string err = SchedulerInstaller.Uninstall(apply);
+                    if (!apply)
+                    {
+                        if (!_quiet) Console.WriteLine("（演练：未删除。加 --apply 才移除 " + SchedulerInstaller.FullName + "）");
+                        return 0;
+                    }
+                    if (!string.IsNullOrEmpty(err)) return Fail(err);
+                    if (!_quiet) Console.WriteLine("已删除 " + SchedulerInstaller.FullName);
+                    return 0;
+                }
+
+                case "disable-legacy":
+                {
+                    List<string> log = SchedulerInstaller.DisableLegacy(apply);
+                    foreach (string line in log) Console.WriteLine((apply ? "" : "[演练] ") + line);
+                    if (!apply) Console.WriteLine("（加 --apply 才真正禁用，需要管理员）");
+                    return 0;
+                }
+
+                default:
+                    Console.WriteLine("task 子命令：status | print | install [--apply] | uninstall [--apply] | disable-legacy [--apply]");
+                    return 1;
+            }
+        }
+
         private static int PathsCommand(QuietModePaths paths)
         {
             if (_json)
@@ -999,6 +1231,14 @@ namespace QuietMode.Cli
             Console.WriteLine("  maint verify night|day      只读验证当前是否达成目标状态");
             Console.WriteLine("  maint baseline-enable  <序号|all> --apply  把 baseline 纠正为「启用」");
             Console.WriteLine("  maint baseline-disable <序号|all> --apply  把 baseline 纠正为「禁用」");
+            Console.WriteLine("  reconcile [auto|night|day|restore|verify] [--trigger X] [--apply]");
+            Console.WriteLine("                              唯一调度入口：决策 → 计划 → 执行 → 复验 → 写回状态");
+            Console.WriteLine("  task status                 v2 任务是否存在 + v1 遗留闸门是否仍在启用");
+            Console.WriteLine("  task print                  打印将要注册的任务 XML");
+            Console.WriteLine("  task install [--apply]      注册 \\QuietMode\\QuietMode-Reconcile（需管理员）");
+            Console.WriteLine("  task uninstall [--apply]    删除该任务");
+            Console.WriteLine("  task disable-legacy [--apply]  停用 \\QuietHDD\\ 下的 v1 闸门");
+            Console.WriteLine("  state show|pause|resume|rearm|manual-quiet|manual-normal|auto");
             Console.WriteLine();
             Console.WriteLine("退出码: 0 成功 / 1 一般失败 / 2 校验失败或操作未达成");
         }

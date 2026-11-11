@@ -117,6 +117,13 @@ Step '维护管理（只读集成测试）' {
     if ($LASTEXITCODE -ne 0) { throw "维护管理测试失败（退出码 $LASTEXITCODE）" }
 }
 
+Step '统一调度（只读集成测试）' {
+    $script = Join-Path $PSScriptRoot 'Test-SchedulingSafety.ps1'
+    $out = & $script
+    $out | ForEach-Object { Write-Host ("    " + $_) }
+    if ($LASTEXITCODE -ne 0) { throw "统一调度测试失败（退出码 $LASTEXITCODE）" }
+}
+
 Step '维护计划与验证（只读）' {
     $paths = Get-QuietModePaths -Root $Root
     if (-not (Test-Path -LiteralPath $paths.baseline)) {
