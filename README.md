@@ -101,6 +101,19 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
 - 脱机 / 联机磁盘、启停计划任务需要管理员权限（托盘程序会按需弹 UAC）
 - FanControl（风扇曲线切换，用户态命名管道，无需管理员）
 
+## v2.0 重构（进行中）
+
+完整规格见 [`docs/V2_SPEC.md`](docs/V2_SPEC.md)。按阶段推进，不一次性重写全部代码。
+
+- **Phase 0 代码审计与行为基线 — 已完成**
+  - `docs/LEGACY_AUDIT.md`：全部脚本入口、计划任务、注册表 / 服务 / 电源 / 磁盘 / 进程 / FanControl IPC 修改点，依赖图，缺口清单；未识别的系统修改 = 0。
+  - `docs/LEGACY_BEHAVIOR.md`：夜间 / 白天 / 开机补跑 / Pause-ReArm / DISKIDLE / 自动静音的实测行为基线，含 2026-11-10 夜间实测异常。
+  - `docs/ARCHITECTURE.md`：现状架构、v2 目标映射、Phase 0–7 路线与迁移安全要点。
+- **Phase 1 统一配置与快照 — 待开始**：`config.json` / `baseline.json` / 原子写 / ConfigValidator / ConfigMigrator / SnapshotManager，不改动运行时系统状态。
+- **Phase 2–7**：磁盘稳定身份、统一维护清单、单一 Worker 与调度、C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
+
+审计结论：v1 存在两套并行闸门、维护任务清单在 6 处重复定义且不一致、白天恢复用硬编码默认值而非原始快照、磁盘身份只用磁盘编号、Worker 只报 `*_REQUESTED` 不回读验证等 10 项结构性缺陷。系统盘 / 页面文件保护与 DISKIDLE 独立性两项已满足，重构时不得回退。
+
 ## 许可
 
 MIT，见 `LICENSE`。
