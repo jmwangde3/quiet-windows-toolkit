@@ -88,6 +88,28 @@ Step 'baseline 校验' {
     }
 }
 
+Step '磁盘身份解析' {
+    $paths = Get-QuietModePaths -Root $Root
+    if (-not (Test-Path -LiteralPath $paths.config)) {
+        Write-Host '    SKIP  尚未安装（没有 config.json）' -ForegroundColor DarkGray
+        return
+    }
+    $r = Invoke-QuietModeToolJson -Arguments @('disks', 'resolve') -Root $Root
+    if ($null -eq $r.Data) { throw "disks resolve 无输出（退出码 $($r.ExitCode)）" }
+    foreach ($t in @($r.Data.targets)) {
+        $line = "    {0,-16} {1}" -f $t.status, $t.uniqueId
+        if ($t.status -eq 'matched') { Write-Host $line } else { Write-Host ($line + "  " + $t.reason) -ForegroundColor Yellow }
+    }
+    if ($r.ExitCode -ne 0) { throw '存在无法唯一匹配的磁盘目标（不会执行任何磁盘操作）' }
+}
+
+Step '磁盘安全闸门（只读集成测试）' {
+    $script = Join-Path $PSScriptRoot 'Test-DiskSafety.ps1'
+    $out = & $script -Configuration $Configuration
+    $out | ForEach-Object { Write-Host ("    " + $_) }
+    if ($LASTEXITCODE -ne 0) { throw "磁盘安全测试失败（退出码 $LASTEXITCODE）" }
+}
+
 Write-Host ''
 if ($failures.Count -eq 0) {
     Write-Host 'ALL PASS' -ForegroundColor Green

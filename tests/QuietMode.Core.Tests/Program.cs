@@ -10,10 +10,11 @@ using QuietMode.Core.Models;
 namespace QuietMode.Core.Tests
 {
     /// <summary>
-    /// Phase 1 单测入口。不依赖测试框架（离线可跑，CI 只看退出码）。
-    /// 覆盖：JSON 层、默认策略、校验器、原子写 / last-known-good、v1 迁移、state、快照完整性。
+    /// 单测入口。不依赖测试框架（离线可跑，CI 只看退出码）。
+    /// Phase 1：JSON 层、默认策略、校验器、原子写 / last-known-good、v1 迁移、state、快照完整性。
+    /// Phase 2：磁盘身份解析、安全闸门、操作结果不变式。
     /// </summary>
-    public static class Program
+    public static partial class Program
     {
         private static int _pass;
         private static int _fail;
@@ -45,6 +46,8 @@ namespace QuietMode.Core.Tests
             Run("快照完整性：确定性 / 篡改可检出", TestSnapshotIntegrity);
             Run("维护任务清单：无重复、含 Regular Maintenance", TestMaintenanceCatalog);
             Run("时间解析边界", TestTimeText);
+
+            RunDiskTests();
 
             Console.WriteLine();
             Console.WriteLine("通过 " + _pass + " / 失败 " + _fail);

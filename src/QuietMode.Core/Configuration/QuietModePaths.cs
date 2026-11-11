@@ -40,11 +40,19 @@ namespace QuietMode.Core.Configuration
 
         public string TaskBackupDir { get { return Path.Combine(RecoveryDir, "tasks"); } }
 
+        /// <summary>进程间传递结构化请求/结果用的临时目录（不长期保存）。</summary>
+        public string RunDir { get { return Path.Combine(Root, "run"); } }
+
+        public string DiskLogPath { get { return Path.Combine(LogDir, "disks.log"); } }
+
+        public string WorkerLogPath { get { return Path.Combine(LogDir, "worker.log"); } }
+
         public void EnsureLayout()
         {
             Directory.CreateDirectory(Root);
             Directory.CreateDirectory(LogDir);
             Directory.CreateDirectory(RecoveryDir);
+            Directory.CreateDirectory(RunDir);
         }
 
         public override string ToString() { return Root; }

@@ -4,8 +4,10 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using QuietMode.Core.Configuration;
+using QuietMode.Core.Disks;
 using QuietMode.Core.Json;
 using QuietMode.Core.Models;
+using QuietMode.Core.Processes;
 using QuietMode.Windows;
 using QuietMode.Windows.Native;
 
@@ -28,7 +30,7 @@ namespace QuietMode.Cli
             catch { }
 
             List<string> positional = new List<string>();
-            bool force = false, reset = false;
+            bool force = false, reset = false, apply = false, withProcess = false;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -39,6 +41,8 @@ namespace QuietMode.Cli
                     case "--json": _json = true; break;
                     case "--force": force = true; break;
                     case "--reset": reset = true; break;
+                    case "--apply": apply = true; break;
+                    case "--processes": withProcess = true; break;
                     case "--out":
                         if (i + 1 < args.Length) { _outPath = args[++i]; }
                         else return Fail("--out 需要一个路径参数");
@@ -66,6 +70,7 @@ namespace QuietMode.Cli
 
             string cmd = positional[0].ToLowerInvariant();
             string sub = positional.Count > 1 ? positional[1].ToLowerInvariant() : "";
+            List<string> rest = positional.Count > 2 ? positional.GetRange(2, positional.Count - 2) : new List<string>();
 
             switch (cmd)
             {
@@ -76,7 +81,7 @@ namespace QuietMode.Cli
                 case "state":
                     return StateCommand(paths, sub);
                 case "disks":
-                    return DisksCommand(sub);
+                    return DisksCommand(paths, sub, rest, force, apply, withProcess);
                 case "paths":
                     return PathsCommand(paths);
                 default:
@@ -303,10 +308,24 @@ namespace QuietMode.Cli
             return Fail("state 子命令：show");
         }
 
-        private static int DisksCommand(string sub)
+        private static int DisksCommand(QuietModePaths paths, string sub, List<string> rest, bool force, bool apply, bool withProcess)
         {
-            if (sub != "" && sub != "list") return Fail("disks 子命令：list");
+            switch (sub)
+            {
+                case "":
+                case "list": return DisksList();
+                case "resolve": return DisksResolve(paths);
+                case "inspect": return DisksInspect(paths, rest, force, withProcess);
+                case "offline": return DisksChange(paths, rest, "offline", apply, force);
+                case "online": return DisksChange(paths, rest, "online", apply, force);
+                case "verify": return DisksChange(paths, rest, "verify", false, force);
+                default: return Fail("disks 子命令：list | resolve | inspect | offline | online | verify");
+            }
+        }
 
+        /// <summary>列出本机全部磁盘（只读，不需要配置文件）。</summary>
+        private static int DisksList()
+        {
             List<DiskSnapshot> disks = DiskInventory.Query();
             if (_json)
             {
@@ -320,11 +339,11 @@ namespace QuietMode.Cli
             if (_quiet) return disks.Count > 0 ? 0 : 2;
             if (disks.Count == 0) return Fail("磁盘清单为空（WMI 查询失败）");
 
-            Console.WriteLine("NUM  FRIENDLY                   SIZE        BUS     OFFLINE SYSTEM BOOT  UNIQUEID");
+            Console.WriteLine("NUM  FRIENDLY                     SIZE        BUS     OFFLINE SYSTEM BOOT  UNIQUEID");
             foreach (DiskSnapshot d in disks)
             {
                 Console.WriteLine(Pad(d.Number.ToString(CultureInfo.InvariantCulture), 5)
-                                  + Pad(d.FriendlyName, 28)
+                                  + Pad(d.FriendlyName, 30)
                                   + Pad(FormatSize(d.SizeBytes), 12)
                                   + Pad(d.BusType, 8)
                                   + Pad(Tri(d.IsOffline), 8)
@@ -333,6 +352,285 @@ namespace QuietMode.Cli
                                   + Short(d.UniqueId));
             }
             return 0;
+        }
+
+        /// <summary>把配置里的磁盘目标逐一与当前磁盘匹配，输出唯一命中情况。</summary>
+        private static int DisksResolve(QuietModePaths paths)
+        {
+            QuietModeConfig cfg;
+            int loadCode = LoadConfig(paths, out cfg);
+            if (loadCode != 0) return loadCode;
+
+            List<DiskSnapshot> disks = DiskInventory.Query();
+            List<DiskMatch> matches = DiskIdentityResolver.ResolveAll(cfg.Disks, disks);
+            bool allMatched = matches.Count > 0;
+            foreach (DiskMatch m in matches) if (!m.Unique) allMatched = false;
+
+            if (_json)
+            {
+                JsonArray arr = new JsonArray();
+                foreach (DiskMatch m in matches)
+                {
+                    JsonObject item;
+                    arr.AddObject(out item);
+                    item.Set("status", m.StatusText);
+                    item.Set("reason", m.Reason ?? "");
+                    item.Set("uniqueId", m.Target == null ? "" : m.Target.UniqueId);
+                    item.Set("serialNumber", m.Target == null ? "" : m.Target.SerialNumber);
+                    item.Set("friendlyName", m.Target == null ? "" : m.Target.FriendlyName);
+                    item.Set("diskNumber", m.Disk == null ? -1 : m.Disk.Number);
+                    JsonArray notes;
+                    item.SetArray("notes", out notes);
+                    foreach (string n in m.Notes) notes.Add(n);
+                }
+                JsonObject root = new JsonObject();
+                root.Set("disksEnabled", cfg.Disks.Enabled);
+                root.Set("targets", arr);
+                Emit(root);
+                return allMatched ? 0 : 2;
+            }
+            if (_quiet) return allMatched ? 0 : 2;
+
+            if (matches.Count == 0)
+                return Fail("配置中没有启用的磁盘目标（disks.enabled=" + cfg.Disks.Enabled + "）");
+
+            Console.WriteLine("IDX  STATUS           DISK  NAME                           UNIQUEID");
+            for (int i = 0; i < matches.Count; i++)
+            {
+                DiskMatch m = matches[i];
+                Console.WriteLine(Pad(i.ToString(CultureInfo.InvariantCulture), 5)
+                                  + Pad(m.StatusText, 17)
+                                  + Pad(m.Disk == null ? "-" : m.Disk.Number.ToString(CultureInfo.InvariantCulture), 6)
+                                  + Pad(m.Target == null ? "" : m.Target.FriendlyName, 31)
+                                  + Short(m.Target == null ? "" : m.Target.UniqueId));
+                if (m.Status != DiskMatchStatus.Matched || m.Notes.Count > 0)
+                    Console.WriteLine("       " + m.Reason + (m.Notes.Count > 0 ? "  [" + string.Join("；", m.Notes.ToArray()) + "]" : ""));
+            }
+            return allMatched ? 0 : 2;
+        }
+
+        /// <summary>身份 + 卷 + 页面文件 + 存储池 + 占用 + 安全结论，全部只读。</summary>
+        private static int DisksInspect(QuietModePaths paths, List<string> rest, bool force, bool withProcess)
+        {
+            QuietModeConfig cfg;
+            int loadCode = LoadConfig(paths, out cfg);
+            if (loadCode != 0) return loadCode;
+
+            List<DiskTarget> targets;
+            string selError;
+            if (!SelectTargets(cfg, rest, out targets, out selError)) return Fail(selError);
+
+            List<DiskSnapshot> disks = DiskInventory.Query();
+            List<JsonObject> jsonItems = new List<JsonObject>();
+            int problems = 0;
+
+            foreach (DiskTarget t in targets)
+            {
+                DiskMatch m = DiskIdentityResolver.Resolve(t, disks);
+                JsonObject item = new JsonObject();
+                item.Set("uniqueId", t.UniqueId ?? "");
+                item.Set("friendlyName", t.FriendlyName ?? "");
+                item.Set("matchStatus", m.StatusText);
+                item.Set("matchReason", m.Reason ?? "");
+                item.Set("diskNumber", m.Disk == null ? -1 : m.Disk.Number);
+
+                if (!m.Unique)
+                {
+                    problems++;
+                    jsonItems.Add(item);
+                    if (!_quiet && !_json)
+                        Console.WriteLine("× " + (string.IsNullOrEmpty(t.FriendlyName) ? Short(t.UniqueId) : t.FriendlyName)
+                                          + " → " + m.StatusText + "：" + m.Reason);
+                    continue;
+                }
+
+                DiskSafetyContext ctx = BuildSafetyContext(m.Disk, withProcess);
+                SafetyVerdict verdict = DiskSafetyGuard.Evaluate(ctx, force);
+                if (!verdict.Allowed) problems++;
+
+                JsonArray vols;
+                item.SetArray("volumes", out vols);
+                foreach (DiskVolumeInfo v in ctx.Volumes) vols.Add(v.ToJson());
+                item.Set("safetyAllowed", verdict.Allowed);
+                JsonArray blocks;
+                item.SetArray("blocks", out blocks);
+                foreach (string b in verdict.Blocks) blocks.Add(b);
+                JsonArray warns;
+                item.SetArray("warnings", out warns);
+                foreach (string w in verdict.Warnings) warns.Add(w);
+                if (ctx.Occupancy != null) item.Set("occupancy", ctx.Occupancy.ToJson());
+                jsonItems.Add(item);
+
+                if (_quiet || _json) continue;
+
+                Console.WriteLine("─ " + (string.IsNullOrEmpty(m.Disk.FriendlyName) ? "磁盘 #" + m.Disk.Number : m.Disk.FriendlyName)
+                                  + "   #" + m.Disk.Number + "   " + FormatSize(m.Disk.SizeBytes) + "   " + m.Disk.BusType
+                                  + "   " + (m.Disk.IsOffline == true ? "OFFLINE" : "ONLINE"));
+                Console.WriteLine("  uniqueId  " + m.Disk.UniqueId);
+                Console.WriteLine("  serial    " + m.Disk.SerialNumber + "   health=" + m.Disk.HealthStatus);
+                Console.WriteLine("  match     " + m.Reason);
+                foreach (string n in m.Notes) Console.WriteLine("  note      " + n);
+                foreach (DiskVolumeInfo v in ctx.Volumes)
+                    Console.WriteLine("  volume    " + Pad(v.Display, 24) + Pad(v.FileSystem, 8) + Pad(FormatSize(v.SizeBytes), 12)
+                                      + (v.IsSystem ? " [系统]" : "") + (v.IsBoot ? " [启动]" : ""));
+                if (ctx.PageFiles.Count > 0)
+                    Console.WriteLine("  pagefile  " + string.Join(", ", ctx.PageFiles.ToArray())
+                                      + (ctx.AutomaticManagedPagefile == true ? "  [自动管理]" : ""));
+                if (!string.IsNullOrEmpty(ctx.DumpFile))
+                    Console.WriteLine("  dumpfile  " + ctx.DumpFile + (ctx.CrashDumpEnabled ? "" : "  [已禁用]"));
+                if (ctx.Occupancy != null)
+                {
+                    Console.WriteLine("  io        " + ctx.Occupancy.BusySummary
+                                      + (ctx.Occupancy.CountersAvailable ? "" : "（计数器不可用）"));
+                    int shown = 0;
+                    foreach (DiskOccupant occ in ctx.Occupancy.Occupants)
+                    {
+                        if (shown++ >= 10)
+                        {
+                            Console.WriteLine("  occupant  …… 另有 " + (ctx.Occupancy.Occupants.Count - 10) + " 个进程命中（--json 可看全部）");
+                            break;
+                        }
+                        Console.WriteLine("  occupant  " + occ.ToLine().Replace("\n", "\n            "));
+                    }
+                }
+                Console.WriteLine("  safety    " + verdict.ToText().Replace("\n", "\n            "));
+            }
+
+            if (_json)
+            {
+                JsonArray arr = new JsonArray();
+                foreach (JsonObject o in jsonItems) arr.Add(o);
+                JsonObject root = new JsonObject();
+                root.Set("disksEnabled", cfg.Disks.Enabled);
+                root.Set("targets", arr);
+                Emit(root);
+            }
+            return problems == 0 ? 0 : 2;
+        }
+
+        /// <summary>执行脱机/联机/校验。真正动手必须带 --apply，否则只演练。</summary>
+        private static int DisksChange(QuietModePaths paths, List<string> rest, string operation, bool apply, bool force)
+        {
+            QuietModeConfig cfg;
+            int loadCode = LoadConfig(paths, out cfg);
+            if (loadCode != 0) return loadCode;
+
+            List<DiskTarget> targets;
+            string selError;
+            if (!SelectTargets(cfg, rest, out targets, out selError)) return Fail(selError);
+            if (targets.Count == 0) return Fail("没有可操作的磁盘目标");
+
+            DiskOperationBatch batch = DiskController.Run(paths, operation, targets, apply, force, 0);
+
+            if (_json)
+            {
+                JsonObject root = new JsonObject();
+                root.Set("ok", batch.Ok);
+                root.Set("error", batch.Error ?? "");
+                root.Set("elevated", batch.Elevated);
+                root.Set("requestFile", batch.RequestFile ?? "");
+                root.Set("resultFile", batch.ResultFile ?? "");
+                JsonArray arr;
+                root.SetArray("results", out arr);
+                foreach (DiskOperationResult r in batch.Results) arr.Add(r.ToJson());
+                Emit(root);
+            }
+            else if (!_quiet)
+            {
+                if (!string.IsNullOrEmpty(batch.Error)) Console.Error.WriteLine("错误：" + batch.Error);
+                foreach (DiskOperationResult r in batch.Results)
+                    Console.WriteLine(r.ToText() + "\n");
+                if (!string.IsNullOrEmpty(batch.StdErr))
+                    Console.WriteLine("stderr: " + ProcessRunner.Flatten(batch.StdErr));
+                if (!apply && operation != "verify")
+                    Console.WriteLine("（演练模式：加 --apply 才会真正执行）");
+            }
+
+            if (!string.IsNullOrEmpty(batch.Error)) return 2;
+            return batch.Ok ? 0 : 2;
+        }
+
+        // ---------------- disks helpers ----------------
+
+        private static int LoadConfig(QuietModePaths paths, out QuietModeConfig cfg)
+        {
+            cfg = null;
+            ConfigLoadResult lr = new ConfigStore(paths).Load(false);
+            if (!lr.Loaded)
+            {
+                Fail("读取配置失败：" + (lr.Error ?? "未知错误"));
+                return 1;
+            }
+            if (!lr.Usable)
+            {
+                Fail("配置校验未通过：" + lr.Report.ToText());
+                return 2;
+            }
+            cfg = lr.Config;
+            return 0;
+        }
+
+        /// <summary>选择磁盘目标：无参数=全部启用；数字=索引；all=全部启用。</summary>
+        private static bool SelectTargets(QuietModeConfig cfg, List<string> rest, out List<DiskTarget> targets, out string error)
+        {
+            targets = new List<DiskTarget>();
+            error = "";
+            List<DiskTarget> all = new List<DiskTarget>();
+            foreach (DiskTarget t in cfg.Disks.Targets) if (t.Enabled) all.Add(t);
+
+            string selector = (rest != null && rest.Count > 0) ? rest[0] : "";
+            if (selector == "" || selector.Equals("all", StringComparison.OrdinalIgnoreCase))
+            {
+                targets.AddRange(all);
+                return true;
+            }
+
+            int index;
+            if (int.TryParse(selector, out index))
+            {
+                if (index < 0 || index >= all.Count)
+                {
+                    error = "索引 " + index + " 超出范围（共 " + all.Count + " 个启用的磁盘目标）";
+                    return false;
+                }
+                targets.Add(all[index]);
+                return true;
+            }
+
+            foreach (DiskTarget t in all)
+            {
+                if (string.Equals(DiskIdentityResolver.NormalizeId(t.UniqueId), DiskIdentityResolver.NormalizeId(selector), StringComparison.Ordinal)
+                    || string.Equals(DiskIdentityResolver.NormalizeSerial(t.SerialNumber), DiskIdentityResolver.NormalizeSerial(selector), StringComparison.Ordinal))
+                {
+                    targets.Add(t);
+                    return true;
+                }
+            }
+            error = "找不到磁盘目标：" + selector;
+            return false;
+        }
+
+        private static DiskSafetyContext BuildSafetyContext(DiskSnapshot disk, bool withProcess)
+        {
+            DiskSafetyContext ctx = new DiskSafetyContext();
+            ctx.Disk = disk;
+            ctx.Volumes = DiskProbe.QueryVolumes(disk.Number);
+
+            DiskProbe.PageFileInfo pf = DiskProbe.QueryPageFiles();
+            ctx.AutomaticManagedPagefile = pf.AutomaticManaged;
+            ctx.PageFiles = pf.Paths;
+
+            DiskProbe.CrashDumpInfo dump = DiskProbe.QueryCrashDump();
+            ctx.DumpFile = dump.DumpFile;
+            ctx.CrashDumpEnabled = dump.Enabled;
+
+            DiskProbe.PoolInfo pool = DiskProbe.QueryStoragePool(disk);
+            ctx.InStoragePool = pool.IsMember;
+            ctx.StoragePoolName = pool.PoolName;
+            if (!pool.IsMember && !string.IsNullOrEmpty(pool.Reason)) ctx.StoragePoolNote = pool.Reason;
+
+            ctx.Occupancy = DiskProbe.Diagnose(disk, ctx.Volumes, withProcess);
+            return ctx;
         }
 
         private static int PathsCommand(QuietModePaths paths)
@@ -381,9 +679,14 @@ namespace QuietMode.Cli
             Console.WriteLine("  snapshot verify             校验 baseline 完整性");
             Console.WriteLine("  snapshot show               打印 baseline 摘要");
             Console.WriteLine("  state show                  打印 state.json");
-            Console.WriteLine("  disks list                  列出磁盘与稳定身份");
+            Console.WriteLine("  disks list                  列出本机磁盘与稳定身份");
+            Console.WriteLine("  disks resolve               配置目标 → 当前磁盘的唯一匹配结果");
+            Console.WriteLine("  disks inspect [索引|all]     身份/卷/页面文件/存储池/占用/安全结论（只读）");
+            Console.WriteLine("  disks offline [索引|all]     脱机（默认演练，--apply 才执行，--force 越过普通占用）");
+            Console.WriteLine("  disks online  [索引|all]     联机（默认演练，--apply 才执行）");
+            Console.WriteLine("  disks verify  [索引|all]     只回读当前状态");
             Console.WriteLine();
-            Console.WriteLine("退出码: 0 成功 / 1 一般失败 / 2 校验失败");
+            Console.WriteLine("退出码: 0 成功 / 1 一般失败 / 2 校验失败或操作未达成");
         }
 
         private static int Fail(string message)

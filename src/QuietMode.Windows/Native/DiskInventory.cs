@@ -66,7 +66,7 @@ namespace QuietMode.Windows.Native
                             d.IsReadOnly = ToBool(item["IsReadOnly"]);
                             d.IsSystem = ToBool(item["IsSystem"]);
                             d.IsBoot = ToBool(item["IsBoot"]);
-                            d.HealthStatus = ToStr(item["HealthStatus"]);
+                            d.HealthStatus = HealthName(ToInt(item["HealthStatus"], -1));
                             list.Add(d);
                         }
                     }
@@ -108,6 +108,19 @@ namespace QuietMode.Windows.Native
                 list.Clear();
             }
             return list;
+        }
+
+        /// <summary>MSFT_Disk.HealthStatus 是数值枚举，直接 ToString 会得到 "0"。</summary>
+        public static string HealthName(int code)
+        {
+            switch (code)
+            {
+                case 0: return "Healthy";
+                case 1: return "Warning";
+                case 2: return "Unhealthy";
+                case 5: return "Unknown";
+                default: return code < 0 ? "" : "Health" + code;
+            }
         }
 
         public static string BusTypeName(int code)

@@ -116,7 +116,16 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - 21 项单测（`tests/QuietMode.Core.Tests`）+ `powershell\Test-QuietMode.ps1` 一键自检，全部通过。
   - 实机演练：v1 `settings.ini` 迁移为 v2，磁盘 #0/#1 由编号解析为 `uniqueId`+`serialNumber`（非编号匹配）；baseline 采集 10 项任务 / SysMain / MaintenanceBoundary / DISKIDLE 1200s / 5 块磁盘。
   - 详见 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)。本阶段所有代码路径均只读，不改系统状态。
-- **Phase 2–7**：磁盘稳定身份落地、统一维护执行、单一 Worker 与调度、C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
+- **Phase 2 磁盘管理重构 — 已完成**
+  - `DiskIdentityResolver`：UniqueId 优先、序列号兜底、容量/总线复核；**磁盘编号永不参与匹配**，无身份或多命中一律拒绝执行。
+  - `DiskSafetyGuard`：系统盘、启动盘、页面文件所在盘、存储池成员、状态未知 —— 硬阻断；`--force` 只能越过「占用」一项。
+  - `Invoke-DiskOperation.ps1`（唯一写入口）在落盘前**用同一身份再复检一次**，执行 `Set-Disk -InputObject`，随后回读 `IsOffline` 验证；未提权返回 `ELEVATION_REQUIRED`，绝不假装成功。
+  - 占用诊断：物理磁盘 I/O 计数器 + 进程路径/命令行线索（handle.exe 为可选增强，不是硬依赖）。
+  - 新增 `ProcessRunner`（并行读 stdout/stderr、真超时、超时杀进程树），所有外部调用统一走它。
+  - `qmctl disks resolve|inspect|offline|online|verify`，默认演练，`--apply` 才动手。
+  - 单测 43 项 + `powershell\Test-DiskSafety.ps1` 只读集成测试（系统盘必须被拦住），全部通过。
+  - 详见 [`docs/DISK_MANAGEMENT.md`](docs/DISK_MANAGEMENT.md)。
+- **Phase 3–7**：统一维护执行、单一 Worker 与调度、C# 托盘拆分、安装迁移恢复、测试与 CI，见规格 §11。
 
 ```powershell
 # 编译 + 自检（不改系统状态）
