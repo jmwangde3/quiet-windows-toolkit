@@ -24,7 +24,7 @@ v2 把它们合成一条：**一个任务、一个决策点、一个执行器、
 qmctl reconcile --apply --trigger schedule
         │
         ├── StateMachine.Decide()        决策：现在应该是什么状态
-        ├── ReconcilePlanner.Build()     顺序：维护 / 磁盘 / 风扇 的固定次序
+        ├── ReconcilePlanner.Build()     顺序：维护 / 磁盘 / 停转 / 风扇 的固定次序
         ├── Invoke-QuietModeWorker.ps1   执行：只按步骤做事，不做判断
         └── 复观测 + 独立验证            结论：Ok / Degraded / Failed
 ```
@@ -95,10 +95,12 @@ DayActive         ← 默认
 |---|---|
 | 1. 维护：停任务 → 禁用 → SysMain → 注册表 | 1. 磁盘 Online（先放盘，才有条件恢复任务） |
 | 2. 磁盘 Offline（逐个回读） | 2. 维护：按 baseline 恢复 |
-| 3. 风扇切静音配置 | 3. 风扇切常态配置 |
-| 4. 全面验证 | 4. 全面验证 |
+| 3. 停转 `DISKIDLE` = `spinDown.minutes`（写后回读） | 3. 停转 `DISKIDLE` = `spinDown.minutes`（同上） |
+| 4. 风扇切静音配置 | 4. 风扇切常态配置 |
+| 5. 全面验证 | 5. 全面验证 |
 
-配置里关掉的模块不会从计划里消失，而是标成 `skipped` 并写明原因 —— 计划始终是四步的形状，人一眼能看出「这一步为什么没做」。
+配置里关掉的模块不会从计划里消失，而是标成 `skipped` 并写明原因 —— 计划始终是五步的形状，人一眼能看出「这一步为什么没做」。
+`spindown` 是 2026-11-12 补进来的一步：配置写 20 分钟、系统实测仍是 300 秒，就是因为 reconcile 从来没管过 DISKIDLE。
 
 ## 6. 成功判定
 
@@ -111,13 +113,14 @@ DayActive         ← 默认
 | `MaintenanceBoundary` | 白天时间 | 复观测注册表 |
 | `WakeUp` | `0` | 复观测注册表 |
 | 目标磁盘 | 全部 `Offline` | 按稳定身份匹配后读 `MSFT_Disk.IsOffline` |
+| 停转 | `DISKIDLE` AC（与可读的 DC）= `spinDown.minutes × 60` | `powercfg /query`，失败读注册表；读不到算 `Degraded` |
 | 风扇 | `current=` 等于静音配置文件名 | `IpcCtl.exe list` 回读 |
 
 结论三档：
 
 - **Ok** —— 全达成。
-- **Degraded** —— 达成但有隐患（任务仍 `Running`、磁盘状态读不到、风扇 IPC 不可用）。
-- **Failed** —— 有硬性未达成（任务仍启用、磁盘状态不符、风扇配置不符、注册表没写进去）。
+- **Degraded** —— 达成但有隐患（任务仍 `Running`、磁盘状态读不到、`DISKIDLE` 读不到、风扇 IPC 不可用）。
+- **Failed** —— 有硬性未达成（任务仍启用、磁盘状态不符、`DISKIDLE` 与配置不符、风扇配置不符、注册表没写进去）。
 
 `qmctl reconcile` 的退出码：`0` 成功或无动作，`2` 有失败，`1` 配置不可用。
 

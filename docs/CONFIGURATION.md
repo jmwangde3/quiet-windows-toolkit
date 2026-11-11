@@ -193,7 +193,7 @@ qmctl [--root PATH] [--quiet] [--json] [--out FILE] <command>
 | `state show` | 打印 state.json |
 | `config set <key> <value>` | 改单个配置项（白名单键，写前强校验；`--force` 跳过文件存在性检查） |
 | `status` | 一次性观测：窗口 / 决策 / 风扇 / 磁盘 / 停转 / 任务 / baseline |
-| `spin show` | 只读当前 DISKIDLE（AC/DC 秒） |
+| `spin show` | 只读当前 DISKIDLE（含配置期望值与是否一致） |
 | `spin set <分钟> [--apply]` | 改 DISKIDLE（0 = 永不），写后独立回读验证 |
 | `disks list` | 磁盘与稳定身份 |
 
@@ -227,11 +227,19 @@ qmctl [--root PATH] [--quiet] [--json] [--out FILE] <command>
 - 可空布尔（`disks.targets[].offline`、`task.exists`）在“读不到”时输出 `null`，**不能**输出 `false`；
 - 配置不可用时退出码为 2，但**仍然输出完整 JSON**，让界面能显示“为什么不可用”。
 
-### 8.3 `spin` 与静音模式解耦
+### 8.3 `spin` 与静音模式
 
 `spin set` 只改当前电源方案的 `DISKIDLE`（AC/DC 同时写，再 `powercfg /setactive`），
 不碰磁盘联机状态、不碰静音模式。写入后先用 `powercfg /query`（与写入不同的读取路径）回读，
 失败才读注册表；值与目标不一致返回 `VERIFY_MISMATCH`，绝不报成功。
+
+**何时会被 reconcile 覆盖**：`spinDown.enabled=true` 时 DISKIDLE 是 reconcile 链上的一步
+（`spindown`，夜间/白天都跑，worker 调 `Invoke-QmSpinDown`，写入后 C# 再独立回读校验，
+不一致直接判 `Failed`）。此时 config 是唯一真相源——手动 `spin set` 的值会在下一次
+reconcile（夜间每 10 分钟一次）被拉回 `spinDown.minutes`。要长期改值请用
+`qmctl config set spinDown.minutes <n>`。
+
+`spinDown.enabled=false` 时整步标 `skipped`，worker 一个字节都不写，手动值原样保留。
 
 退出码：`0` 成功、`1` 一般失败、`2` 校验失败。`--quiet` 静默（只留退出码，供 PowerShell 调用）；`--json --out FILE` 把机器可读结果写 UTF-8 文件，绕开控制台代码页（zh-CN 代码页 936 会把 UTF-8 输出解成乱码）。
 

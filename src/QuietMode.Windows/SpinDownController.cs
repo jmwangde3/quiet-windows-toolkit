@@ -56,11 +56,14 @@ namespace QuietMode.Windows
     }
 
     /// <summary>
-    /// 硬盘空闲停转（DISKIDLE）的独立执行器。v1 是托盘里拼一段 PowerShell 提权脚本，
+    /// 硬盘空闲停转（DISKIDLE）的执行器。v1 是托盘里拼一段 PowerShell 提权脚本，
     /// v2 收到这里：命令由 C# 出，执行走 powercfg，结论只认回读值。
     ///
-    /// 为什么不让它进夜间/白天计划：DISKIDLE 是用户独立开关，与静音模式解耦，
-    /// 开关静音模式绝不能顺手改它（v1 的既有语义，见 LEGACY_BEHAVIOR.md）。
+    /// 与静音模式的关系（2026-11-12 修正）：`spinDown.enabled=true` 时它是
+    /// reconcile 链上的一步（night/day 都跑），由 ReconcilePlanner 排进计划、
+    /// worker 调 Invoke-QmSpinDown 写入、C# 复观测回读校验。
+    /// `enabled=false` 时整步标 skipped，一个字节都不写 —— 手动设置因此得以保留。
+    /// 之所以早先不放进计划，是因为当时没有回读校验，写坏无人知；现在有了。
     /// </summary>
     public static class SpinDownController
     {

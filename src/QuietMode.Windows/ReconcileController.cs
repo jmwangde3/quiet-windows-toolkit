@@ -240,6 +240,12 @@ namespace QuietMode.Windows
             }
             req.Set("diskForce", cfg.Disks.ForceBusy);
 
+            JsonObject sd = new JsonObject();
+            sd.Set("enabled", cfg.SpinDown != null && cfg.SpinDown.Enabled);
+            sd.Set("minutes", cfg.SpinDown == null ? 0 : cfg.SpinDown.Minutes);
+            sd.Set("seconds", cfg.SpinDown == null ? 0 : cfg.SpinDown.Seconds);
+            req.Set("spinDown", sd);
+
             JsonObject fan = new JsonObject();
             fan.Set("enabled", cfg.Fan.Enabled);
             fan.Set("ipcPath", cfg.Fan.IpcPath ?? "");
@@ -290,8 +296,21 @@ namespace QuietMode.Windows
                 fan = FanProbe.Read(cfg.Fan, wantSilent);
             }
 
+            SpinDownObservation spin = null;
+            if (cfg.SpinDown != null && cfg.SpinDown.Enabled)
+            {
+                PowerPlanSnapshot pp = PowerPlanReader.Capture();
+                spin = new SpinDownObservation();
+                spin.Enabled = true;
+                spin.ExpectedSeconds = cfg.SpinDown.Seconds;
+                spin.Captured = pp.Captured;
+                spin.AcSeconds = pp.DiskIdleAcSeconds;
+                spin.DcSeconds = pp.DiskIdleDcSeconds;
+                spin.Error = pp.Error ?? "";
+            }
+
             run.Verification = ReconcileVerifier.Verify(
-                run.Action == "none" ? "day" : run.Action, cfg, baseline, obs, disks, fan);
+                run.Action == "none" ? "day" : run.Action, cfg, baseline, obs, disks, fan, spin);
         }
 
         private static void PersistState(QuietModePaths paths, ReconcileRun run, QuietModeState state)

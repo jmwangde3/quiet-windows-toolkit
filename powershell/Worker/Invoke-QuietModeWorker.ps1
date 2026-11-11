@@ -11,10 +11,11 @@
 
     请求 JSON 关键字段：
       action        night | day | restore | verify
-      steps         [ { order, module: maintenance|disk|fan|verify, action, detail } ]
+      steps         [ { order, module: maintenance|disk|spindown|fan|verify, action, detail } ]
       maintenance   { phase, steps: [ MaintenanceStep... ] }     # 交给 Invoke-QmMaintenanceStep
       diskTargets   [ { uniqueId, serialNumber, ... } ]
       diskForce     bool
+      spinDown      { enabled, minutes, seconds }                # 交给 Invoke-QmSpinDown
       fan           { enabled, ipcPath, controlExe, normalProfile, silentProfile, flagPath }
 
     结果 JSON：host / action / startTime / endTime / exitCode / elevated / steps[] / error
@@ -75,7 +76,7 @@ function Add-WorkerLog {
     } catch { }
 }
 
-foreach ($m in @('QuietMode.Common', 'QuietMode.Maintenance', 'QuietMode.Disk', 'QuietMode.Fan')) {
+foreach ($m in @('QuietMode.Common', 'QuietMode.Maintenance', 'QuietMode.Disk', 'QuietMode.Fan', 'QuietMode.Power')) {
     $p = Join-Path $modDir ($m + '.psm1')
     if (-not (Test-Path -LiteralPath $p)) {
         Write-QmWorkerResult (New-QmWorkerError 'NO_MODULE' "找不到模块：$p") $ResultFile
@@ -164,6 +165,18 @@ try {
                     $status = 'failed'
                     $err = (($bad | ForEach-Object { "$($_.friendlyName):$($_.errorCode)" }) -join '; ')
                 }
+            }
+            'spindown' {
+                $sd = $req.spinDown
+                if (-not $sd -or $sd.enabled -ne $true) {
+                    $status = 'skipped'
+                    $detail = '硬盘停转未启用'
+                    break
+                }
+                $sec = [int]$sd.seconds
+                $r = Invoke-QmSpinDown -Seconds $sec
+                $detail = "目标 ${sec}s 回读 AC=$($r.ac)s DC=$($r.dc)s"
+                if ($r.status -ne 'Done') { $status = 'failed'; $err = [string]$r.error }
             }
             'fan' {
                 $fan = $req.fan

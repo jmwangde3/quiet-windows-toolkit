@@ -1,5 +1,32 @@
 # 变更记录
 
+## 2.0.0-phase6.1 — 2026-11-12
+
+`DISKIDLE` 进入 reconcile 链。**这是一次会改系统状态的变更**：首轮 reconcile 会把
+`DISKIDLE` 从实测的 300 秒写成配置里的 1200 秒。
+
+### 修正
+
+- **配置写 20 分钟、系统里却是 300 秒**。`spinDown` 从 Phase 5 起只是「独立开关」，
+  `reconcile` 链根本不碰它，于是 `config.json` 与电源方案长期分叉，谁也没发现。
+  现在 `spinDown.enabled=true` 时 `spindown` 是夜间/白天链上固定一步：
+  `ReconcilePlanner` 排步 → worker 调 `Invoke-QmSpinDown` 写 AC/DC + `setactive`
+  → C# 用 `PowerPlanReader` 独立回读 → 不一致判 `Failed`。`enabled=false` 时整步
+  `skipped`，一个字节都不写。
+
+### 新增
+
+- `powershell/Modules/QuietMode.Power.psm1`：`Get-QmDiskIdleSeconds`（`powercfg /query`
+  解析十六进制索引，失败读注册表）、`Invoke-QmSpinDown`（已是目标值则跳过 `setactive`，
+  写完回读，只认回读值）。
+- `ReconcileModels.SpinDownObservation`：`expectedSeconds` / `acSeconds` / `dcSeconds` /
+  `captured` / `matches`，DC 只在读得到时参与判定。
+- `qmctl spin show` 增加 `expectedSeconds` / `reconcileManaged` / `matches`，
+  文本模式直接点出「配置已启用，next reconcile 会拉回 Ns」。
+- `qmctl spin set` 在配置已启用且数值不同时提示会被 reconcile 覆盖，并给出
+  `config set spinDown.minutes` 的正确用法。
+- 单测 83 → 86（夜间/白天五步顺序、停转开启/关闭、`DISKIDLE` 不符判 Failed、读不到判 Degraded）。
+
 ## 2.0.0-phase5 — 2026-11-11
 
 托盘重构：从“什么都干”的单文件变成 `qmctl` 的前端。**不改变运行中的系统状态**：

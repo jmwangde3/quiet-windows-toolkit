@@ -188,6 +188,45 @@ namespace QuietMode.Core.Scheduling
         }
     }
 
+    /// <summary>
+    /// 硬盘空闲停转（DISKIDLE）的观测。配置启用时它是 reconcile 链的一环：
+    /// 计划负责写、验证负责回读，两边都不许拿「命令返回 0」当成功。
+    /// </summary>
+    public sealed class SpinDownObservation
+    {
+        public bool Enabled;
+        public int ExpectedSeconds;
+        public int AcSeconds = -1;
+        public int DcSeconds = -1;
+        public bool Captured;
+        public string Error = "";
+
+        /// <summary>DC 只在读得到时才参与判定（台式机上可能没有电池分支）。</summary>
+        public bool Matches
+        {
+            get
+            {
+                if (!Captured) return false;
+                if (AcSeconds != ExpectedSeconds) return false;
+                if (DcSeconds >= 0 && DcSeconds != ExpectedSeconds) return false;
+                return true;
+            }
+        }
+
+        public JsonObject ToJson()
+        {
+            JsonObject o = new JsonObject();
+            o.Set("enabled", Enabled);
+            o.Set("expectedSeconds", ExpectedSeconds);
+            o.Set("acSeconds", AcSeconds);
+            o.Set("dcSeconds", DcSeconds);
+            o.Set("captured", Captured);
+            o.Set("matches", Matches);
+            o.Set("error", Error ?? "");
+            return o;
+        }
+    }
+
     public sealed class FanObservation
     {
         public bool Available;
@@ -229,6 +268,7 @@ namespace QuietMode.Core.Scheduling
         public List<string> Notes = new List<string>();
         public MaintenanceVerification Maintenance;
         public List<DiskStateObservation> Disks = new List<DiskStateObservation>();
+        public SpinDownObservation SpinDown;
         public FanObservation Fan;
 
         public void Settle()
@@ -268,6 +308,7 @@ namespace QuietMode.Core.Scheduling
             if (Maintenance != null) o.Set("maintenance", Maintenance.ToJson());
             o.SetArray("disks", out arr);
             foreach (DiskStateObservation d in Disks) arr.Add(d.ToJson());
+            if (SpinDown != null) o.Set("spinDown", SpinDown.ToJson());
             if (Fan != null) o.Set("fan", Fan.ToJson());
             return o;
         }

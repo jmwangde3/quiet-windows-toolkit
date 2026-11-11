@@ -149,27 +149,30 @@ namespace QuietMode.Core.Tests
                 Eq("DISK_STUCK", st.LastErrorCode);
             });
 
-            Run("计划：夜间顺序 = 维护 → 磁盘 → 风扇 → 验证", delegate
+            Run("计划：夜间顺序 = 维护 → 磁盘 → 停转 → 风扇 → 验证", delegate
             {
                 ReconcilePlan p = ReconcilePlanner.Build("night", "timer", "", FullConfig(), NightMaintenance());
-                Eq(4, p.Steps.Count);
+                Eq(5, p.Steps.Count);
                 Eq("maintenance", p.Steps[0].Module);
                 Eq("disk", p.Steps[1].Module);
                 Eq("offline", p.Steps[1].Action);
-                Eq("fan", p.Steps[2].Module);
-                Eq("silent", p.Steps[2].Action);
-                Eq("verify", p.Steps[3].Module);
+                Eq("spindown", p.Steps[2].Module);
+                Eq("apply", p.Steps[2].Action);
+                Eq("fan", p.Steps[3].Module);
+                Eq("silent", p.Steps[3].Action);
+                Eq("verify", p.Steps[4].Module);
             });
 
-            Run("计划：白天顺序 = 磁盘 → 维护 → 风扇 → 验证", delegate
+            Run("计划：白天顺序 = 磁盘 → 维护 → 停转 → 风扇 → 验证", delegate
             {
                 ReconcilePlan p = ReconcilePlanner.Build("day", "schedule", "", FullConfig(), DayMaintenance());
-                Eq(4, p.Steps.Count);
+                Eq(5, p.Steps.Count);
                 Eq("disk", p.Steps[0].Module);
                 Eq("online", p.Steps[0].Action);
                 Eq("maintenance", p.Steps[1].Module);
-                Eq("fan", p.Steps[2].Module);
-                Eq("normal", p.Steps[2].Action);
+                Eq("spindown", p.Steps[2].Module);
+                Eq("fan", p.Steps[3].Module);
+                Eq("normal", p.Steps[3].Action);
             });
 
             Run("计划：维护明细必须随计划下发（否则 worker 空转）", delegate
@@ -199,11 +202,84 @@ namespace QuietMode.Core.Tests
                 QuietModeConfig cfg = FullConfig();
                 cfg.Fan.Enabled = false;
                 cfg.Disks.Targets.Clear();
+                cfg.SpinDown.Enabled = false;
                 ReconcilePlan p = ReconcilePlanner.Build("night", "timer", "", cfg, NightMaintenance());
-                Eq(4, p.Steps.Count);
-                Eq("skipped", p.Steps[1].Status);
-                Eq("skipped", p.Steps[2].Status);
+                Eq(5, p.Steps.Count);
+                Eq("skipped", p.Steps[1].Status);   // disk
+                Eq("skipped", p.Steps[2].Status);   // spindown
+                Eq("skipped", p.Steps[3].Status);   // fan
                 True(p.Steps[1].Critical == false, "跳过的步骤不应是关键步骤");
+                True(p.Steps[2].Critical == false, "关闭的停转不应是关键步骤");
+            });
+
+            Run("计划：停转开启时带上目标秒数，关闭时不下发", delegate
+            {
+                QuietModeConfig cfg = FullConfig();
+                cfg.SpinDown.Enabled = true;
+                cfg.SpinDown.Minutes = 20;
+                ReconcilePlan p = ReconcilePlanner.Build("night", "timer", "", cfg, NightMaintenance());
+                ReconcileStep sd = p.Steps.Find(x => x.Module == "spindown");
+                True(sd != null, "计划里应有 spindown 步骤");
+                Eq("pending", sd.Status);
+                Eq(true, sd.Critical);
+                True(sd.Detail.Contains("1200"), "明细应写出 1200 秒，实际：" + sd.Detail);
+
+                cfg.SpinDown.Enabled = false;
+                ReconcilePlan p2 = ReconcilePlanner.Build("night", "timer", "", cfg, NightMaintenance());
+                ReconcileStep sd2 = p2.Steps.Find(x => x.Module == "spindown");
+                Eq("skipped", sd2.Status);
+                Eq("spinDown.enabled=false", sd2.Error);
+            });
+
+            Run("验证：DISKIDLE 与配置不一致算失败", delegate
+            {
+                QuietModeConfig cfg = FullConfig();
+                cfg.Maintenance.Enabled = false;
+                cfg.Disks.Enabled = false;
+                cfg.Fan.Enabled = false;
+                cfg.SpinDown.Enabled = true;
+                cfg.SpinDown.Minutes = 20;
+
+                SpinDownObservation s = new SpinDownObservation();
+                s.Enabled = true;
+                s.ExpectedSeconds = 1200;
+                s.Captured = true;
+                s.AcSeconds = 300;
+                s.DcSeconds = 0;
+
+                ReconcileVerification v = ReconcileVerifier.Verify("night", cfg, new BaselineSnapshot(),
+                    new SystemObservation(), null, null, s);
+                Eq(ReconcileVerdict.Failed, v.Verdict);
+                True(v.Problems.Exists(x => x.Contains("硬盘停转")), "应指出硬盘停转");
+                True(v.Problems.Exists(x => x.Contains("1200")), "应写出期望值");
+            });
+
+            Run("验证：DISKIDLE 读不到算降级，读对才算 Ok", delegate
+            {
+                QuietModeConfig cfg = FullConfig();
+                cfg.Maintenance.Enabled = false;
+                cfg.Disks.Enabled = false;
+                cfg.Fan.Enabled = false;
+                cfg.SpinDown.Enabled = true;
+                cfg.SpinDown.Minutes = 20;
+
+                SpinDownObservation s = new SpinDownObservation();
+                s.Enabled = true;
+                s.ExpectedSeconds = 1200;
+                s.Captured = false;
+                s.Error = "powercfg 不可用";
+
+                ReconcileVerification v = ReconcileVerifier.Verify("night", cfg, new BaselineSnapshot(),
+                    new SystemObservation(), null, null, s);
+                Eq(ReconcileVerdict.Degraded, v.Verdict);
+
+                s.Captured = true;
+                s.AcSeconds = 1200;
+                s.DcSeconds = 1200;
+                ReconcileVerification v2 = ReconcileVerifier.Verify("night", cfg, new BaselineSnapshot(),
+                    new SystemObservation(), null, null, s);
+                Eq(ReconcileVerdict.Ok, v2.Verdict);
+                Eq("NightActive", v2.VerdictText);
             });
 
             Run("验证：磁盘状态不明算降级不算失败", delegate

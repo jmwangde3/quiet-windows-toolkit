@@ -66,6 +66,13 @@ Step 'Core 单测' {
     if ($LASTEXITCODE -ne 0) { throw "单测失败（退出码 $LASTEXITCODE）" }
 }
 
+Step '电源模块：DISKIDLE 只读回读（不改任何状态）' {
+    Import-Module (Join-Path $PSScriptRoot 'Modules\QuietMode.Power.psm1') -Force
+    $sd = Get-QmDiskIdleSeconds
+    if (-not $sd.captured) { throw ("读不到 DISKIDLE：" + $sd.error) }
+    Write-Host ("    AC={0}s DC={1}s 来源={2}" -f $sd.ac, $sd.dc, $sd.source)
+}
+
 Step '配置校验' {
     $check = Test-QuietModeConfig -Root $Root
     foreach ($e in $check.Errors) { Write-Host ("    ERROR " + $e) -ForegroundColor Red }

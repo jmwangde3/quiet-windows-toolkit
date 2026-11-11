@@ -35,6 +35,7 @@ namespace QuietMode.Core.Scheduling
             {
                 AddMaintenance(p, cfg, maintenance, "night");
                 AddDisk(p, cfg, enabledTargets, "offline");
+                AddSpinDown(p, cfg);
                 AddFan(p, cfg, "silent");
                 p.Add("verify", "night", "全面验证夜间状态", true);
             }
@@ -43,6 +44,7 @@ namespace QuietMode.Core.Scheduling
                 // 白天顺序与夜间相反：先把盘放回来，才有条件恢复维护任务。
                 AddDisk(p, cfg, enabledTargets, "online");
                 AddMaintenance(p, cfg, maintenance, "day");
+                AddSpinDown(p, cfg);
                 AddFan(p, cfg, "normal");
                 p.Add("verify", "day", "全面验证白天状态", true);
             }
@@ -80,6 +82,24 @@ namespace QuietMode.Core.Scheduling
             p.Add("disk", op, enabledTargets + " 个目标磁盘", true);
             if (cfg.Disks.ForceBusy)
                 p.Notes.Add("disks.forceBusy=true：占用检查只记录，不阻止脱机");
+        }
+
+        /// <summary>
+        /// 硬盘空闲停转。它是用户独立开关（spinDown.enabled），但只要开着就是
+        /// reconcile 的一部分：配置说 20 分钟，系统里就只能是 1200 秒。
+        /// 关掉时标 skipped，一个字节都不写——不替用户清他手设的值。
+        /// </summary>
+        private static void AddSpinDown(ReconcilePlan p, QuietModeConfig cfg)
+        {
+            SpinDownSettings sd = cfg.SpinDown;
+            if (sd == null || !sd.Enabled)
+            {
+                ReconcileStep s = p.Add("spindown", "apply", "硬盘停转已在配置中关闭", false);
+                s.Status = "skipped";
+                s.Error = "spinDown.enabled=false";
+                return;
+            }
+            p.Add("spindown", "apply", sd.Minutes + " 分钟（" + sd.Seconds + " 秒）", true);
         }
 
         private static void AddFan(ReconcilePlan p, QuietModeConfig cfg, string action)
@@ -124,7 +144,7 @@ namespace QuietMode.Core.Scheduling
     {
         public static ReconcileVerification Verify(string action, QuietModeConfig cfg, BaselineSnapshot baseline,
                                                    SystemObservation obs, IList<DiskStateObservation> disks,
-                                                   FanObservation fan)
+                                                   FanObservation fan, SpinDownObservation spinDown = null)
         {
             if (cfg == null) throw new ArgumentNullException("cfg");
             ReconcileVerification v = new ReconcileVerification();
@@ -174,6 +194,26 @@ namespace QuietMode.Core.Scheduling
             else
             {
                 v.Notes.Add("磁盘管理已关闭，不参与验证");
+            }
+
+            if (cfg.SpinDown != null && cfg.SpinDown.Enabled)
+            {
+                v.SpinDown = spinDown;
+                int want = cfg.SpinDown.Seconds;
+                if (spinDown == null || !spinDown.Captured)
+                {
+                    v.Warnings.Add("硬盘停转：读不到 DISKIDLE，无法确认（期望 " + want + "s）"
+                                   + (spinDown == null || string.IsNullOrEmpty(spinDown.Error) ? "" : "：" + spinDown.Error));
+                }
+                else if (!spinDown.Matches)
+                {
+                    v.Problems.Add("硬盘停转：期望 " + want + "s，实际 AC=" + spinDown.AcSeconds
+                                   + "s DC=" + spinDown.DcSeconds + "s");
+                }
+            }
+            else
+            {
+                v.Notes.Add("硬盘停转已关闭，不参与验证");
             }
 
             v.Fan = fan;

@@ -1384,6 +1384,11 @@ namespace QuietMode.Cli
             if (sub == "" || sub == "show" || sub == "status")
             {
                 PowerPlanSnapshot p = PowerPlanReader.Capture();
+                int want = configured.Seconds;
+                bool managed = configured.Enabled;
+                bool acOk = p.Captured && p.DiskIdleAcSeconds == want;
+                bool dcOk = p.Captured && (p.DiskIdleDcSeconds < 0 || p.DiskIdleDcSeconds == want);
+                bool matches = managed && acOk && dcOk;
                 if (_json)
                 {
                     JsonObject o = new JsonObject();
@@ -1392,14 +1397,23 @@ namespace QuietMode.Cli
                     o.Set("dcSeconds", p.DiskIdleDcSeconds);
                     o.Set("configuredMinutes", configured.Minutes);
                     o.Set("configuredEnabled", configured.Enabled);
+                    o.Set("expectedSeconds", want);
+                    o.Set("reconcileManaged", managed);
+                    o.Set("matches", matches);
                     o.Set("error", p.Error ?? "");
                     Emit(o);
                     return p.Captured ? 0 : 2;
                 }
                 if (_quiet) return p.Captured ? 0 : 2;
                 Console.WriteLine("DISKIDLE：AC=" + p.DiskIdleAcSeconds + "s  DC=" + p.DiskIdleDcSeconds + "s");
-                Console.WriteLine("配置：Enabled=" + configured.Enabled + "  Minutes=" + configured.Minutes);
+                Console.WriteLine("配置：Enabled=" + configured.Enabled + "  Minutes=" + configured.Minutes
+                                  + "（期望 " + want + "s）");
                 if (!string.IsNullOrEmpty(p.Error)) Console.WriteLine("读取提示：" + p.Error);
+                if (managed && p.Captured && !matches)
+                    Console.WriteLine("偏差：配置已启用，next reconcile 会把它拉回 " + want + "s"
+                                      + "（手动改请用 qmctl config set spinDown.minutes）");
+                else if (!managed && p.Captured && p.DiskIdleAcSeconds > 0)
+                    Console.WriteLine("说明：配置未启用，reconcile 不管 DISKIDLE，当前值由 qmctl spin set 决定");
                 return p.Captured ? 0 : 2;
             }
 
@@ -1420,9 +1434,14 @@ namespace QuietMode.Cli
             Console.WriteLine(r.ToText());
             if (r.Ok && cfg != null)
             {
-                // 只在真的写成功后才把配置对齐，避免「配置说开、系统其实关」
-                Console.WriteLine("（config.json 未改动；需要同步请 qmctl config set spinDown.enabled "
-                                  + (r.RequestedSeconds > 0 ? "true" : "false") + "）");
+                // 只在真的写成功后才谈配置，避免「配置说开、系统其实关」
+                if (configured.Enabled && r.RequestedSeconds != configured.Seconds)
+                    Console.WriteLine("注意：spinDown.enabled=true，下次 reconcile 会把 DISKIDLE 拉回配置值 "
+                                      + configured.Seconds + "s；要保留 " + r.RequestedSeconds + "s 请跑 "
+                                      + "qmctl config set spinDown.minutes " + (r.RequestedSeconds / 60));
+                else
+                    Console.WriteLine("（config.json 未改动；需要同步请 qmctl config set spinDown.enabled "
+                                      + (r.RequestedSeconds > 0 ? "true" : "false") + "）");
             }
             return r.Apply ? (r.Ok ? 0 : 2) : 0;
         }
@@ -1574,8 +1593,9 @@ namespace QuietMode.Cli
             Console.WriteLine("  task uninstall [--apply]    删除该任务");
             Console.WriteLine("  task disable-legacy [--apply]  停用 \\QuietHDD\\ 下的 v1 闸门");
             Console.WriteLine("  status                      一次性观测：窗口/决策/风扇/磁盘/停转/任务（--json 供托盘用）");
-            Console.WriteLine("  spin show                   只读当前 DISKIDLE");
+            Console.WriteLine("  spin show                   只读当前 DISKIDLE（含配置期望值）");
             Console.WriteLine("  spin set <分钟> [--apply]    改 DISKIDLE（0 = 永不，需管理员）");
+            Console.WriteLine("                              spinDown.enabled=true 时 reconcile 会维持配置值");
             Console.WriteLine("  state show|pause|resume|rearm|manual-quiet|manual-normal|auto");
             Console.WriteLine();
             Console.WriteLine("退出码: 0 成功 / 1 一般失败 / 2 校验失败或操作未达成");

@@ -150,7 +150,7 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - 只保留一个计划任务 `\QuietMode\QuietMode-Reconcile`：23:58 / 10:02 / 开机+2min / 睡眠恢复 / 解锁 / 登录，夜间每 10 分钟校验一次；SYSTEM + Highest、`WakeToRun=false`、忽略并发、10 分钟执行上限。
   - `StateMachine` 是唯一决策点（10 个状态，优先级：恢复 → 手动 → 暂停 → 时间 → 默认白天），`StateMachine.ApplyRun` 是唯一状态写回点。
   - `ScheduleWindow` 用完整 `HH:mm` 判跨午夜窗口，开机补偿显式配置（默认开机 15 分钟内、06:00 之后算白天）。
-  - `ReconcilePlanner` 固定顺序：夜间 维护→磁盘→风扇→验证，白天 磁盘→维护→风扇→验证。
+  - `ReconcilePlanner` 固定顺序：夜间 维护→磁盘→停转→风扇→验证，白天 磁盘→维护→停转→风扇→验证。
   - `Invoke-QuietModeWorker.ps1` 是唯一执行器：接收请求 JSON，只按步骤做事，不做判断；未提权时全部步骤标 `notrun`，绝不做一半。
   - 风扇改用 `IpcCtl.exe list` 的 `current=` 回读真实配置（v1 注释里「FanControl 不暴露当前配置名」不成立）。
   - `qmctl reconcile [auto|night|day|restore|verify] [--trigger X] [--apply]`、`qmctl task status|print|install|uninstall|disable-legacy`、`qmctl state pause|resume|rearm|manual-quiet|manual-normal|auto`。
@@ -161,6 +161,7 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - 删除 `Apply()` 与 `CheckAutoSilent()`：托盘不再自己算窗口、不再拼提权脚本、不再直接碰 WMI / 注册表 / 电源方案。
   - 新增 `qmctl status`（一次调用给出窗口/决策/风扇/磁盘/停转/任务的完整事实）、`qmctl apply <intent>`（一次用户动作 = 一次提权 = 一次 reconcile）、`qmctl config set`、`qmctl spin show|set`。
   - 新增 `SpinDownController`：DISKIDLE 独立开关，`powercfg` 写入后独立回读，不一致即 `VERIFY_MISMATCH`。
+  - **2026-11-12 修正**：`spinDown.enabled=true` 时 DISKIDLE 进入 reconcile 链（`spindown` 步骤，night/day 都跑），由 `Invoke-QmSpinDown` 写入、C# 复观测校验 AC/DC；`enabled=false` 时整步 `skipped`、一个字节都不写。起因：配置写 20 分钟、系统实测仍是 300 秒，reconcile 从没管过它。
   - 修正 `Environment.TickCount & 0x7FFFFFFF` 在开机 24.9 天后回绕成“刚开机几分钟”、导致 06:00–10:02 夜间窗口被误判成白天的问题（改用 `GetTickCount64`）。
   - 界面只显示观测值：`offline`/`exists` 读不到时序列化为 `null`，显示“状态未知”而不是“正常”；计划任务未注册、v1 闸门仍启用都会常驻警告。
   - 单测 81 项（新增 5 项托盘契约）+ `Test-QuietMode.ps1` 新增“托盘契约：status 字段齐全（只读）”，全部通过。
