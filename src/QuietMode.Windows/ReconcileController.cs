@@ -243,14 +243,20 @@ namespace QuietMode.Windows
             try { paths.EnsureLayout(); }
             catch (Exception ex) { run.Error = "无法创建运行目录 " + paths.RunDir + "：" + ex.Message; return run; }
 
-            string stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff", System.Globalization.CultureInfo.InvariantCulture);
-            string reqFile = Path.Combine(paths.RunDir, "reconcile-request-" + stamp + ".json");
-            string resFile = Path.Combine(paths.RunDir, "reconcile-result-" + stamp + ".json");
+            // run\ 是「普通用户可能写过东西」的目录：目录本身必须是普通目录，
+            // 文件名必须不可预测，写请求必须独占新建 —— 三条缺一条就能被重定向。
+            try { PrivilegedIo.EnsurePlainDirectory(paths.RunDir); }
+            catch (Exception ex) { run.Error = "运行目录不可信：" + ex.Message; return run; }
+
+            DateTime started = DateTime.Now;
+            string nonce = Guid.NewGuid().ToString("N").Substring(0, 8);
+            string reqFile = Path.Combine(paths.RunDir, PrivilegedIo.UniqueFileName("reconcile-request", started, nonce));
+            string resFile = Path.Combine(paths.RunDir, PrivilegedIo.UniqueFileName("reconcile-result", started, nonce));
             run.RequestFile = reqFile;
             run.ResultFile = resFile;
 
             JsonObject req = BuildRequest(cfg, run, paths);
-            try { AtomicFile.WriteText(reqFile, req.ToJson(true) + "\n", null, null); }
+            try { PrivilegedIo.WriteNewText(reqFile, req.ToJson(true) + "\n"); }
             catch (Exception ex) { run.Error = "写入请求文件失败：" + ex.Message; return run; }
 
             string args = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + script + "\""
@@ -263,7 +269,9 @@ namespace QuietMode.Windows
             if (!pr.Started) { run.Error = "无法启动 PowerShell：" + pr.StartError; return run; }
             if (pr.TimedOut) { run.Error = "Worker 超时（" + timeoutMs + " ms）后被终止"; }
 
-            if (File.Exists(resFile)) MergeWorkerResult(run, resFile);
+            if (PrivilegedIo.IsPlainExistingFile(resFile)) MergeWorkerResult(run, resFile);
+            else if (File.Exists(resFile))
+                run.Error = "结果文件是重解析点或不是普通文件，拒绝读取（可能是被替换的路径）";
             else if (string.IsNullOrEmpty(run.Error))
                 run.Error = "Worker 未生成结果文件（退出码 " + pr.ExitCode + "）"
                             + (string.IsNullOrWhiteSpace(pr.StdErr) ? "" : "：" + ProcessRunner.Flatten(pr.StdErr));

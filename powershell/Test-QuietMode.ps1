@@ -159,6 +159,13 @@ Step '统一调度（只读集成测试）' {
     if ($LASTEXITCODE -ne 0) { throw "统一调度测试失败（退出码 $LASTEXITCODE）" }
 }
 
+Step '特权目录与攻击检测（临时目录自测）' {
+    $script = Join-Path $PSScriptRoot 'Test-Privilege.ps1'
+    if ($Root) { $out = & $script -Root $Root } else { $out = & $script }
+    $out | ForEach-Object { Write-Host ("    " + $_) }
+    if ($LASTEXITCODE -ne 0) { throw "特权目录自测失败（退出码 $LASTEXITCODE）" }
+}
+
 Step '维护计划与验证（只读）' {
     $paths = Get-QuietModePaths -Root $Root
     if (-not (Test-Path -LiteralPath $paths.baseline)) {

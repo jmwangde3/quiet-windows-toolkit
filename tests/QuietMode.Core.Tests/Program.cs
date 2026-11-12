@@ -46,6 +46,7 @@ namespace QuietMode.Core.Tests
             Run("快照完整性：确定性 / 篡改可检出", TestSnapshotIntegrity);
             Run("基线体检：缺失 / 损坏 / 不完整 / 完整四态", TestBaselineHealth);
             Run("维护任务清单：无重复、含 Regular Maintenance", TestMaintenanceCatalog);
+            Run("特权路径：文件名不可预测、不跟随已存在的文件", TestPrivilegedIo);
             Run("时间解析边界", TestTimeText);
 
             RunDiskTests();
@@ -482,6 +483,61 @@ namespace QuietMode.Core.Tests
             Eq(BaselineState.Partial, oldHealth.State);
             Eq(true, oldHealth.Usable);
             Eq(false, oldHealth.Authoritative);
+        }
+
+        /// <summary>
+        /// 特权目录的读写纪律。三条对策都要能被证明，而不是「看起来写了」：
+        ///   1. 文件名不可预测（nonce）；
+        ///   2. 独占新建 —— 已经有人放了同名文件时直接失败，绝不跟随；
+        ///   3. 重解析点目录直接拒绝。
+        /// </summary>
+        private static void TestPrivilegedIo()
+        {
+            DateTime now = new DateTime(2026, 11, 12, 10, 15, 0, 123);
+
+            string a = PrivilegedIo.UniqueFileName("reconcile-request", now, "a1b2c3d4");
+            string b = PrivilegedIo.UniqueFileName("reconcile-request", now, "ffffffff");
+            Eq("reconcile-request-20261112-101500-123-a1b2c3d4.json", a);
+            True(a != b, "同一毫秒、不同 nonce 必须给出不同名字");
+            True(a.IndexOf('\\') < 0 && a.IndexOf('/') < 0, "文件名不得包含路径分隔符");
+
+            // nonce 被清洗：../ 之类进不来
+            string dirty = PrivilegedIo.UniqueFileName("x", now, "..\\..\\evil");
+            Eq(-1, dirty.IndexOf('\\'));
+            Eq(-1, dirty.IndexOf('/'));
+            Eq(-1, dirty.IndexOf(".."));
+
+            // nonce 为空时自动补随机段
+            string auto1 = PrivilegedIo.UniqueFileName("p", now, "");
+            string auto2 = PrivilegedIo.UniqueFileName("p", now, "");
+            True(auto1 != auto2, "空 nonce 也要保证不重名");
+
+            True(PrivilegedIo.IsReparse(FileAttributes.ReparsePoint), "ReparsePoint 应识别为重解析");
+            True(!PrivilegedIo.IsReparse(FileAttributes.Normal), "Normal 不应识别为重解析");
+            True(!PrivilegedIo.IsReparse(FileAttributes.Directory | FileAttributes.Normal), "普通目录不是重解析点");
+
+            string dir = Path.Combine(Path.GetTempPath(), "qm-priv-" + Guid.NewGuid().ToString("N").Substring(0, 8));
+            try
+            {
+                PrivilegedIo.EnsurePlainDirectory(dir);
+                string target = Path.Combine(dir, a);
+                PrivilegedIo.WriteNewText(target, "{\"ok\":true}");
+                Eq("{\"ok\":true}", File.ReadAllText(target));
+
+                // 攻击场景：攻击者先在同名路径放一个文件（真实攻击里是 symlink）→ 必须失败
+                bool threw = false;
+                try { PrivilegedIo.WriteNewText(target, "overwritten"); }
+                catch (IOException) { threw = true; }
+                True(threw, "目标已存在时独占新建必须失败，否则等于跟随预置路径");
+                Eq("{\"ok\":true}", File.ReadAllText(target));
+
+                True(PrivilegedIo.IsPlainExistingFile(target), "普通文件应可读");
+                True(!PrivilegedIo.IsPlainExistingFile(Path.Combine(dir, "nope.json")), "不存在的文件不算可读");
+            }
+            finally
+            {
+                try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+            }
         }
 
         private static void TestMaintenanceCatalog()

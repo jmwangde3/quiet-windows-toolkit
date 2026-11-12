@@ -85,6 +85,40 @@ function Get-QmPrivilegedPaths {
     return $list
 }
 
+<#
+    路径是否指向重解析点（符号链接 / junction / 挂载点）。
+    特权目录里出现重解析点就等于「SYSTEM 的读写可能被指到别处」。
+#>
+function Test-QmReparsePoint {
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) { return $false }
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    } catch { return $false }
+}
+
+<#
+    把「相对名字」安全地拼到基目录下。任何逃出基目录的结果都返回 $null，
+    包括 ..\、绝对路径、以盘符开头的路径。纯字符串运算，不访问磁盘。
+#>
+function Resolve-QmSafeChild {
+    param([string]$Base, [string]$Name)
+    if (-not $Base -or -not $Name) { return $null }
+    if ($Name.IndexOfAny([char[]]@('/', '\')) -ge 0) { return $null }
+    if ($Name -eq '.' -or $Name -eq '..') { return $null }
+    if ($Name -match '^[A-Za-z]:') { return $null }
+    if ($Name.IndexOf(':') -ge 0) { return $null }
+    try {
+        $baseFull = [System.IO.Path]::GetFullPath($Base)
+        if (-not $baseFull.EndsWith('\')) { $baseFull += '\' }
+        $full = [System.IO.Path]::GetFullPath((Join-Path $baseFull $Name))
+        if (-not $full.StartsWith($baseFull, [System.StringComparison]::OrdinalIgnoreCase)) { return $null }
+        return $full
+    } catch { return $null }
+}
+
 function Test-QmPrivilegedLayout {
     param([string]$Root, [string]$DeployDir)
 
@@ -99,20 +133,22 @@ function Test-QmPrivilegedLayout {
     }
 
     # 日志目录反过来：普通用户要能追加，但不该能删整个目录
-    $logDir = Join-Path $Root 'logs'
-    if (Test-Path -LiteralPath $logDir) {
-        $checked++
-        $acl = Get-Acl -LiteralPath $logDir
-        $hasWrite = $false
-        foreach ($ace in $acl.Access) {
-            if ((Get-QmSidValue $ace.IdentityReference) -eq $script:UsersSid -and
-                [string]$ace.AccessControlType -eq 'Allow' -and
-                ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) -ne 0) {
-                $hasWrite = $true
+    if ($Root) {
+        $logDir = Join-Path $Root 'logs'
+        if (Test-Path -LiteralPath $logDir) {
+            $checked++
+            $acl = Get-Acl -LiteralPath $logDir
+            $hasWrite = $false
+            foreach ($ace in $acl.Access) {
+                if ((Get-QmSidValue $ace.IdentityReference) -eq $script:UsersSid -and
+                    [string]$ace.AccessControlType -eq 'Allow' -and
+                    ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) -ne 0) {
+                    $hasWrite = $true
+                }
             }
-        }
-        if (-not $hasWrite) {
-            $problems += ("logs 目录普通用户不可写，非提权 qmctl 无法留日志：$logDir")
+            if (-not $hasWrite) {
+                $problems += ("logs 目录普通用户不可写，非提权 qmctl 无法留日志：$logDir")
+            }
         }
     }
 
@@ -174,8 +210,9 @@ function Protect-QuietModeRoot {
         }
     }
 
-    $logDir = Join-Path $Root 'logs'
-    if (Test-Path -LiteralPath $logDir) {
+    $logDir = ''
+    if ($Root) { $logDir = Join-Path $Root 'logs' }
+    if ($logDir -and (Test-Path -LiteralPath $logDir)) {
         if (-not $Apply) {
             $report += ("PLAN 将允许 Users 追加日志：" + $logDir)
         } else {
@@ -200,4 +237,4 @@ function Protect-QuietModeRoot {
     }
 }
 
-Export-ModuleMember -Function Get-QmAclSummary, Get-QmPrivilegedPaths, Test-QmUserWritable, Test-QmPrivilegedLayout, Protect-QuietModeRoot
+Export-ModuleMember -Function Get-QmAclSummary, Get-QmPrivilegedPaths, Test-QmUserWritable, Test-QmPrivilegedLayout, Protect-QuietModeRoot, Test-QmReparsePoint, Resolve-QmSafeChild
