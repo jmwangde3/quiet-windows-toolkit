@@ -46,7 +46,13 @@ $script:Warnings = New-Object System.Collections.Generic.List[string]
 $script:StepNo = 0
 $script:ExeName = 'QuietMode.exe'
 $script:TaskFullName = '\QuietMode\QuietMode-Reconcile'
-$script:LegacyTasks = @('\QuietHDD\QuietHDD_NightGate', '\QuietHDD\QuietHDD_DiskGate')
+# v1 历史上装过两种路径：带 \QuietHDD\ 文件夹的，以及直接挂在根下的。
+$script:LegacyTasks = @(
+    '\QuietHDD\QuietHDD_NightGate',
+    '\QuietHDD\QuietHDD_DiskGate',
+    '\QuietHDD_NightGate',
+    '\QuietHDD_DiskGate'
+)
 
 # ---------------------------------------------------------------- 基础设施
 
@@ -74,6 +80,17 @@ function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p = New-Object Security.Principal.WindowsPrincipal($id)
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+<#
+    Test-Path 在无权访问的目录上会抛 UnauthorizedAccessException，
+    而本脚本 ErrorActionPreference=Stop —— 未提权的 DryRun 会因此直接中断。
+    读不到 ≠ 不存在，所以这里返回 $null 表示「不知道」。
+#>
+function Test-PathSafe {
+    param([string]$Path)
+    try { return (Test-Path -LiteralPath $Path -ErrorAction Stop) }
+    catch { return $null }
 }
 
 function Resolve-RepoRoot {
@@ -277,9 +294,9 @@ if ($Mode -ne 'DryRun' -and -not $isAdmin) {
     exit 5
 }
 
-# 用部署目录里的 qmctl（才是任务将来调用的那个）
-$script:QmctlPath = Join-Path $DeployDir 'qmctl.exe'
+# 预检一律用编译产物：部署目录里可能还是上一版，拿它探针会得到旧结论
 $srcQmctl = Join-Path $cliBin 'qmctl.exe'
+$script:QmctlPath = $srcQmctl
 
 # ================================================================ ROLLBACK
 if ($Mode -eq 'Rollback') {
@@ -331,63 +348,269 @@ if ($Mode -eq 'Rollback') {
 
 $apply = ($Mode -eq 'Apply')
 
-# ================================================================ 1 预检
-Write-Step '预检'
+# ================================================================ 1 环境与权限
+Write-Step '环境与权限'
 
-$required = @(
-    @{ Path = $srcQmctl; Name = 'qmctl.exe' },
-    @{ Path = (Join-Path $cliBin 'QuietMode.Core.dll'); Name = 'QuietMode.Core.dll' },
-    @{ Path = (Join-Path $cliBin 'QuietMode.Windows.dll'); Name = 'QuietMode.Windows.dll' },
-    @{ Path = (Join-Path $trayBin 'QuietMode.exe'); Name = 'QuietMode.exe' }
-)
-foreach ($p in $required) {
-    if (Test-Path -LiteralPath $p.Path) {
-        $f = Get-Item -LiteralPath $p.Path
-        Write-Ok ("{0}  {1:N0} B  {2}" -f $p.Name, $f.Length, (Get-Date $f.LastWriteTime -Format 'MM-dd HH:mm'))
-    } else {
-        Write-Bad ("缺少 $($p.Name)：$($p.Path)（先 dotnet build QuietMode.sln -c Release）")
+$psv = $PSVersionTable.PSVersion
+if ($psv.Major -gt 5 -or ($psv.Major -eq 5 -and $psv.Minor -ge 1)) {
+    Write-Ok ("PowerShell " + $psv.ToString())
+} else {
+    Write-Bad ("PowerShell " + $psv.ToString() + " 过旧：需要 5.1 及以上")
+}
+
+$netRelease = 0
+try {
+    $ndp = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full' -ErrorAction Stop
+    if ($null -ne $ndp.Release) { $netRelease = [int]$ndp.Release }
+} catch { $netRelease = 0 }
+
+if ($netRelease -ge 533320) { Write-Ok (".NET Framework 4.8.1（Release " + $netRelease + "）") }
+elseif ($netRelease -ge 528040) { Write-Ok (".NET Framework 4.8（Release " + $netRelease + "）") }
+elseif ($netRelease -ge 461808) { Write-Bad (".NET Framework 4.7.2（Release " + $netRelease + "）：二进制按 4.8 编译，加载可能失败") }
+elseif ($netRelease -gt 0) { Write-Bad (".NET Framework 4.x（Release " + $netRelease + "）低于 4.8") }
+else { Write-Bad '读不到 .NET Framework 4.x 版本键：未安装或注册表不可读' }
+
+$osv = [Environment]::OSVersion.Version
+if ($osv.Major -ge 10) {
+    Write-Ok ("Windows 内核 " + $osv.ToString(2) + "（" + [Environment]::OSVersion.VersionString + "）")
+} elseif ($osv.Major -eq 6 -and $osv.Minor -ge 1) {
+    Write-Warn2 ("Windows 内核 " + $osv.ToString(2) + "：只在 Win7 SP1 以上验证过")
+} else {
+    Write-Bad ("不支持的 Windows 版本 " + $osv.ToString(2))
+}
+
+if ($isAdmin) { Write-Ok '已提权（Administrators）' }
+elseif ($Mode -eq 'DryRun') { Write-Note '未提权：DryRun 只读检查可继续；Apply 需要管理员' }
+else { Write-Bad '未提权' }
+
+# ================================================================ 2 载体完整性
+Write-Step '载体完整性'
+
+function Show-Artifact {
+    param([string]$Path, [string]$Label, [switch]$Required)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        if ($Required) { Write-Bad ("缺少 " + $Label + "：" + $Path + "（先 dotnet build QuietMode.sln -c Release）") }
+        else { Write-Warn2 ("缺少 " + $Label + "：" + $Path) }
+        return
     }
+    $f = Get-Item -LiteralPath $Path
+    $ver = ''
+    try { $ver = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path).FileVersion } catch { }
+    $hash = ''
+    try { $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.Substring(0, 12) } catch { }
+    $parts = @($Label, ('{0:N0} B' -f $f.Length))
+    if ($ver) { $parts += ('v' + $ver) }
+    if ($hash) { $parts += ('sha256:' + $hash) }
+    Write-Ok ($parts -join '  ')
+}
+
+Show-Artifact -Path $srcQmctl -Label 'qmctl.exe' -Required
+Show-Artifact -Path (Join-Path $cliBin 'QuietMode.Core.dll') -Label 'QuietMode.Core.dll' -Required
+Show-Artifact -Path (Join-Path $cliBin 'QuietMode.Windows.dll') -Label 'QuietMode.Windows.dll' -Required
+Show-Artifact -Path (Join-Path $trayBin 'QuietMode.exe') -Label '托盘 QuietMode.exe' -Required
+
+# 任务将来调用的脚本树必须完整：少一个模块就在夜里静默失败
+$moduleNames = @(
+    'QuietMode.Common.psm1', 'QuietMode.Config.psm1', 'QuietMode.Disk.psm1',
+    'QuietMode.Fan.psm1', 'QuietMode.Maintenance.psm1', 'QuietMode.Power.psm1',
+    'QuietMode.Security.psm1'
+)
+foreach ($m in $moduleNames) {
+    Show-Artifact -Path (Join-Path $repoRoot ('powershell\Modules\' + $m)) -Label $m -Required
+}
+Show-Artifact -Path (Join-Path $repoRoot 'powershell\Worker\Invoke-QuietModeWorker.ps1') -Label 'Worker' -Required
+foreach ($s in @('Disks\Invoke-DiskOperation.ps1', 'Maintenance\Invoke-MaintenanceOperation.ps1')) {
+    Show-Artifact -Path (Join-Path $repoRoot ('powershell\' + $s)) -Label $s
 }
 
 if ($script:Failures.Count -gt 0) {
     Write-Log ''
-    Write-Log '预检失败，未做任何改动。' 'Red'
+    Write-Log '载体不完整，未做任何改动。' 'Red'
     exit 3
 }
 
+# ================================================================ 3 现有安装
+Write-Step '现有安装'
+
 $hasConfig = Test-Path -LiteralPath (Join-Path $Root 'config.json')
 $hasBaseline = Test-Path -LiteralPath (Join-Path $Root 'baseline.json')
-$legacySettings = Join-Path $env:APPDATA 'QuietMode\settings.ini'
+$legacyAppData = Join-Path $env:APPDATA 'QuietMode'
+$legacySettings = Join-Path $legacyAppData 'settings.ini'
+$legacyStateIni = Join-Path $legacyAppData 'state.ini'
+$legacyDiskConf = 'C:\ProgramData\QuietHDD\diskgate.conf'
 
 $cfgText = '不存在'
 if ($hasConfig) { $cfgText = '已存在' }
 $baseText = '不存在'
 if ($hasBaseline) { $baseText = '已存在' }
-$legacyText = '不存在'
-if (Test-Path -LiteralPath $legacySettings) { $legacyText = '存在（可迁移）' }
+Write-Note ("config.json     " + $cfgText)
+Write-Note ("baseline.json   " + $baseText)
 
-Write-Note ("config.json    " + $cfgText)
-Write-Note ("baseline.json  " + $baseText)
-Write-Note ("v1 settings.ini " + $legacyText)
-
-# 用源 qmctl 做只读体检（部署目录里可能还是旧版）
-if (-not $hasConfig) {
-    Write-Note '配置还没迁移，先跳过 task status 探针（qmctl 读不到 config.json 属预期）'
+$v1Files = @()
+foreach ($p in @($legacySettings, $legacyStateIni, $legacyDiskConf)) {
+    if (Test-Path -LiteralPath $p) { $v1Files += $p }
+}
+if ($v1Files.Count -gt 0) {
+    foreach ($p in $v1Files) { Write-Ok ("v1 配置 " + $p) }
 } else {
-    $probePath = $script:QmctlPath
-    $script:QmctlPath = $srcQmctl
-    $st0 = Invoke-QmctlJson -Arguments @('task', 'status')
-    $script:QmctlPath = $probePath
+    Write-Note '没有 v1 配置文件（全新安装路径）'
+}
 
-    if ($st0.Code -eq 0 -or $st0.Code -eq 2) { Write-Ok 'qmctl 可执行，task status 正常响应' }
-    else { Write-Warn2 ("qmctl task status 退出码 " + $st0.Code) }
-
-    if ($st0.Data) {
-        $taskText = '未注册'
-        if ($st0.Data.exists -eq $true) { $taskText = '已注册，状态 ' + $st0.Data.state }
-        Write-Note ("v2 任务        " + $taskText)
-        if ($st0.Data.conflict) { Write-Note 'v1 闸门        仍在启用（会与 v2 抢同一件事）' }
+$v1Active = @()
+$v1Seen = 0
+foreach ($full in $script:LegacyTasks) {
+    $s = Get-TaskState -FullName $full
+    if ($s.Exists -eq $true) {
+        $v1Seen++
+        $stateText = '启用'
+        if ($s.Enabled -eq $false) { $stateText = '禁用' }
+        Write-Ok ("v1 任务 " + $full + " 存在，当前" + $stateText)
+        if ($s.Enabled -eq $true) { $v1Active += $full }
+    } elseif ($s.Exists -eq $null) {
+        Write-Warn2 ("v1 任务 " + $full + " 无法确认：" + $s.Error)
     }
+}
+if ($v1Seen -eq 0) { Write-Note '没有 v1 闸门任务' }
+elseif ($v1Active.Count -eq 0) { Write-Note 'v1 闸门任务都已禁用，不与 v2 抢设备' }
+
+$st0 = Invoke-QmctlJson -Arguments @('task', 'status')
+if ($st0.Data -and $st0.Data.exists -eq $true) {
+    Write-Ok ("v2 任务已注册，状态 " + $st0.Data.state)
+} elseif ($st0.Data -and $st0.Data.exists -eq $false) {
+    Write-Note 'v2 任务未注册'
+} else {
+    Write-Warn2 ("读不到 v2 任务状态（退出码 " + $st0.Code + "）")
+}
+
+# ================================================================ 4 磁盘稳定身份
+Write-Step '磁盘稳定身份'
+
+$probe = Invoke-QmctlJson -Arguments @('status')
+$probeData = $probe.Data
+
+if ($null -eq $probeData) {
+    Write-Warn2 ("status 探针没有返回数据（退出码 " + $probe.Code + "）：无法核对磁盘身份，Apply 前必须解决")
+} else {
+    $diskTargets = @($probeData.disks.targets)
+    if ($diskTargets.Count -eq 0) {
+        Write-Note '配置里没有启用的磁盘目标（disks.enabled=false 或 targets 为空）'
+    } else {
+        foreach ($d in $diskTargets) {
+            $label = '磁盘 #' + $d.number + ' ' + $d.friendlyName
+            if ($d.matched -eq $true -and $d.uniqueId) {
+                Write-Ok ($label + ' → ' + $d.uniqueId)
+            } elseif ($d.matched -eq $true) {
+                Write-Bad ($label + ' 匹配到了但读不到稳定身份，拒绝继续（禁止按编号猜测）')
+            } else {
+                Write-Bad ($label + ' 未匹配：' + $d.matchReason)
+            }
+        }
+    }
+    if ($probeData.disks.unknown -gt 0) {
+        Write-Warn2 ("有 " + $probeData.disks.unknown + " 个磁盘状态读不到（权限不足？）")
+    }
+}
+
+# ================================================================ 5 静音窗口与风扇
+Write-Step '静音窗口与风扇依赖'
+
+function Convert-HhmmMinutes {
+    param([string]$Text)
+    if ($Text -notmatch '^\d{1,2}:\d{2}$') { return -1 }
+    $parts = $Text.Split(':')
+    $h = [int]$parts[0]
+    $m = [int]$parts[1]
+    if ($h -lt 0 -or $h -gt 23 -or $m -lt 0 -or $m -gt 59) { return -1 }
+    return ($h * 60 + $m)
+}
+
+if ($null -eq $probeData) {
+    Write-Warn2 '读不到 schedule 段，跳过窗口检查'
+} else {
+    $night = [string]$probeData.schedule.nightStart
+    $day = [string]$probeData.schedule.dayStart
+    $ns = Convert-HhmmMinutes $night
+    $ds = Convert-HhmmMinutes $day
+    if ($ns -lt 0 -or $ds -lt 0) {
+        Write-Bad ("静音窗口时间格式非法：nightStart=" + $night + "  dayStart=" + $day)
+    } elseif ($ns -eq $ds) {
+        Write-Bad '夜间起点与白天起点相同，窗口为空，等于永不静音'
+    } else {
+        $len = $ds - $ns
+        if ($len -le 0) { $len += 1440 }
+        Write-Ok ("夜间窗口 " + $night + " → " + $day + "（" + [math]::Round($len / 60.0, 2) + " 小时 / " + $len + " 分钟）")
+        if ($null -ne $probeData.window) {
+            Write-Note ("当前判定 " + $probeData.window.band + "：" + $probeData.window.reason)
+        }
+        if ($len -gt 1380) { Write-Warn2 '窗口超过 23 小时：白天几乎没有恢复时间' }
+    }
+
+    $schedEnabled = $probeData.schedule.enabled
+    if ($schedEnabled -ne $true) { Write-Warn2 'schedule.enabled=false：装完也不会自动切换，需要手动打开' }
+
+    $fan = $probeData.fan
+    if ($null -eq $fan) {
+        Write-Warn2 '读不到 fan 段，跳过风扇依赖检查'
+    } elseif ($fan.enabled -ne $true) {
+        Write-Note 'fan.enabled=false：不依赖 FanControl'
+    } elseif ($fan.available -eq $true) {
+        Write-Ok ("FanControl 可用，当前档位 " + $fan.currentProfile + "（match=" + $fan.match + "）")
+        if ($fan.silentProfile -and $fan.silentProfile -eq $fan.normalProfile) {
+            Write-Warn2 '静音档与普通档同名：夜间切换等于什么也没做'
+        }
+    } else {
+        Write-Warn2 ("fan.enabled=true 但 FanControl 当前不可用：" + $fan.error + "；夜间风扇步骤会失败")
+    }
+}
+
+# ================================================================ 6 baseline 可信度
+Write-Step 'baseline 可信度'
+
+if (-not $hasBaseline) {
+    Write-Note '还没有 baseline：Apply 时会抓一份（夜间抓会标「原始状态未知」，见下）'
+} else {
+    $bv = Invoke-QmctlJson -Arguments @('snapshot', 'verify')
+    $bState = ''
+    if ($bv.Data -and $bv.Data.state) { $bState = [string]$bv.Data.state }
+    if ($bState -eq 'Complete' -and $bv.Data.valid -eq $true) {
+        Write-Ok 'baseline 完整且校验通过'
+    } elseif ($bState -eq 'Partial') {
+        Write-Warn2 'baseline 不完整（缺 XML 备份或字段）：可以继续，但恢复会有无法确认的项'
+    } elseif ($bState -eq 'Corrupt') {
+        Write-Bad 'baseline 损坏（校验和不符或 schema 不符）：拒绝把损坏基线用于恢复，需 -Force 重建或先修复'
+        if ($bv.Data -and $bv.Data.errors) { foreach ($e in $bv.Data.errors) { Write-Note ("  " + $e) } }
+    } elseif ($bState -eq 'Missing') {
+        Write-Warn2 'qmctl 说找不到 baseline，但文件存在：两者不一致，先查清再装'
+    } else {
+        Write-Warn2 ("baseline 状态未知（退出码 " + $bv.Code + "），按「不完整」对待")
+    }
+}
+
+# ================================================================ 7 安装计划
+Write-Step '安装计划'
+
+$planLines = New-Object System.Collections.Generic.List[string]
+$planLines.Add('1. 部署二进制与脚本树到 ' + $DeployDir)
+if ($hasConfig -and -not $Force) { $planLines.Add('2. 配置：已存在，保持不动（-Force 可重建）') }
+else { $planLines.Add('2. 配置：从 v1 settings.ini 迁移并校验（旧配置先备份）') }
+if ($hasBaseline -and -not $Force) { $planLines.Add('3. baseline：已存在，保持不动（-Force 才重建）') }
+else { $planLines.Add('3. baseline：抓取原始状态快照（任务 XML 一并备份）') }
+$planLines.Add('4. 注册唯一调度任务 ' + $script:TaskFullName + '（SYSTEM + 最高权限）')
+$planLines.Add('5. 授予 Users 读取任务文件的权限（托盘免提权）')
+if ($KeepLegacy) { $planLines.Add('6. v1 闸门：按 -KeepLegacy 保留（两套调度会互相覆盖）') }
+elseif ($v1Active.Count -gt 0) { $planLines.Add('6. 停用 v1 闸门：' + ($v1Active -join ', ')) }
+else { $planLines.Add('6. 停用 v1 闸门：没有需要停用的') }
+$planLines.Add('7. 清掉手动静音与今晚抑制标记（state auto），随后立即对齐一次')
+$planLines.Add('8. 启动托盘')
+
+foreach ($line in $planLines) { Write-Note $line }
+Write-Note '不变量：任何时刻只允许一套调度器控制磁盘；v2 注册失败就不动 v1，v1 停不掉就回滚 v2。'
+
+if ($script:Failures.Count -gt 0) {
+    Write-Log ''
+    Write-Log '预检失败，未做任何改动。修好上面标 FAIL 的项再重试。' 'Red'
+    if ($script:LogPath) { Write-Log ("日志：" + $script:LogPath) 'Yellow' }
+    exit 3
 }
 
 # ================================================================ 2 部署二进制
@@ -433,6 +656,117 @@ if (-not (Test-Path -LiteralPath $psSrc)) {
 
 $script:QmctlPath = Join-Path $DeployDir 'qmctl.exe'
 if (-not (Test-Path -LiteralPath $script:QmctlPath)) { $script:QmctlPath = $srcQmctl }
+
+# ================================================================ 备份
+Write-Step '备份现有资料（改动前先留退路）'
+
+$backupTargets = @(
+    @{ Path = (Join-Path $Root 'config.json'); Sub = 'config' },
+    @{ Path = (Join-Path $Root 'state.json'); Sub = 'config' },
+    @{ Path = (Join-Path $Root 'baseline.json'); Sub = 'baseline' },
+    @{ Path = (Join-Path $Root 'baseline.previous.json'); Sub = 'baseline' },
+    @{ Path = $legacySettings; Sub = 'v1' },
+    @{ Path = $legacyStateIni; Sub = 'v1' },
+    @{ Path = $legacyDiskConf; Sub = 'v1' }
+)
+
+foreach ($bt in $backupTargets) {
+    if (-not (Test-Path -LiteralPath $bt.Path)) { continue }
+    if (-not $apply) { Write-Note ("将备份 " + $bt.Path); continue }
+    $dir = Join-Path $backupRoot $bt.Sub
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    try {
+        Copy-Item -LiteralPath $bt.Path -Destination (Join-Path $dir (Split-Path -Leaf $bt.Path)) -Force
+        Write-Ok ("备份 " + $bt.Path)
+    } catch { Write-Bad ("备份失败 " + $bt.Path + "：" + $_.Exception.Message) }
+}
+
+# v1 任务的 XML 也要留：迁移后若发现判断错了，得能照原样装回去
+foreach ($full in $script:LegacyTasks) {
+    $s = Get-TaskState -FullName $full
+    if ($s.Exists -ne $true) { continue }
+    if (-not $apply) { Write-Note ("将导出任务 XML " + $full); continue }
+    $tp = Split-TaskPath -FullName $full
+    $dir = Join-Path $backupRoot 'tasks'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    try {
+        $xml = Export-ScheduledTask -TaskPath $tp.Path -TaskName $tp.Name -ErrorAction Stop
+        $file = Join-Path $dir ($tp.Name + '.xml')
+        Set-Content -LiteralPath $file -Value $xml -Encoding UTF8
+        Write-Ok ("导出任务 XML " + $full)
+    } catch { Write-Warn2 ("导出任务 XML 失败 " + $full + "：" + $_.Exception.Message) }
+}
+
+if ($script:Failures.Count -gt 0) {
+    Write-Log ''
+    Write-Log '备份不完整，停止：没有退路就不动系统。' 'Red'
+    exit 4
+}
+
+# ---------------------------------------------------------------- 迁移前状态记录
+# v1 的「现在」不等于「原始」：旧闸门可能已经把维护任务禁用了。
+# 把迁移前看到的一切写下来，迁移后再有争议时能对照，而不是靠回忆。
+if ($apply) {
+    $rec = New-Object System.Collections.Generic.List[string]
+    $rec.Add('QuietMode v2 迁移前状态记录')
+    $rec.Add('生成时间   ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    $rec.Add('模式       ' + $Mode)
+    $rec.Add('提权       ' + $isAdmin)
+    $rec.Add('配置根     ' + $Root)
+    $rec.Add('部署目录   ' + $DeployDir)
+    if ($null -ne $probeData -and $null -ne $probeData.window) {
+        $rec.Add('窗口判定   ' + $probeData.window.band + ' / ' + $probeData.window.reason)
+    }
+    $rec.Add('')
+
+    $rec.Add('--- v1 配置文件 ---')
+    foreach ($p in @($legacySettings, $legacyStateIni, $legacyDiskConf)) {
+        if (Test-Path -LiteralPath $p) {
+            $rec.Add('[' + $p + ']')
+            try { foreach ($line in (Get-Content -LiteralPath $p -ErrorAction Stop)) { $rec.Add('  ' + $line) } }
+            catch { $rec.Add('  (读取失败：' + $_.Exception.Message + ')') }
+        } else {
+            $rec.Add('[' + $p + '] 不存在')
+        }
+    }
+    $rec.Add('')
+
+    $rec.Add('--- v1 计划任务 ---')
+    foreach ($full in $script:LegacyTasks) {
+        $s = Get-TaskState -FullName $full
+        $t = '无法确认'
+        if ($s.Exists -eq $false) { $t = '不存在' }
+        elseif ($s.Exists -eq $true) {
+            $t = '存在，'
+            if ($null -eq $s.Enabled) { $t += '启用状态未知' }
+            elseif ($s.Enabled) { $t += '启用' }
+            else { $t += '禁用' }
+            if ($s.State) { $t += '，' + $s.State }
+        }
+        $rec.Add('  ' + $full + ' → ' + $t)
+    }
+    $rec.Add('')
+
+    $rec.Add('--- 维护任务（迁移前观测值，不等于原始值）---')
+    $ml = Invoke-QmctlJson -Arguments @('maint', 'list')
+    if ($ml.Data -and $ml.Data.tasks) {
+        foreach ($t in @($ml.Data.tasks)) {
+            $en = '?'
+            if ($null -ne $t.enabled) {
+                if ($t.enabled) { $en = 'on' } else { $en = 'off' }
+            }
+            $rec.Add('  ' + $t.fullName + '  presence=' + $t.presence + ' enabled=' + $en + ' state=' + $t.state)
+        }
+    } else {
+        $rec.Add('  (maint list 读取失败，退出码 ' + $ml.Code + ')')
+    }
+
+    $recFile = Join-Path $backupRoot 'migration-before.txt'
+    try {
+        Set-Content -LiteralPath $recFile -Value $rec -Encoding UTF8
+        Write-Ok ('迁移前状态已记录 ' + $recFile)
+    } catch { Write-Warn2 ('写迁移前状态记录失败：' + $_.Exception.Message) }
+}
 
 # ================================================================ 3 迁移配置
 Write-Step '迁移配置'
@@ -484,6 +818,48 @@ if ($script:Failures.Count -gt 0) {
     exit 4
 }
 
+# 快照里的 CaptureNotes 是给人看的：夜间抓快照会留下「原始状态未知」，必须说出来
+if ($apply) {
+    $snapShow = Invoke-QmctlJson -Arguments @('snapshot', 'show')
+    if ($snapShow.Data -and $snapShow.Data.captureNotes) {
+        $notes = @($snapShow.Data.captureNotes)
+        if ($notes.Count -gt 0) {
+            Write-Log ''
+            Write-Log '快照采集说明（不是故障，但需要你确认）：' 'Yellow'
+            foreach ($n in $notes) { Write-Log ("   - " + $n) 'Yellow' }
+        }
+    }
+}
+
+# ================================================================ 权限加固
+Write-Step '配置根权限加固（SYSTEM 会读的内容不许普通用户写）'
+
+$secModule = Join-Path $repoRoot 'powershell\Modules\QuietMode.Security.psm1'
+if (-not (Test-Path -LiteralPath $secModule)) {
+    Write-Warn2 ("缺少权限模块 " + $secModule + "，跳过加固（安装仍可继续，但存在提权面）")
+} else {
+    try {
+        Import-Module $secModule -Force
+        $permBefore = Test-QmPrivilegedLayout -Root $Root -DeployDir $DeployDir
+        if ($permBefore.ok) {
+            Write-Ok ("权限布局已合规（检查 " + $permBefore.checked + " 项）")
+        } else {
+            foreach ($p in $permBefore.problems) { Write-Warn2 $p }
+            if ($apply) {
+                $fix = Protect-QuietModeRoot -Root $Root -DeployDir $DeployDir -Apply
+                foreach ($l in $fix.lines) {
+                    if ($l -like 'FAIL*') { Write-Bad $l } else { Write-Note $l }
+                }
+                $permAfter = Test-QmPrivilegedLayout -Root $Root -DeployDir $DeployDir
+                if ($permAfter.ok) { Write-Ok '加固后复检通过' }
+                else { foreach ($p in $permAfter.problems) { Write-Bad ("加固后仍不合规：" + $p) } }
+            } else {
+                Write-Note '将拒绝 Users 对上述路径的写/删/改权限（logs 单独放行追加）'
+            }
+        }
+    } catch { Write-Warn2 ("权限检查失败：" + $_.Exception.Message) }
+}
+
 # ================================================================ 5 注册任务
 Write-Step '注册统一计划任务'
 if ($apply) {
@@ -498,6 +874,21 @@ if ($st.Data -and $st.Data.exists -eq $true) { Write-Ok ("v2 任务已存在，�
 elseif ($apply) { Write-Bad '注册后回读不到 v2 任务' }
 else { Write-Note '当前未注册（符合 DryRun 预期）' }
 
+# 不变量：v2 没确认落地之前，绝不动 v1。否则停掉 v1 就变成「两套都没有」。
+if ($apply -and -not ($st.Data -and $st.Data.exists -eq $true)) {
+    Write-Log ''
+    Write-Log 'v2 任务没注册成功：保留 v1 现状，不做任何切换。' 'Red'
+    Write-Log ("排查：" + $script:LogPath) 'Yellow'
+    exit 6
+}
+
+# 任务文件落在 \QuietMode\ 下，托盘要能读到才算安装完成
+if ($apply) {
+    $v2TaskFile = Join-Path $env:WINDIR 'System32\Tasks\QuietMode\QuietMode-Reconcile'
+    if ((Test-PathSafe $v2TaskFile) -eq $true) { Write-Ok '任务文件已落盘' }
+    else { Write-Warn2 ("找不到任务文件 " + $v2TaskFile + "（可能被策略重定向）") }
+}
+
 # ================================================================ 6 授权读取
 Write-Step '授予普通用户读取计划任务（托盘免提权才看得到状态）'
 $taskFiles = @(
@@ -507,7 +898,9 @@ $taskFiles = @(
 )
 $usersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
 foreach ($tf in $taskFiles) {
-    if (-not (Test-Path -LiteralPath $tf)) { Write-Note "不存在：$tf"; continue }
+    $exists = Test-PathSafe $tf
+    if ($exists -eq $false) { Write-Note "不存在：$tf"; continue }
+    if ($exists -eq $null) { Write-Note ("无权访问 " + $tf + "（读不到 ≠ 不存在；Apply 时会以管理员重试）"); continue }
     try {
         $acl = Get-Acl -LiteralPath $tf
         $hasRead = $false
@@ -538,21 +931,40 @@ foreach ($tf in $taskFiles) {
 
 # ================================================================ 7 停用 v1
 Write-Step '停用 v1 闸门'
+$legacyStillOn = New-Object System.Collections.Generic.List[string]
 if ($KeepLegacy) {
     Write-Warn2 '按 -KeepLegacy 保留 v1 闸门（两套调度会互相覆盖，仅用于短时观察）'
 } else {
     foreach ($full in $script:LegacyTasks) {
         $s = Get-TaskState -FullName $full
         if ($s.Exists -eq $false) { Write-Note "$full 不存在"; continue }
-        if ($s.Exists -eq $null) { Write-Warn2 ("$full 无法确认（" + $s.Error + "），未改动"); continue }
+        if ($s.Exists -eq $null) {
+            # 读不到就不算「已停用」：这是两套调度并行的风险，必须当成未完成处理
+            Write-Warn2 ("$full 无法确认（" + $s.Error + "），未改动")
+            $legacyStillOn.Add($full)
+            continue
+        }
         if ($s.Enabled -eq $false) { Write-Ok "$full 已禁用"; continue }
         if (-not $apply) { Write-Note "$full 当前启用 → 将禁用"; continue }
         try {
             $a = Set-LegacyEnabled -FullName $full -Enabled $false
             if ($a.Enabled -eq $false) { Write-Ok "$full 已禁用（回读确认）" }
-            else { Write-Bad "$full 禁用后回读仍为启用（可能被外部策略改回）" }
-        } catch { Write-Bad ("禁用 $full 失败：" + $_.Exception.Message) }
+            else { Write-Bad "$full 禁用后回读仍为启用（可能被外部策略改回）"; $legacyStillOn.Add($full) }
+        } catch { Write-Bad ("禁用 $full 失败：" + $_.Exception.Message); $legacyStillOn.Add($full) }
     }
+}
+
+# 不变量检查：两套调度同时开着比只有 v1 更糟 —— 夜里它们会互相把对方的状态改回去。
+# 既然 v1 停不掉，就把刚装的 v2 撤掉，回到「只有 v1」这个已知安全的状态。
+if ($apply -and -not $KeepLegacy -and $legacyStillOn.Count -gt 0) {
+    Write-Log ''
+    Write-Log ('有 ' + $legacyStillOn.Count + ' 个 v1 闸门停不掉：' + ($legacyStillOn -join ', ')) 'Red'
+    Write-Log '为避免两套调度器同时控制磁盘，回滚刚注册的 v2 任务。' 'Yellow'
+    $rc = Invoke-Qmctl -Arguments @('task', 'uninstall', '--apply')
+    if ($rc -eq 0) { Write-Ok 'v2 任务已移除，回到只有 v1 的状态' }
+    else { Write-Bad ("回滚 v2 任务失败（退出码 " + $rc + "）：现在可能两套并存，请手工禁用其中一套") }
+    if ($script:LogPath) { Write-Log ("日志：" + $script:LogPath) 'Yellow' }
+    exit 7
 }
 
 # ================================================================ 8 交回自动
@@ -579,6 +991,28 @@ if ($apply) {
 # ================================================================ 10 托盘
 Write-Step '托盘'
 Start-Tray -ExePath (Join-Path $DeployDir $script:ExeName) -Apply $apply
+
+# ================================================================ 11 收尾自检
+Write-Step '收尾自检'
+$finalTask = Invoke-QmctlJson -Arguments @('task', 'status')
+if ($finalTask.Data -and $finalTask.Data.exists -eq $true) {
+    Write-Ok ('v2 调度任务在位，状态 ' + $finalTask.Data.state)
+} elseif ($apply) {
+    Write-Bad '收尾时读不到 v2 调度任务：调度已不可靠'
+} else {
+    Write-Note 'v2 任务当前未注册（DryRun 预期）'
+}
+
+if (-not $KeepLegacy) {
+    $reEnabled = @()
+    foreach ($full in $script:LegacyTasks) {
+        $s = Get-TaskState -FullName $full
+        if ($s.Exists -eq $true -and $s.Enabled -eq $true) { $reEnabled += $full }
+        elseif ($s.Exists -eq $null) { Write-Warn2 ("收尾复核：" + $full + " 仍读不到，无法确认未启用") }
+    }
+    if ($reEnabled.Count -gt 0) { Write-Bad ('收尾时仍有 v1 闸门在启用：' + ($reEnabled -join ', ') + '（可能被策略改回）') }
+    else { Write-Ok '没有 v1 闸门与新调度并行' }
+}
 
 # ================================================================ 汇总
 Write-Log ''
