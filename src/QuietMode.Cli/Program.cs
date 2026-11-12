@@ -251,10 +251,21 @@ namespace QuietMode.Cli
 
                 case "verify":
                 {
-                    BaselineSnapshot s;
-                    try { s = mgr.Load(); }
-                    catch (Exception ex) { return Fail(ex.Message); }
-                    if (s == null) return Fail("未找到 baseline.json：" + paths.BaselinePath);
+                    BaselineHealth health;
+                    BaselineSnapshot s = mgr.TryLoad(out health);
+                    if (s == null)
+                    {
+                        if (_json)
+                        {
+                            JsonObject bad = new JsonObject();
+                            bad.Set("valid", false);
+                            bad.Set("state", health.State.ToString());
+                            JsonArray be; bad.SetArray("errors", out be); foreach (string e in health.Errors) be.Add(e);
+                            Emit(bad);
+                        }
+                        else if (!_quiet) Console.WriteLine(health.ToText());
+                        return 2;
+                    }
 
                     SnapshotVerifyResult v = mgr.Verify(s);
                     if (_json)
@@ -262,6 +273,7 @@ namespace QuietMode.Cli
                         JsonObject o = new JsonObject();
                         o.Set("valid", v.Ok);
                         o.Set("complete", v.Complete);
+                        o.Set("state", v.State.ToString());
                         JsonArray errs; o.SetArray("errors", out errs); foreach (string e in v.Errors) errs.Add(e);
                         JsonArray warns; o.SetArray("warnings", out warns); foreach (string w in v.Warnings) warns.Add(w);
                         Emit(o);
@@ -331,6 +343,14 @@ namespace QuietMode.Cli
         {
             StateStore store = new StateStore(paths);
             QuietModeState s = store.Load();
+            // 抑制标记要绑定到具体夜间窗口，所以这里需要调度配置；读失败不阻断纯状态操作。
+            ScheduleSettings schedule = null;
+            try
+            {
+                ConfigLoadResult loaded = new ConfigStore(paths).Load(false);
+                if (loaded.Config != null) schedule = loaded.Config.Schedule;
+            }
+            catch { }
 
             switch (sub)
             {
@@ -352,23 +372,24 @@ namespace QuietMode.Cli
 
                 case "rearm":
                     s.SchedulePaused = false;
-                    s.AutoSilentSuppressed = false;
+                    StateMachine.ClearSuppression(s);
                     s.ModeOn = false;
                     return SaveState(store, s, "已重新武装：清除暂停与今晚的抑制标记");
 
                 case "manual-quiet":
                     s.ModeOn = true;
-                    s.AutoSilentSuppressed = false;
+                    StateMachine.ClearSuppression(s);
                     return SaveState(store, s, "手动静音已记录（下一次 reconcile 执行）");
 
                 case "manual-normal":
-                    s.ModeOn = false;
-                    s.AutoSilentSuppressed = true;
-                    return SaveState(store, s, "手动关闭已记录（今晚不再自动开启）");
+                    StateMachine.Suppress(s, schedule, DateTime.Now);
+                    string window = s.AutoSilentSuppressedWindow;
+                    return SaveState(store, s, "手动关闭已记录（"
+                        + (window.Length > 0 ? "窗口 " + window : "本夜") + " 不再自动开启）");
 
                 case "auto":
                     s.ModeOn = false;
-                    s.AutoSilentSuppressed = false;
+                    StateMachine.ClearSuppression(s);
                     s.SchedulePaused = false;
                     return SaveState(store, s, "已交回自动调度");
 
@@ -376,6 +397,22 @@ namespace QuietMode.Cli
                     Console.WriteLine("state 子命令：show | pause | resume | rearm | manual-quiet | manual-normal | auto");
                     return 1;
             }
+        }
+
+        /// <summary>
+        /// 读基线。损坏/缺失一律当「没有基线」处理并说明原因，
+        /// 绝不让一份坏文件带着后续的恢复流程往下走。
+        /// </summary>
+        private static BaselineSnapshot LoadBaseline(QuietModePaths paths, QuietModeConfig cfg)
+        {
+            BaselineHealth health;
+            BaselineSnapshot s = new SnapshotManager(paths, cfg).TryLoad(out health);
+            if (!health.Usable && !_quiet)
+            {
+                string why = health.Errors.Count > 0 ? health.Errors[0] : health.State.ToString();
+                Console.Error.WriteLine("baseline 不可用（" + health.State + "）：" + why);
+            }
+            return health.Usable ? s : null;
         }
 
         private static int SaveState(StateStore store, QuietModeState s, string message)
@@ -794,7 +831,7 @@ namespace QuietMode.Cli
             int rc = LoadConfig(paths, out cfg);
             if (rc != 0) return rc;
 
-            BaselineSnapshot baseline = new SnapshotManager(paths, cfg).Load();
+            BaselineSnapshot baseline = LoadBaseline(paths, cfg);
             SystemObservation obs = MaintenanceProbe.Capture();
 
             if (_json)
@@ -875,7 +912,7 @@ namespace QuietMode.Cli
             QuietModeConfig cfg;
             int rc = LoadConfig(paths, out cfg);
             if (rc != 0) return rc;
-            BaselineSnapshot baseline = new SnapshotManager(paths, cfg).Load();
+            BaselineSnapshot baseline = LoadBaseline(paths, cfg);
             SystemObservation obs = MaintenanceProbe.Capture();
 
             MaintenancePlan plan = phase == "night"
@@ -909,7 +946,7 @@ namespace QuietMode.Cli
             QuietModeConfig cfg;
             int rc = LoadConfig(paths, out cfg);
             if (rc != 0) return rc;
-            BaselineSnapshot baseline = new SnapshotManager(paths, cfg).Load();
+            BaselineSnapshot baseline = LoadBaseline(paths, cfg);
             if (baseline == null)
             {
                 if (_json) Emit(new JsonObject().Set("ok", false).Set("error", "baseline.json 不存在，先运行 qmctl snapshot create"));
@@ -952,7 +989,7 @@ namespace QuietMode.Cli
             QuietModeConfig cfg;
             int rc = LoadConfig(paths, out cfg);
             if (rc != 0) return rc;
-            BaselineSnapshot baseline = new SnapshotManager(paths, cfg).Load();
+            BaselineSnapshot baseline = LoadBaseline(paths, cfg);
             SystemObservation obs = MaintenanceProbe.Capture();
 
             MaintenanceVerification v = phase == "night"
@@ -1298,22 +1335,21 @@ namespace QuietMode.Cli
             {
                 case "manual-quiet":
                     state.ModeOn = true;
-                    state.AutoSilentSuppressed = false;
+                    StateMachine.ClearSuppression(state);
                     break;
                 case "manual-normal":
-                    state.ModeOn = false;
-                    state.AutoSilentSuppressed = true;
+                    StateMachine.Suppress(state, cfg.Schedule, DateTime.Now);
                     break;
                 case "auto":
                     state.ModeOn = false;
-                    state.AutoSilentSuppressed = false;
+                    StateMachine.ClearSuppression(state);
                     state.SchedulePaused = false;
                     break;
                 case "pause": state.SchedulePaused = true; break;
                 case "resume": state.SchedulePaused = false; break;
                 case "rearm":
                     state.SchedulePaused = false;
-                    state.AutoSilentSuppressed = false;
+                    StateMachine.ClearSuppression(state);
                     state.ModeOn = false;
                     break;
             }

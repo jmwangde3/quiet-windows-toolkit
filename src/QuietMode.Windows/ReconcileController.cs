@@ -103,14 +103,18 @@ namespace QuietMode.Windows
             if (cfg == null) { run.Error = "未提供配置"; run.EndUtc = NowIso(); return run; }
             if (timeoutMs <= 0) timeoutMs = DefaultTimeoutMs;
 
-            run.Window = ScheduleWindow.Evaluate(cfg.Schedule, DateTime.Now, SystemClock.Uptime());
+            DateTime now = DateTime.Now;
+            run.Window = ScheduleWindow.Evaluate(cfg.Schedule, now, SystemClock.Uptime());
 
             DecisionInput input = new DecisionInput();
             input.Schedule = cfg.Schedule;
             input.State = state ?? new QuietModeState();
             input.Window = run.Window;
             input.Trigger = run.Trigger;
+            input.Now = now;
             input.LastRunFailed = StateMachine.IsLastRunFailed(input.State);
+            // 抑制标记先对账到当前夜间窗口：窗口换了就自动松开，旧状态就补上窗口。
+            StateMachine.NormalizeSuppression(input.State, cfg.Schedule, now);
             run.Decision = StateMachine.Decide(input);
 
             string resolved = ResolveAction(action, run.Decision);
@@ -185,8 +189,12 @@ namespace QuietMode.Windows
                               + " action=" + (string.IsNullOrEmpty(run.Action) ? "none" : run.Action)
                               + " apply=" + (apply ? "1" : "0")
                               + " verdict=" + verdict
+                              + (run.Verification == null ? "" : " drift=" + run.Verification.Classification)
                               + (run.Decision == null ? "" : " state=" + run.Decision.State)
                               + (string.IsNullOrEmpty(run.Error) ? "" : " error=" + ProcessRunner.Flatten(run.Error))
+                              + (run.Verification == null || run.Verification.Problems.Count == 0
+                                    ? ""
+                                    : " why=" + ProcessRunner.Flatten(run.Verification.Problems[0]))
                               + Environment.NewLine;
                 File.AppendAllText(path, line, new UTF8Encoding(false));
             }
@@ -207,14 +215,12 @@ namespace QuietMode.Windows
                 if (!apply && run.Action == "none") run.Ok = true;
                 if (state != null && run.Decision != null) state.ControllerState = run.Decision.State.ToString();
 
-                // 漂移修复：决策说「已经到位、不用动」，但回读是 Failed。此时直接返回，
+                // 漂移修复：决策说「已经到位、不用动」，但回读存在可修复偏差。此时直接返回，
                 // 偏差就会一直挂着（配置 20 分钟、电源方案 300 秒就是这种形态）。
-                // 按目标相位重跑一次，把「判定」变成「动作」。
+                // 只对 ActionableDrift 重跑；Unknown 盲写可能把正常状态改坏，SafetyBlocked 不许碰设备。
                 string repair = run.Decision == null
                     ? null
-                    : ReconcileVerifier.RepairTarget(apply, run.Action, run.Decision.TargetNight,
-                                                    run.Verification == null ? ReconcileVerdict.Unknown
-                                                                             : run.Verification.Verdict);
+                    : ReconcileVerifier.RepairTarget(apply, run.Action, run.Decision.TargetNight, run.Verification);
                 if (string.IsNullOrEmpty(repair))
                 {
                     run.EndUtc = NowIso();
@@ -222,7 +228,9 @@ namespace QuietMode.Windows
                 }
 
                 ReconcileRun forced = Plan(paths, cfg, baseline, state, repair, trigger, apply, timeoutMs);
-                forced.Plan.Notes.Add("漂移修复：自动判定为「无需动作」但回读 Failed，按 " + repair + " 强制重跑");
+                forced.Plan.Notes.Add("漂移修复：自动判定为「无需动作」但存在可修复偏差（"
+                                      + DriftClassifier.Text(run.Verification.Classification) + "），按 "
+                                      + repair + " 强制重跑");
                 forced.Decision = forced.Decision ?? run.Decision;
                 run = forced;
             }
@@ -395,6 +403,14 @@ namespace QuietMode.Windows
                 string verdict = run.Verification == null ? "Unknown" : run.Verification.Verdict.ToString();
                 bool nightOk = string.Equals(run.Action, "night", StringComparison.OrdinalIgnoreCase)
                                && run.Verification != null && run.Verification.Verdict == ReconcileVerdict.Ok;
+                // 先把「为什么」写进状态，再写 verdict：状态文件必须能自己解释失败，
+                // 而不是显示 NightActive 却什么警告都没有。
+                state.LastDrift = run.Verification == null ? "" : run.Verification.Classification.ToString();
+                state.LastProblems = run.Verification == null
+                    ? new List<string>()
+                    : new List<string>(run.Verification.Problems.Count > 20
+                        ? run.Verification.Problems.GetRange(0, 20)
+                        : run.Verification.Problems);
                 StateMachine.ApplyRun(state, run.Action, verdict, run.Error, DateTime.UtcNow, nightOk);
                 if (run.Decision != null) state.ControllerState = run.Decision.State.ToString();
                 new StateStore(paths).Save(state);

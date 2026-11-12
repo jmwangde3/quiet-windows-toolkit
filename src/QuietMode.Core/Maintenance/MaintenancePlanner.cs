@@ -151,7 +151,9 @@ namespace QuietMode.Core.Maintenance
                     desired ? MaintenanceAction.EnableTask : MaintenanceAction.DisableTask,
                     def.Path, def.Name,
                     "恢复 baseline 原始状态（enabled=" + (desired ? "true" : "false") + "）");
-                s.Critical = !desired;   // 原本启用却恢复不回来 = 关键失败；原本禁用只是对齐
+                // 原本启用、白天恢复不回来 = 关键失败：用户的维护任务被我们关掉了却没还回去。
+                // 原本禁用只是「对齐」，失败也要如实报告，但不该让整轮判成灾难。
+                s.Critical = desired;
             }
 
             // ---- 2. SysMain 恢复 ----

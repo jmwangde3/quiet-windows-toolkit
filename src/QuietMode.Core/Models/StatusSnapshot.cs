@@ -118,6 +118,7 @@ namespace QuietMode.Core.Models
             st.Set("schedulePaused", s.SchedulePaused);
             st.Set("autoSilentActive", s.AutoSilentActive);
             st.Set("autoSilentSuppressed", s.AutoSilentSuppressed);
+            st.Set("autoSilentSuppressedWindow", s.AutoSilentSuppressedWindow ?? "");
             st.Set("lastVerdict", s.LastVerdict ?? "");
             st.Set("lastErrorCode", s.LastErrorCode ?? "");
             st.Set("lastReconcileAction", s.LastReconcileAction ?? "");

@@ -258,24 +258,72 @@ namespace QuietMode.Core.Scheduling
     /// <summary>
     /// 全部组件验证完才叫成功（规格 §7.4）。缺一项就是降级或失败，
     /// 绝不符合「worker 说成功」就报成功。
+    ///
+    /// 除了 verdict（好不好），还给出 classification（要不要动手、能不能修）。
+    /// 这两件事必须分开：一个读不到的磁盘是 Degraded，但重跑一百遍也还是读不到。
     /// </summary>
     public sealed class ReconcileVerification
     {
         public string Action = "";
         public ReconcileVerdict Verdict = ReconcileVerdict.Unknown;
+        public DriftClass Classification = DriftClass.Compliant;
         public List<string> Problems = new List<string>();
         public List<string> Warnings = new List<string>();
         public List<string> Notes = new List<string>();
+        /// <summary>结构化偏差清单：Verifier 写、控制器读，中间不靠解析中文。</summary>
+        public List<DriftItem> Items = new List<DriftItem>();
         public MaintenanceVerification Maintenance;
         public List<DiskStateObservation> Disks = new List<DiskStateObservation>();
         public SpinDownObservation SpinDown;
         public FanObservation Fan;
+
+        /// <summary>记录一条「目标状态没达成」。fixable 表示重跑当前相位能不能修好。</summary>
+        public void Problem(string component, bool fixable, string target, string message)
+        {
+            Problems.Add(message);
+            Items.Add(new DriftItem(component, DriftKind.Mismatch, fixable, target, message));
+        }
+
+        /// <summary>记录一条「读不到」。永远不可修复 —— 未知不是偏差。</summary>
+        public void Unknown(string component, string message)
+        {
+            Warnings.Add(message);
+            Items.Add(new DriftItem(component, DriftKind.Unknown, false, "", message));
+        }
+
+        /// <summary>
+        /// 记录一条「达成但有隐患」的偏差。fixable 表示重跑当前相位是否值得再试一次；
+        /// 与 Problem 的区别只是严重度（Degraded vs Failed），不是「要不要修」。
+        /// </summary>
+        public void Warning(string component, bool fixable, string target, string message)
+        {
+            Warnings.Add(message);
+            Items.Add(new DriftItem(component, DriftKind.Mismatch, fixable, target, message));
+        }
+
+        /// <summary>记录一条安全阻塞。整轮禁止自动写入。</summary>
+        public void Safety(string component, string message)
+        {
+            Problems.Add(message);
+            Items.Add(new DriftItem(component, DriftKind.Safety, false, "", message));
+        }
 
         public void Settle()
         {
             if (Problems.Count > 0) Verdict = ReconcileVerdict.Failed;
             else if (Warnings.Count > 0) Verdict = ReconcileVerdict.Degraded;
             else Verdict = ReconcileVerdict.Ok;
+            Classification = DriftClassifier.Classify(Items);
+        }
+
+        public int FixableCount
+        {
+            get
+            {
+                int n = 0;
+                foreach (DriftItem i in Items) if (i != null && i.Fixable) n++;
+                return n;
+            }
         }
 
         public string VerdictText
@@ -298,6 +346,8 @@ namespace QuietMode.Core.Scheduling
             o.Set("action", Action ?? "");
             o.Set("verdict", Verdict.ToString());
             o.Set("verdictText", VerdictText);
+            o.Set("classification", Classification.ToString());
+            o.Set("classificationText", DriftClassifier.Text(Classification));
             JsonArray arr;
             o.SetArray("problems", out arr);
             foreach (string s in Problems) arr.Add(s);
@@ -305,6 +355,17 @@ namespace QuietMode.Core.Scheduling
             foreach (string s in Warnings) arr.Add(s);
             o.SetArray("notes", out arr);
             foreach (string s in Notes) arr.Add(s);
+            o.SetArray("drift", out arr);
+            foreach (DriftItem i in Items)
+            {
+                JsonObject d = new JsonObject();
+                d.Set("component", i.Component ?? "");
+                d.Set("kind", i.Kind.ToString());
+                d.Set("fixable", i.Fixable);
+                d.Set("target", i.Target ?? "");
+                d.Set("message", i.Message ?? "");
+                arr.Add(d);
+            }
             if (Maintenance != null) o.Set("maintenance", Maintenance.ToJson());
             o.SetArray("disks", out arr);
             foreach (DiskStateObservation d in Disks) arr.Add(d.ToJson());
@@ -317,6 +378,8 @@ namespace QuietMode.Core.Scheduling
         {
             System.Text.StringBuilder sb = new System.Text.StringBuilder();
             sb.AppendLine("验证: " + VerdictText + "（" + Action + "）");
+            if (Classification != DriftClass.Compliant)
+                sb.AppendLine("分类: " + DriftClassifier.Text(Classification) + "（需修复 " + FixableCount + " 项）");
             foreach (string s in Problems) sb.AppendLine("  失败  " + s);
             foreach (string s in Warnings) sb.AppendLine("  降级  " + s);
             foreach (string s in Notes) sb.AppendLine("  说明  " + s);

@@ -44,6 +44,7 @@ namespace QuietMode.Core.Tests
             Run("迁移：已存在 v2 配置时拒绝覆盖", TestMigrationRefuseOverwrite);
             Run("state.json 往返（含恢复进度）", TestStateRoundTrip);
             Run("快照完整性：确定性 / 篡改可检出", TestSnapshotIntegrity);
+            Run("基线体检：缺失 / 损坏 / 不完整 / 完整四态", TestBaselineHealth);
             Run("维护任务清单：无重复、含 Regular Maintenance", TestMaintenanceCatalog);
             Run("时间解析边界", TestTimeText);
 
@@ -397,6 +398,70 @@ namespace QuietMode.Core.Tests
 
             back.Disks[0].IsOffline = false;
             True(!SnapshotIntegrity.Matches(back), "篡改后应检出");
+        }
+
+        /// <summary>
+        /// 基线体检的四态判断。危险写操作只允许在「完整」时发生，
+        /// 损坏的基线必须整份拒用，而不是逐字段「尽量用」。
+        /// </summary>
+        private static void TestBaselineHealth()
+        {
+            BaselineHealth missing = BaselineHealth.Evaluate(null, null, null);
+            Eq(BaselineState.Missing, missing.State);
+            Eq(false, missing.Usable);
+
+            BaselineSnapshot s = new BaselineSnapshot();
+            s.Metadata.WindowsBuild = "19045.4291";
+            s.Metadata.CreatedAtUtc = "2026-11-12T00:00:00Z";
+            s.Metadata.ToolVersion = ProductInfo.Version;
+            s.Metadata.SchemaVersion = BaselineSnapshot.CurrentSchemaVersion;
+            s.Metadata.Complete = true;
+
+            TaskSnapshot t = new TaskSnapshot();
+            t.Path = @"\Microsoft\Windows\Defrag\";
+            t.Name = "ScheduledDefrag";
+            t.Exists = true;
+            t.Enabled = true;
+            t.XmlBackup = "tasks/defrag.xml";
+            t.XmlSha256 = "samplehash";
+            s.ScheduledTasks.Add(t);
+
+            DiskSnapshot disk = new DiskSnapshot();
+            disk.Number = 1;
+            disk.UniqueId = "SAMPLE-UNIQUE-0002";
+            disk.SizeBytes = 4000000000000;
+            s.Disks.Add(disk);
+
+            // 没有完整性校验值 ≡ 无法证明没被改过
+            BaselineHealth noHash = BaselineHealth.Evaluate(s, delegate { return true; }, delegate { return "samplehash"; });
+            Eq(BaselineState.Corrupt, noHash.State);
+
+            s.Metadata.IntegritySha256 = SnapshotIntegrity.Compute(s);
+            BaselineHealth ok = BaselineHealth.Evaluate(s, delegate { return true; }, delegate { return "samplehash"; });
+            Eq(BaselineState.Complete, ok.State);
+            Eq(true, ok.Authoritative);
+
+            BaselineSnapshot tampered = BaselineSnapshot.FromJson(JsonNode.Parse(s.ToJson().ToJson(true)).AsObject());
+            tampered.ScheduledTasks[0].Enabled = false;
+            Eq(BaselineState.Corrupt, BaselineHealth.Evaluate(tampered, null, null).State);
+
+            BaselineSnapshot noXml = BaselineSnapshot.FromJson(JsonNode.Parse(s.ToJson().ToJson(true)).AsObject());
+            BaselineHealth partial = BaselineHealth.Evaluate(noXml, delegate { return false; }, null);
+            Eq(BaselineState.Partial, partial.State);
+            Eq(true, partial.Usable);
+            Eq(false, partial.Authoritative);
+            Eq(1, partial.MissingXmlBackups);
+
+            BaselineSnapshot incomplete = BaselineSnapshot.FromJson(JsonNode.Parse(s.ToJson().ToJson(true)).AsObject());
+            incomplete.Metadata.Complete = false;
+            incomplete.Disks.Clear();
+            // 改完要重算校验值，否则测的就不是「不完整」而是「被篡改」
+            incomplete.Metadata.IntegritySha256 = SnapshotIntegrity.Compute(incomplete);
+            Eq(BaselineState.Partial, BaselineHealth.Evaluate(incomplete, delegate { return true; }, delegate { return "samplehash"; }).State);
+
+            BaselineSnapshot wrongSchema = BaselineSnapshot.FromJson(JsonNode.Parse(s.ToJson().ToJson(true)).AsObject());
+            wrongSchema.SchemaVersion = 1;
+            Eq(BaselineState.Corrupt, BaselineHealth.Evaluate(wrongSchema, delegate { return true; }, delegate { return "samplehash"; }).State);
         }
 
         private static void TestMaintenanceCatalog()

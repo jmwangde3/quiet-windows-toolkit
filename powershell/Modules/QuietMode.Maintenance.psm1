@@ -24,24 +24,80 @@ function Get-QmRegistryPsPath {
     return "HKLM:\$($KeyPath.TrimStart('\'))"
 }
 
+# ---- 任务状态三态 ---------------------------------------------------------
+#
+# true / false / $null 必须严格区分：$null 是「读不到」，既不代表启用也不代表禁用。
+# 旧实现用错误文本猜「任务不存在」，中文和英文 Windows 文案不同，猜错就会把
+# 拒绝访问当成「任务不存在」，或者在读不到时直接跳过写入还报成功。
+# 现在只认 COM 的 HRESULT 低位码（2/3 = 不存在，5 = 拒绝访问 = 未知），语言无关。
+
+function ConvertFrom-QmTaskHResult {
+    param([int64]$HResult)
+    $low = $HResult -band 0xFFFF
+    switch ($low) {
+        2 { return 'NotPresent' }    # ERROR_FILE_NOT_FOUND
+        3 { return 'NotPresent' }    # ERROR_PATH_NOT_FOUND
+        default { return 'Unknown' } # 5 = 拒绝访问；其余一律「无法确认」
+    }
+}
+
+function ConvertFrom-QmTaskStateCode {
+    param($Code)
+    switch ([int]$Code) {
+        1 { return 'Disabled' }
+        2 { return 'Queued' }
+        3 { return 'Ready' }
+        4 { return 'Running' }
+        default { return 'Unknown' }
+    }
+}
+
+function New-QmTaskState {
+    param([string]$Status = 'Unknown', $Enabled = $null, [string]$State = '',
+          [string]$Error = '', [string]$Source = '')
+    $exists = $null
+    if ($Status -eq 'Present') { $exists = $true }
+    elseif ($Status -eq 'NotPresent') { $exists = $false }
+    return [pscustomobject]@{
+        status  = $Status      # Present | NotPresent | Unknown
+        exists  = $exists      # 只有 Present / NotPresent 才有布尔值
+        enabled = $Enabled     # $true / $false / $null（读不到）
+        state   = $State
+        error   = $Error
+        source  = $Source
+    }
+}
+
 function Get-QmTaskState {
     param([string]$TaskPath, [string]$TaskName)
+
+    $svc = $null
     try {
-        $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop
-        return [pscustomobject]@{
-            exists  = $true
-            enabled = [bool]$t.Settings.Enabled
-            state   = [string]$t.State
-            error   = ''
-        }
+        $svc = New-Object -ComObject Schedule.Service
+        $svc.Connect()
+        $folderPath = ($TaskPath -replace '^\\', '') -replace '\\$', ''
+        if ($folderPath) { $folder = $svc.GetFolder($folderPath) } else { $folder = $svc.GetFolder('\') }
+        $task = $folder.GetTask($TaskName)
+        return (New-QmTaskState -Status 'Present' -Enabled ([bool]$task.Enabled) `
+                    -State (ConvertFrom-QmTaskStateCode $task.State) -Source 'com')
     } catch {
-        $msg = $_.Exception.Message
-        $missing = $msg -match 'No MSFT_ScheduledTask|不存在|not found|找不到'
-        return [pscustomobject]@{
-            exists  = (-not $missing)
-            enabled = $null
-            state   = ''
-            error   = $msg
+        $hr = 0
+        try { $hr = [int]$_.Exception.HResult } catch { $hr = 0 }
+        if ($hr -ne 0) {
+            return (New-QmTaskState -Status (ConvertFrom-QmTaskHResult $hr) -Error $_.Exception.Message -Source 'com')
+        }
+        # COM 拿不到（极少见）：退到 ScheduledTasks 模块，但只允许证明「存在」，
+        # 失败一律算未知 —— 宁可说不知道，也不能说没有。
+        try {
+            $t = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop
+            return (New-QmTaskState -Status 'Present' -Enabled ([bool]$t.Settings.Enabled) `
+                        -State ([string]$t.State) -Source 'cmdlet')
+        } catch {
+            return (New-QmTaskState -Status 'Unknown' -Error $_.Exception.Message -Source 'cmdlet')
+        }
+    } finally {
+        if ($svc) {
+            try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($svc) } catch { }
         }
     }
 }
@@ -59,11 +115,19 @@ function New-QmStepResult {
 function Invoke-QmStopTask {
     param($Step)
     $before = Get-QmTaskState -TaskPath $Step.path -TaskName $Step.name
-    if (-not $before.exists) { return (New-QmStepResult $Step.order 'NotPresent' '') }
-    if ($before.state -ne 'Running') { return (New-QmStepResult $Step.order 'Skipped' '任务本来未运行') }
+    if ($before.status -eq 'NotPresent') { return (New-QmStepResult $Step.order 'NotPresent' '') }
+    if ($before.status -eq 'Unknown') {
+        return (New-QmStepResult $Step.order 'Failed' ('无法确认任务状态，未执行停止：' + $before.error) '')
+    }
+    if ($before.state -ne 'Running') {
+        return (New-QmStepResult $Step.order 'Skipped' '任务本来未运行' $before.state)
+    }
     try {
         Stop-ScheduledTask -TaskPath $Step.path -TaskName $Step.name -ErrorAction Stop
         $after = Get-QmTaskState -TaskPath $Step.path -TaskName $Step.name
+        if ($after.status -ne 'Present') {
+            return (New-QmStepResult $Step.order 'Failed' ('停止后无法确认任务状态（' + $after.status + '）') '')
+        }
         if ($after.state -eq 'Running') {
             return (New-QmStepResult $Step.order 'Failed' '停止后复读仍为 Running' $after.state)
         }
@@ -77,9 +141,18 @@ function Invoke-QmStopTask {
 function Invoke-QmSetTaskEnabled {
     param($Step, [bool]$Enabled)
     $before = Get-QmTaskState -TaskPath $Step.path -TaskName $Step.name
-    if (-not $before.exists) { return (New-QmStepResult $Step.order 'NotPresent' '') }
-    if ($Enabled -and $before.enabled) { return (New-QmStepResult $Step.order 'Skipped' '本来就是启用' 'enabled=True') }
-    if (-not $Enabled -and -not $before.enabled) { return (New-QmStepResult $Step.order 'Skipped' '本来就是禁用' 'enabled=False') }
+    if ($before.status -eq 'NotPresent') { return (New-QmStepResult $Step.order 'NotPresent' '') }
+
+    # 只有在「确实是已知状态且已经一致」时才跳过。$null 绝不能走进这里 ——
+    # 那正是旧实现把「读不到」当成「本来就是禁用」的地方。
+    if ($before.status -eq 'Present' -and $null -ne $before.enabled) {
+        if ([bool]$before.enabled -eq $Enabled) {
+            $word = '禁用'
+            if ($Enabled) { $word = '启用' }
+            return (New-QmStepResult $Step.order 'Skipped' ('本来就是' + $word) ('enabled=' + $before.enabled))
+        }
+    }
+
     try {
         if ($Enabled) {
             Enable-ScheduledTask -TaskPath $Step.path -TaskName $Step.name -ErrorAction Stop | Out-Null
@@ -87,8 +160,11 @@ function Invoke-QmSetTaskEnabled {
             Disable-ScheduledTask -TaskPath $Step.path -TaskName $Step.name -ErrorAction Stop | Out-Null
         }
         $after = Get-QmTaskState -TaskPath $Step.path -TaskName $Step.name
-        if (-not $after.exists) {
-            return (New-QmStepResult $Step.order 'Failed' '写入后任务消失了' '')
+        if ($after.status -ne 'Present') {
+            return (New-QmStepResult $Step.order 'Failed' ('写入后无法确认任务状态（' + $after.status + '）') '')
+        }
+        if ($null -eq $after.enabled) {
+            return (New-QmStepResult $Step.order 'Failed' '写入后仍读不到 Enabled，按验证失败处理' '')
         }
         if ([bool]$after.enabled -ne $Enabled) {
             return (New-QmStepResult $Step.order 'Failed' ('复读 Enabled 与期望不一致：期望 ' + $Enabled + '，实际 ' + $after.enabled) ('enabled=' + $after.enabled))
@@ -244,4 +320,4 @@ function Invoke-QmMaintenanceStep {
     }
 }
 
-Export-ModuleMember -Function Test-QmElevated, Get-QmTaskState, Invoke-QmMaintenanceStep, New-QmStepResult
+Export-ModuleMember -Function Test-QmElevated, Get-QmTaskState, New-QmTaskState, ConvertFrom-QmTaskHResult, ConvertFrom-QmTaskStateCode, Invoke-QmMaintenanceStep, New-QmStepResult

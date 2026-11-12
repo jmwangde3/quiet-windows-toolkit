@@ -154,17 +154,36 @@ namespace QuietMode.Core.Scheduling
     public static class ReconcileVerifier
     {
         /// <summary>
-        /// 是否需要「漂移修复」：自动决策说不用动（action=none），但回读判定 Failed。
+        /// 是否需要「漂移修复」：自动决策说不用动（action=none），但回读存在可修复偏差。
         /// 这正是首夜之后的形态 —— 状态机认为「已经在夜间」，可电源方案还是旧值，
         /// 于是每个周期都安静地判定失败，谁都不去修。
-        /// 返回需要重跑的相位（night / day）；不需要修复返回 null。
+        ///
+        /// 只认 ActionableDrift：Unknown 不许盲写，SafetyBlocked 不许动设备，
+        /// UnfixableDrift 重跑也没用（交给状态机下个周期重试并累计失败次数）。
         /// </summary>
-        public static string RepairTarget(bool apply, string action, bool targetNight, ReconcileVerdict verdict)
+        public static string RepairTarget(bool apply, string action, bool targetNight, DriftClass classification)
         {
             if (!apply) return null;
             if (!string.Equals(action ?? "", "none", StringComparison.OrdinalIgnoreCase)) return null;
-            if (verdict != ReconcileVerdict.Failed) return null;
+            if (!DriftClassifier.AllowsAutomaticRepair(classification)) return null;
             return targetNight ? "night" : "day";
+        }
+
+        /// <summary>兼容旧调用：按 verdict 推断（Degraded/Failed 都可能是可修复偏差）。</summary>
+        public static string RepairTarget(bool apply, string action, bool targetNight, ReconcileVerdict verdict)
+        {
+            if (verdict != ReconcileVerdict.Failed && verdict != ReconcileVerdict.Degraded) return null;
+            return RepairTarget(apply, action, targetNight, DriftClass.ActionableDrift);
+        }
+
+        /// <summary>
+        /// 只需修复某个组件时用的「定点修复」判定。目前用于把「维护任务被重新启用」
+        /// 这类偏差收敛到最小动作；返回空表示走完整相位。
+        /// </summary>
+        public static string RepairTarget(bool apply, string action, bool targetNight, ReconcileVerification v)
+        {
+            if (v == null) return null;
+            return RepairTarget(apply, action, targetNight, v.Classification);
         }
 
         public static ReconcileVerification Verify(string action, QuietModeConfig cfg, BaselineSnapshot baseline,
@@ -181,8 +200,20 @@ namespace QuietMode.Core.Scheduling
                 v.Maintenance = night
                     ? MaintenanceVerifier.VerifyNight(cfg, obs)
                     : MaintenanceVerifier.VerifyDay(cfg, baseline, obs);
-                v.Problems.AddRange(v.Maintenance.Problems);
-                v.Warnings.AddRange(v.Maintenance.Warnings);
+                // 没有可用基线就没有「原始状态」可谈，白天恢复不能报 Ok。
+                if (!night && (baseline == null || baseline.ScheduledTasks.Count == 0))
+                {
+                    v.Unknown("maintenance", "没有可用的 baseline（缺失或损坏），无法确认维护任务已恢复到原始状态");
+                }
+                foreach (string p in v.Maintenance.Problems) v.Problem("maintenance", true, "", p);
+                foreach (string w in v.Maintenance.Warnings)
+                {
+                    // 「读不到」不可修复；「任务/服务仍在运行」重跑相位还能再停一次，值得修。
+                    bool unreadable = w.Contains("无法确认") || w.Contains("读取失败")
+                                      || w.Contains("读不到") || w.Contains("未探测");
+                    if (unreadable) v.Unknown("maintenance", w);
+                    else v.Warning("maintenance", true, "", w);
+                }
                 v.Notes.AddRange(v.Maintenance.Notes);
             }
             else
@@ -199,22 +230,24 @@ namespace QuietMode.Core.Scheduling
                 {
                     if (!d.Matched)
                     {
-                        v.Problems.Add("磁盘 " + d.Display + "：身份未匹配（" + (string.IsNullOrEmpty(d.Error) ? "原因未知" : d.Error) + "）");
+                        // 身份不明 = 安全阻塞：不许为了「看起来对齐」去动一块认不出的盘。
+                        v.Safety("disk", "磁盘 " + d.Display + "：身份未匹配（"
+                                          + (string.IsNullOrEmpty(d.Error) ? "原因未知" : d.Error) + "），不做任何写入");
                         continue;
                     }
                     if (!d.IsOffline.HasValue)
                     {
-                        v.Warnings.Add("磁盘 " + d.Display + "：读不到脱机状态，无法确认");
+                        v.Unknown("disk", "磁盘 " + d.Display + "：读不到脱机状态，无法确认");
                         continue;
                     }
                     if (d.IsOffline.Value != wantOffline)
                     {
-                        v.Problems.Add("磁盘 " + d.Display + "：期望 " + (wantOffline ? "Offline" : "Online")
-                                       + "，实际 " + (d.IsOffline.Value ? "Offline" : "Online"));
+                        v.Problem("disk", true, d.UniqueId, "磁盘 " + d.Display + "：期望 " + (wantOffline ? "Offline" : "Online")
+                                   + "，实际 " + (d.IsOffline.Value ? "Offline" : "Online"));
                     }
                 }
                 if (list.Count == 0)
-                    v.Warnings.Add("配置启用了磁盘管理，但没有采集到任何目标磁盘状态");
+                    v.Unknown("disk", "配置启用了磁盘管理，但没有采集到任何目标磁盘状态");
             }
             else
             {
@@ -227,13 +260,13 @@ namespace QuietMode.Core.Scheduling
                 int want = cfg.SpinDown.Seconds;
                 if (spinDown == null || !spinDown.Captured)
                 {
-                    v.Warnings.Add("硬盘停转：读不到 DISKIDLE，无法确认（期望 " + want + "s）"
-                                   + (spinDown == null || string.IsNullOrEmpty(spinDown.Error) ? "" : "：" + spinDown.Error));
+                    v.Unknown("spindown", "硬盘停转：读不到 DISKIDLE，无法确认（期望 " + want + "s）"
+                                          + (spinDown == null || string.IsNullOrEmpty(spinDown.Error) ? "" : "：" + spinDown.Error));
                 }
                 else if (!spinDown.Matches)
                 {
-                    v.Problems.Add("硬盘停转：期望 " + want + "s，实际 AC=" + spinDown.AcSeconds
-                                   + "s DC=" + spinDown.DcSeconds + "s");
+                    v.Problem("spindown", true, "DISKIDLE", "硬盘停转：期望 " + want + "s，实际 AC=" + spinDown.AcSeconds
+                               + "s DC=" + spinDown.DcSeconds + "s");
                 }
             }
             else
@@ -246,16 +279,17 @@ namespace QuietMode.Core.Scheduling
             {
                 if (fan == null)
                 {
-                    v.Warnings.Add("风扇：没有采集到状态");
+                    v.Unknown("fan", "风扇：没有采集到状态");
                 }
                 else if (!fan.Available)
                 {
-                    v.Warnings.Add("风扇：状态未知（" + (string.IsNullOrEmpty(fan.Error) ? "IPC 不可用" : fan.Error) + "）");
+                    v.Unknown("fan", "风扇：状态未知（" + (string.IsNullOrEmpty(fan.Error) ? "IPC 不可用" : fan.Error) + "）");
                 }
                 else if (!fan.Matches)
                 {
-                    v.Problems.Add("风扇：当前配置 " + (fan.CurrentProfile.Length == 0 ? "(未知)" : fan.CurrentProfile)
-                                   + "，期望 " + fan.ExpectedProfile);
+                    v.Problem("fan", true, fan.ExpectedProfile, "风扇：当前配置 "
+                               + (fan.CurrentProfile.Length == 0 ? "(未知)" : fan.CurrentProfile)
+                               + "，期望 " + fan.ExpectedProfile);
                 }
             }
             else

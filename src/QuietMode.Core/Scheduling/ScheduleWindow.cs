@@ -133,4 +133,61 @@ namespace QuietMode.Core.Scheduling
             return minutes >= nightStart && minutes < dayStart;
         }
     }
+
+    /// <summary>
+    /// 夜间窗口的身份。「今晚」不是一个布尔值，而是一段具体的窗口：默认 23:58 开始、
+    /// 次日 10:02 结束。任何「只对今晚有效」的决定都必须绑定到这个身份上，否则跨午夜、
+    /// 重启、改时间之后就无法判断这个决定是不是过期了。
+    ///
+    /// 取值 = 窗口开始那一天的本地日期（yyyy-MM-dd）。跨午夜窗口在午夜之后仍属于前一天。
+    /// </summary>
+    public static class NightWindow
+    {
+        /// <summary>now 所在的夜间窗口；不在窗口内时返回「下一个即将开始的窗口」。</summary>
+        public static string Key(ScheduleSettings s, DateTime now)
+        {
+            if (s == null) return "";
+            int night = TimeOfDay.Parse(s.NightStart);
+            int day = TimeOfDay.Parse(s.DayStart);
+            if (night < 0 || day < 0 || night == day) return "";
+
+            int nowMinutes = TimeOfDay.Of(now);
+            if (ScheduleWindow.InWindow(nowMinutes, night, day))
+            {
+                // 跨午夜：00:00–dayStart 这一段属于前一天开始的那个窗口。
+                if (night > day && nowMinutes < day) return Format(now.Date.AddDays(-1));
+                return Format(now.Date);
+            }
+            return Format(night > nowMinutes ? now.Date : now.Date.AddDays(1));
+        }
+
+        /// <summary>窗口的结束时刻（用于日志与文档，不参与判定）。</summary>
+        public static DateTime EndOf(ScheduleSettings s, DateTime now)
+        {
+            DateTime start = StartOf(s, now);
+            if (start == DateTime.MinValue) return DateTime.MinValue;
+            int night = TimeOfDay.Parse(s.NightStart);
+            int day = TimeOfDay.Parse(s.DayStart);
+            DateTime end = start.Date.AddDays(1).AddMinutes(day);
+            if (night < day) end = start.Date.AddMinutes(day);
+            return end;
+        }
+
+        /// <summary>窗口的开始时刻（本地）。</summary>
+        public static DateTime StartOf(ScheduleSettings s, DateTime now)
+        {
+            string key = Key(s, now);
+            if (key.Length == 0) return DateTime.MinValue;
+            DateTime date;
+            if (!DateTime.TryParseExact(key, "yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture,
+                                        System.Globalization.DateTimeStyles.None, out date))
+                return DateTime.MinValue;
+            return date.AddMinutes(TimeOfDay.Parse(s.NightStart));
+        }
+
+        private static string Format(DateTime d)
+        {
+            return d.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+        }
+    }
 }

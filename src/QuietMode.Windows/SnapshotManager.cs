@@ -13,14 +13,18 @@ namespace QuietMode.Windows
     {
         public bool Ok = true;
         public bool Complete = true;
+        public BaselineState State = BaselineState.Missing;
         public List<string> Errors = new List<string>();
         public List<string> Warnings = new List<string>();
+
+        public void AddErrors(IEnumerable<string> items) { foreach (string s in items) Errors.Add(s); }
+        public void AddWarnings(IEnumerable<string> items) { foreach (string s in items) Warnings.Add(s); }
 
         public string ToText()
         {
             StringBuilder sb = new StringBuilder();
             sb.AppendLine(Ok ? "SNAPSHOT OK" : "SNAPSHOT INVALID");
-            sb.AppendLine("complete=" + Complete);
+            sb.AppendLine("state=" + State + "  complete=" + Complete);
             foreach (string e in Errors) sb.AppendLine("  ERROR   " + e);
             foreach (string w in Warnings) sb.AppendLine("  WARN    " + w);
             return sb.ToString().TrimEnd();
@@ -157,14 +161,98 @@ namespace QuietMode.Windows
 
             snapshot.Metadata.IntegritySha256 = ComputeIntegrity(snapshot);
             string text = snapshot.ToJson().ToJson(true) + "\n";
+
+            // baseline.previous.json 只在「现有基线可信」时才轮换。
+            // 否则一次重建会把唯一一份还能用的旧基线覆盖成坏文件，等于把退路烧掉。
             string previous = Path.Combine(Paths.RecoveryDir, "baseline.previous.json");
-            AtomicFile.WriteText(Paths.BaselinePath, text, previous, delegate(string reread)
+            bool rotate = false;
+            if (File.Exists(Paths.BaselinePath))
+            {
+                BaselineHealth health = Inspect();
+                rotate = health.Usable;
+                if (!rotate)
+                    snapshot.CaptureNotes.Add("原 baseline 不可用（" + health.State + "），未覆盖 baseline.previous.json");
+            }
+
+            AtomicFile.WriteText(Paths.BaselinePath, text, rotate ? previous : null, delegate(string reread)
             {
                 JsonNode node;
                 string err;
                 if (!JsonNode.TryParse(reread, out node, out err))
                     throw new InvalidDataException("baseline 写入后复读失败：" + err);
             });
+        }
+
+        /// <summary>
+        /// 读取并体检。任何情况下都不抛异常 —— 调用方要根据状态决定「能不能恢复」，
+        /// 而不是被一个异常打断在半路。
+        /// </summary>
+        public BaselineSnapshot TryLoad(out BaselineHealth health)
+        {
+            health = new BaselineHealth();
+            if (!File.Exists(Paths.BaselinePath))
+            {
+                health.State = BaselineState.Missing;
+                health.Errors.Add("baseline.json 不存在");
+                return null;
+            }
+
+            BaselineSnapshot s;
+            try
+            {
+                string text = File.ReadAllText(Paths.BaselinePath, Encoding.UTF8);
+                JsonNode node;
+                string err;
+                if (!JsonNode.TryParse(text, out node, out err))
+                {
+                    health.State = BaselineState.Corrupt;
+                    health.Errors.Add("baseline.json 解析失败：" + err);
+                    return null;
+                }
+                JsonObject root = node.TryObject();
+                if (root == null)
+                {
+                    health.State = BaselineState.Corrupt;
+                    health.Errors.Add("baseline.json 根节点不是对象");
+                    return null;
+                }
+                s = BaselineSnapshot.FromJson(root);
+            }
+            catch (Exception ex)
+            {
+                health.State = BaselineState.Corrupt;
+                health.Errors.Add("读取 baseline.json 失败：" + ex.Message);
+                return null;
+            }
+
+            health = Evaluate(s);
+            return s;
+        }
+
+        /// <summary>只体检，不返回数据。用于「要不要拿它去恢复」的判断。</summary>
+        public BaselineHealth Inspect()
+        {
+            BaselineHealth h;
+            BaselineSnapshot s = TryLoad(out h);
+            if (s == null) return h;
+            return h;
+        }
+
+        private BaselineHealth Evaluate(BaselineSnapshot s)
+        {
+            return BaselineHealth.Evaluate(
+                s,
+                delegate(string relative)
+                {
+                    string full = Path.Combine(Paths.RecoveryDir, relative.Replace('/', Path.DirectorySeparatorChar));
+                    return File.Exists(full);
+                },
+                delegate(string relative)
+                {
+                    string full = Path.Combine(Paths.RecoveryDir, relative.Replace('/', Path.DirectorySeparatorChar));
+                    try { return AtomicFile.Sha256OfFile(full); }
+                    catch { return ""; }
+                });
         }
 
         public BaselineSnapshot Load()
@@ -183,60 +271,15 @@ namespace QuietMode.Windows
         public SnapshotVerifyResult Verify(BaselineSnapshot s)
         {
             SnapshotVerifyResult r = new SnapshotVerifyResult();
-            if (s == null)
-            {
-                r.Ok = false;
-                r.Errors.Add("快照为空");
-                return r;
-            }
+            BaselineHealth h = s == null ? BaselineHealth.Evaluate(null, null, null) : Evaluate(s);
 
-            if (s.SchemaVersion != BaselineSnapshot.CurrentSchemaVersion)
-            {
-                r.Ok = false;
-                r.Errors.Add("schemaVersion=" + s.SchemaVersion + "，期望 " + BaselineSnapshot.CurrentSchemaVersion);
-            }
-
-            string expected = s.Metadata.IntegritySha256 ?? "";
-            string actual = ComputeIntegrity(s);
-            if (!string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase))
-            {
-                r.Ok = false;
-                r.Errors.Add("完整性校验值不匹配（记录 " + Short(expected) + "，实算 " + Short(actual) + "）");
-            }
-
-            foreach (TaskSnapshot t in s.ScheduledTasks)
-            {
-                if (string.IsNullOrEmpty(t.XmlBackup)) continue;
-                string full = Path.Combine(Paths.RecoveryDir, t.XmlBackup.Replace('/', Path.DirectorySeparatorChar));
-                if (!File.Exists(full))
-                {
-                    r.Ok = false;
-                    r.Errors.Add(t.FullName + " 的 XML 备份缺失：" + t.XmlBackup);
-                    continue;
-                }
-                string hash = AtomicFile.Sha256OfFile(full);
-                if (!string.Equals(hash, t.XmlSha256, StringComparison.OrdinalIgnoreCase))
-                {
-                    r.Ok = false;
-                    r.Errors.Add(t.FullName + " 的 XML 备份被改动（哈希不符）");
-                }
-            }
-
-            if (!s.Metadata.Complete)
-            {
-                r.Complete = false;
+            r.State = h.State;
+            r.AddErrors(h.Errors);
+            r.AddWarnings(h.Warnings);
+            r.Ok = h.Usable;
+            r.Complete = h.State == BaselineState.Complete;
+            if (h.State == BaselineState.Partial)
                 r.Warnings.Add("快照不完整；恢复时缺失项会被跳过并记录，不会假装成功");
-                foreach (string n in s.CaptureNotes) r.Warnings.Add(n);
-            }
-
-            foreach (RegistrySnapshot reg in s.Registry)
-            {
-                if (string.Equals(reg.Kind, "Error", StringComparison.Ordinal))
-                {
-                    r.Ok = false;
-                    r.Errors.Add("注册表读取失败：" + reg.KeyPath + "\\" + reg.ValueName + " — " + reg.Value);
-                }
-            }
             return r;
         }
 

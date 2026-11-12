@@ -4,6 +4,7 @@ using System.Globalization;
 using System.IO;
 using System.Text;
 using QuietMode.Core.Models;
+using QuietMode.Core.Scheduling;
 using QuietMode.Windows.Native;
 
 namespace QuietMode.Windows
@@ -98,116 +99,35 @@ namespace QuietMode.Windows
         public const string TaskName = "QuietMode-Reconcile";
         public const string FullName = FolderPath + TaskName;
 
+        /// <summary>
+        /// v1 留下的全部历史闸门。v1 前后装过两个位置（带文件夹和不带文件夹），
+        /// 少认一个就会出现「两套调度同时控制设备」—— 而这正是 v1 出问题的形态。
+        /// 这里只按「任务全名」查找，不依赖磁盘号、不依赖用户名。
+        /// </summary>
         public static readonly string[] LegacyTaskPaths =
         {
             @"\QuietHDD\QuietHDD_NightGate",
-            @"\QuietHDD\QuietHDD_DiskGate"
+            @"\QuietHDD\QuietHDD_DiskGate",
+            @"\QuietHDD_NightGate",
+            @"\QuietHDD_DiskGate"
         };
 
-        /// <summary>生成任务 XML。纯函数，方便单测和人工核对。</summary>
+        /// <summary>夜间窗口的分钟数（nightStart → dayStart，跨午夜自动 +1 天）。非法返回 0。</summary>
+        public static int WindowMinutes(string nightStart, string dayStart)
+        {
+            return TaskXml.WindowMinutes(nightStart, dayStart);
+        }
+
+        /// <summary>ISO-8601 时长；实现在 TaskXml，两边只有一份。</summary>
+        public static string IsoDuration(int minutes)
+        {
+            return TaskXml.IsoDuration(minutes);
+        }
+
+        /// <summary>生成任务 XML。纯函数，方便单测和人工核对；实现见 Core 的 TaskXml。</summary>
         public static string BuildXml(ScheduleSettings s, string command, string arguments, string workingDir, string description)
         {
-            if (s == null) s = new ScheduleSettings();
-            int interval = s.ReconcileIntervalMinutes > 0 ? s.ReconcileIntervalMinutes : 10;
-            string night = string.IsNullOrWhiteSpace(s.NightStart) ? "23:58" : s.NightStart.Trim();
-            string day = string.IsNullOrWhiteSpace(s.DayStart) ? "10:02" : s.DayStart.Trim();
-            if (TimeText.ToMinutes(night) < 0) night = "23:58";
-            if (TimeText.ToMinutes(day) < 0) day = "10:02";
-
-            string start = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-
-            StringBuilder sb = new StringBuilder();
-            sb.AppendLine("<?xml version=\"1.0\" encoding=\"UTF-16\"?>");
-            sb.AppendLine("<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">");
-            sb.AppendLine("  <RegistrationInfo>");
-            sb.AppendLine("    <Author>QuietMode</Author>");
-            sb.AppendLine("    <Description>" + Escape(description ?? "QuietMode 统一调度：维护闸门 + 磁盘脱机 + 风扇配置") + "</Description>");
-            sb.AppendLine("    <URI>" + FullName + "</URI>");
-            sb.AppendLine("  </RegistrationInfo>");
-            sb.AppendLine("  <Triggers>");
-            sb.AppendLine(CalendarTrigger(start + "T" + night + ":00", "PT" + interval + "M", "PT10H", true));
-            sb.AppendLine(CalendarTrigger(start + "T" + day + ":00", "", "", false));
-            sb.AppendLine("    <BootTrigger>");
-            sb.AppendLine("      <Enabled>true</Enabled>");
-            sb.AppendLine("      <Delay>PT2M</Delay>");
-            sb.AppendLine("    </BootTrigger>");
-            sb.AppendLine("    <EventTrigger>");
-            sb.AppendLine("      <Enabled>true</Enabled>");
-            sb.AppendLine("      <Subscription>&lt;QueryList&gt;&lt;Query Id=\"0\" Path=\"System\"&gt;&lt;Select Path=\"System\"&gt;*[System[Provider[@Name='Microsoft-Windows-Power-Troubleshooter'] and EventID=1]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>");
-            sb.AppendLine("      <Delay>PT30S</Delay>");
-            sb.AppendLine("    </EventTrigger>");
-            sb.AppendLine("    <EventTrigger>");
-            sb.AppendLine("      <Enabled>true</Enabled>");
-            sb.AppendLine("      <Subscription>&lt;QueryList&gt;&lt;Query Id=\"0\" Path=\"Security\"&gt;&lt;Select Path=\"Security\"&gt;*[System[Provider[@Name='Microsoft-Windows-Security-Auditing'] and EventID=4801]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>");
-            sb.AppendLine("      <Delay>PT10S</Delay>");
-            sb.AppendLine("    </EventTrigger>");
-            sb.AppendLine("    <LogonTrigger>");
-            sb.AppendLine("      <Enabled>true</Enabled>");
-            sb.AppendLine("      <Delay>PT45S</Delay>");
-            sb.AppendLine("    </LogonTrigger>");
-            sb.AppendLine("  </Triggers>");
-            sb.AppendLine("  <Principals>");
-            sb.AppendLine("    <Principal id=\"Author\">");
-            sb.AppendLine("      <UserId>S-1-5-18</UserId>");
-            sb.AppendLine("      <RunLevel>HighestAvailable</RunLevel>");
-            sb.AppendLine("    </Principal>");
-            sb.AppendLine("  </Principals>");
-            sb.AppendLine("  <Settings>");
-            sb.AppendLine("    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>");
-            sb.AppendLine("    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>");
-            sb.AppendLine("    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>");
-            sb.AppendLine("    <AllowHardTerminate>true</AllowHardTerminate>");
-            sb.AppendLine("    <StartWhenAvailable>true</StartWhenAvailable>");
-            sb.AppendLine("    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>");
-            sb.AppendLine("    <IdleSettings>");
-            sb.AppendLine("      <StopOnIdleEnd>false</StopOnIdleEnd>");
-            sb.AppendLine("      <RestartOnIdle>false</RestartOnIdle>");
-            sb.AppendLine("    </IdleSettings>");
-            sb.AppendLine("    <AllowStartOnDemand>true</AllowStartOnDemand>");
-            sb.AppendLine("    <Enabled>true</Enabled>");
-            sb.AppendLine("    <Hidden>false</Hidden>");
-            sb.AppendLine("    <RunOnlyIfIdle>false</RunOnlyIfIdle>");
-            sb.AppendLine("    <WakeToRun>false</WakeToRun>");
-            sb.AppendLine("    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>");
-            sb.AppendLine("    <Priority>7</Priority>");
-            sb.AppendLine("  </Settings>");
-            sb.AppendLine("  <Actions Context=\"Author\">");
-            sb.AppendLine("    <Exec>");
-            sb.AppendLine("      <Command>" + Escape(command) + "</Command>");
-            sb.AppendLine("      <Arguments>" + Escape(arguments) + "</Arguments>");
-            if (!string.IsNullOrEmpty(workingDir))
-                sb.AppendLine("      <WorkingDirectory>" + Escape(workingDir) + "</WorkingDirectory>");
-            sb.AppendLine("    </Exec>");
-            sb.AppendLine("  </Actions>");
-            sb.AppendLine("</Task>");
-            return sb.ToString();
-        }
-
-        private static string CalendarTrigger(string startBoundary, string interval, string duration, bool withRepetition)
-        {
-            StringBuilder sb = new StringBuilder();
-            sb.AppendLine("    <CalendarTrigger>");
-            sb.AppendLine("      <StartBoundary>" + startBoundary + "</StartBoundary>");
-            sb.AppendLine("      <Enabled>true</Enabled>");
-            sb.AppendLine("      <ScheduleByDay>");
-            sb.AppendLine("        <DaysInterval>1</DaysInterval>");
-            sb.AppendLine("      </ScheduleByDay>");
-            if (withRepetition && interval.Length > 0)
-            {
-                sb.AppendLine("      <Repetition>");
-                sb.AppendLine("        <Interval>" + interval + "</Interval>");
-                sb.AppendLine("        <Duration>" + duration + "</Duration>");
-                sb.AppendLine("        <StopAtDurationEnd>true</StopAtDurationEnd>");
-                sb.AppendLine("      </Repetition>");
-            }
-            sb.Append("    </CalendarTrigger>");
-            return sb.ToString();
-        }
-
-        private static string Escape(string s)
-        {
-            if (string.IsNullOrEmpty(s)) return "";
-            return s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;");
+            return TaskXml.Build(s, command, arguments, workingDir, description, FullName, DateTime.Now);
         }
 
         /// <summary>默认命令行：qmctl reconcile --apply --trigger schedule --root &lt;root&gt; --quiet。</summary>

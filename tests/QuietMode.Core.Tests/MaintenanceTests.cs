@@ -25,6 +25,7 @@ namespace QuietMode.Core.Tests
             Run("白天计划：原本启用的任务恢复启用", TestDayPlanEnables);
             Run("白天计划：原本禁用的任务不擅自启用", TestDayPlanKeepsDisabled);
             Run("白天计划：被外部启用时按 baseline 收回禁用", TestDayPlanRestoresDisabled);
+            Run("白天计划：恢复原本启用的任务是关键步骤，收回禁用不是", TestDayPlanCriticalGrading);
             Run("白天计划：baseline 没有的值 → 删除而不是写默认值", TestDayPlanDeletesAbsentValue);
             Run("白天计划：SysMain 按 baseline 的 Start 值恢复", TestDayPlanRestoresSysMain);
             Run("白天验证：注册表被改动 → Failed", TestDayVerifyRegistryDrift);
@@ -277,6 +278,52 @@ namespace QuietMode.Core.Tests
             MaintenancePlan plan = MaintenancePlanner.BuildDay(DefaultConfig(), baseline, obs);
             Eq(0, CountSteps(plan, MaintenanceAction.EnableTask));
             Eq(MaintenanceCatalog.NightDisableTargets.Count, CountSteps(plan, MaintenanceAction.DisableTask));
+            // 原本禁用的任务，按原状再禁用失败只是「对齐失败」，不该升级成关键失败；
+            // 但它仍然必须作为一步出现并被验证器报告，不能被隐藏。
+            foreach (MaintenanceStep s in plan.Steps)
+            {
+                if (s.Action == MaintenanceAction.DisableTask) Eq(false, s.Critical);
+            }
+        }
+
+        /// <summary>
+        /// Critical 的语义只有一条：这一步失败会不会让用户丢掉原有的东西。
+        /// 原本启用的任务恢复不回来 = 用户的维护任务被我们关死了，必须关键失败。
+        /// </summary>
+        private static void TestDayPlanCriticalGrading()
+        {
+            BaselineSnapshot baseline = BaselineAllEnabled();
+            SystemObservation obs = EmptyObservation();
+            SetAllNightTargets(obs, false, "Disabled");   // 夜间被我们禁用，白天要恢复
+            SetSysMain(obs, true, 4, "Stopped");
+
+            MaintenancePlan plan = MaintenancePlanner.BuildDay(DefaultConfig(), baseline, obs);
+            MaintenanceTaskDefinition first = MaintenanceCatalog.NightDisableTargets[0];
+            MaintenanceStep enable = FirstStep(plan, MaintenanceAction.EnableTask, first.Name);
+            True(enable != null, "应对原本启用的任务生成 EnableTask");
+            Eq(true, enable.Critical);
+
+            // 原本启用却停在禁用 → 关键；反过来原本禁用、现在被打开 → 非关键
+            BaselineSnapshot mixed = BaselineAllEnabled();
+            foreach (TaskSnapshot t in mixed.ScheduledTasks) t.Enabled = false;
+            mixed.ScheduledTasks[0].Enabled = true;
+
+            SystemObservation obs2 = EmptyObservation();
+            SetAllNightTargets(obs2, true, "Ready");
+            // 第一个原本启用的任务当前是禁用 → 需要恢复启用（关键）
+            SetTask(obs2, MaintenanceCatalog.NightDisableTargets[0], TaskPresence.Present, false, "Disabled");
+            SetSysMain(obs2, true, 4, "Stopped");
+            MaintenancePlan plan2 = MaintenancePlanner.BuildDay(DefaultConfig(), mixed, obs2);
+
+            MaintenanceStep enableFirst = FirstStep(plan2, MaintenanceAction.EnableTask, mixed.ScheduledTasks[0].Name);
+            True(enableFirst != null, "原本启用的那一个应生成 EnableTask");
+            Eq(true, enableFirst.Critical);
+
+            foreach (MaintenanceStep s in plan2.Steps)
+            {
+                if (s.Action != MaintenanceAction.DisableTask) continue;
+                Eq(false, s.Critical);
+            }
         }
 
         private static void TestDayPlanDeletesAbsentValue()

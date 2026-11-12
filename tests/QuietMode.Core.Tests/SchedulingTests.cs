@@ -84,13 +84,108 @@ namespace QuietMode.Core.Tests
                 True(d.Notes.Exists(n => n.Contains("手动静音")), "应说明手动静音优先");
             });
 
-            Run("状态机：手动关闭保留到下一夜", delegate
+            Run("状态机：手动关闭只覆盖本夜，白天恢复成功也不能解除抑制", delegate
             {
-                DecisionInput i = NightInput(new DateTime(2026, 11, 12, 1, 0, 0));   // 夜间
-                i.State.AutoSilentSuppressed = true;
-                Decision d = StateMachine.Decide(i);
-                Eq(ControllerState.ManualNormal, d.State);
+                ScheduleSettings sc = DefaultSchedule();
+                DateTime press = new DateTime(2026, 11, 12, 1, 0, 0);       // 夜间按下
+                QuietModeState st = new QuietModeState();
+                st.AutoSilentActive = true;
+
+                StateMachine.Suppress(st, sc, press);
+                Eq(true, st.AutoSilentSuppressed);
+                Eq("2026-11-11", st.AutoSilentSuppressedWindow);           // 跨午夜窗口属于前一天
+
+                // 01:01 需要真的恢复到白天
+                Decision need = DecideAt(st, sc, press.AddMinutes(1));
+                Eq(ControllerState.ManualNormal, need.State);
+                Eq("day", need.Action);
+
+                // 恢复成功：抑制标记必须留着（这就是原先的缺陷所在）
+                StateMachine.ApplyRun(st, "day", "Ok", "", press.AddMinutes(2).ToUniversalTime(), false);
+                Eq(false, st.AutoSilentActive);
+                Eq(true, st.AutoSilentSuppressed);
+                Eq("2026-11-11", st.AutoSilentSuppressedWindow);
+
+                // 本夜后续周期一律不动，绝不重新进入夜间
+                Decision quiet1 = DecideAt(st, sc, press.AddMinutes(10));
+                Eq(ControllerState.ManualNormal, quiet1.State);
+                Eq("none", quiet1.Action);
+                Eq("none", DecideAt(st, sc, new DateTime(2026, 11, 12, 6, 0, 0)).Action);
+                Eq("none", DecideAt(st, sc, new DateTime(2026, 11, 12, 10, 1, 0)).Action);
+
+                // 10:02 之后是白天，正常
+                Decision day = DecideAt(st, sc, new DateTime(2026, 11, 12, 10, 2, 0));
+                Eq(ControllerState.DayActive, day.State);
+                Eq("none", day.Action);
+
+                // 次日 23:58：窗口换了，抑制自动失效，自动静音恢复
+                DateTime nextNight = new DateTime(2026, 11, 12, 23, 58, 0);
+                StateMachine.NormalizeSuppression(st, sc, nextNight);
+                Eq(false, st.AutoSilentSuppressed);
+                Decision next = DecideAt(st, sc, nextNight);
+                Eq(ControllerState.EnteringNight, next.State);
+                Eq("night", next.Action);
+            });
+
+            Run("状态机：夜间重启后抑制保持，手动静音可以覆盖", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+                DateTime press = new DateTime(2026, 11, 12, 2, 0, 0);
+                QuietModeState st = new QuietModeState();
+                StateMachine.Suppress(st, sc, press);
+
+                // 重启：同一窗口、只改内存里的「现在」，标记仍有效
+                StateMachine.NormalizeSuppression(st, sc, new DateTime(2026, 11, 12, 3, 30, 0));
+                Eq(true, st.AutoSilentSuppressed);
+                Eq("none", DecideAt(st, sc, new DateTime(2026, 11, 12, 3, 30, 0)).Action);
+
+                // 手动重新开启静音：抑制立即作废，动作回到 night
+                st.ModeOn = true;
+                StateMachine.ClearSuppression(st);
+                Decision d = DecideAt(st, sc, new DateTime(2026, 11, 12, 3, 40, 0));
+                Eq(ControllerState.ManualQuiet, d.State);
+                Eq("night", d.Action);
+            });
+
+            Run("状态机：旧版本的抑制标记按当前窗口迁移，不会永久粘住", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+
+                // schema 3 留下的裸布尔：没有窗口 → 归到当前窗口
+                QuietModeState legacy = new QuietModeState();
+                legacy.SchemaVersion = 3;
+                legacy.AutoSilentSuppressed = true;
+                StateMachine.NormalizeSuppression(legacy, sc, new DateTime(2026, 11, 12, 1, 0, 0));
+                Eq("2026-11-11", legacy.AutoSilentSuppressedWindow);
+                Eq(true, legacy.AutoSilentSuppressed);
+
+                // 换到第二天夜里：自动松开
+                StateMachine.NormalizeSuppression(legacy, sc, new DateTime(2026, 11, 13, 0, 5, 0));
+                Eq(false, legacy.AutoSilentSuppressed);
+                Eq("", legacy.AutoSilentSuppressedWindow);
+            });
+
+            Run("状态机：白天恢复失败会在白天重试", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+                QuietModeState st = new QuietModeState();
+                st.LastVerdict = "Failed";
+                st.LastReconcileAction = "day";
+                st.ConsecutiveFailures = 2;
+                Decision d = DecideAt(st, sc, new DateTime(2026, 11, 12, 11, 0, 0));
+                Eq(ControllerState.EnteringDay, d.State);
                 Eq("day", d.Action);
+                True(d.Notes.Exists(n => n.Contains("连续失败 2 次")), "应带出连续失败次数");
+            });
+
+            Run("状态机：抑制期间出现真实偏差仍会被修复（decision 走 none，修复由控制器兜底）", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+                QuietModeState st = new QuietModeState();
+                StateMachine.Suppress(st, sc, new DateTime(2026, 11, 12, 1, 0, 0));
+                Decision d = DecideAt(st, sc, new DateTime(2026, 11, 12, 1, 5, 0));
+                Eq("none", d.Action);
+                Eq(false, d.TargetNight);
             });
 
             Run("状态机：暂停时夜间也不动作", delegate
@@ -228,12 +323,190 @@ namespace QuietMode.Core.Tests
                 Eq("day", ReconcileVerifier.RepairTarget(true, "none", false, ReconcileVerdict.Failed));
             });
 
-            Run("漂移修复：达标 / 降级 / 非 apply / 已有动作时都不触发", delegate
+            Run("漂移修复：达标 / 非 apply / 已有动作时都不触发", delegate
             {
                 Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, ReconcileVerdict.Ok));
-                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, ReconcileVerdict.Degraded));
                 Eq<string>(null, ReconcileVerifier.RepairTarget(false, "none", true, ReconcileVerdict.Failed));
                 Eq<string>(null, ReconcileVerifier.RepairTarget(true, "night", true, ReconcileVerdict.Failed));
+            });
+
+            Run("任务 XML：夜间重复覆盖整个窗口而不是写死 10 小时", delegate
+            {
+                Eq(604, TaskXml.WindowMinutes("23:58", "10:02"));
+                Eq("PT10H4M", TaskXml.IsoDuration(604));
+                Eq("PT10H", TaskXml.IsoDuration(600));
+                Eq("PT6H", TaskXml.IsoDuration(360));
+                Eq("PT45M", TaskXml.IsoDuration(45));
+                Eq("", TaskXml.IsoDuration(0));
+
+                Eq(600, TaskXml.WindowMinutes("22:00", "08:00"));
+                Eq(360, TaskXml.WindowMinutes("00:00", "06:00"));
+                Eq(840, TaskXml.WindowMinutes("22:30", "12:30"));
+                Eq(0, TaskXml.WindowMinutes("10:02", "10:02"));
+                Eq(0, TaskXml.WindowMinutes("25:00", "10:02"));
+            });
+
+            Run("任务 XML：结构合法，关键设置齐全", delegate
+            {
+                ScheduleSettings s = DefaultSchedule();
+                string xml = TaskXml.Build(s, @"C:\QuietMode\qmctl.exe", "reconcile --apply --trigger schedule",
+                                           @"C:\QuietMode", "测试", @"\QuietMode\QuietMode-Reconcile",
+                                           new DateTime(2026, 11, 12));
+                System.Xml.XmlDocument doc = new System.Xml.XmlDocument();
+                doc.LoadXml(xml);
+                System.Xml.XmlNamespaceManager ns = new System.Xml.XmlNamespaceManager(doc.NameTable);
+                ns.AddNamespace("t", TaskXml.Namespace);
+
+                Eq("S-1-5-18", doc.SelectSingleNode("//t:Principals/t:Principal/t:UserId", ns).InnerText);
+                Eq("HighestAvailable", doc.SelectSingleNode("//t:Principals/t:Principal/t:RunLevel", ns).InnerText);
+                Eq("IgnoreNew", doc.SelectSingleNode("//t:Settings/t:MultipleInstancesPolicy", ns).InnerText);
+                Eq("false", doc.SelectSingleNode("//t:Settings/t:WakeToRun", ns).InnerText);
+                Eq("PT10M", doc.SelectSingleNode("//t:Settings/t:ExecutionTimeLimit", ns).InnerText);
+                Eq("reconcile --apply --trigger schedule", doc.SelectSingleNode("//t:Actions/t:Exec/t:Arguments", ns).InnerText);
+
+                System.Xml.XmlNodeList triggers = doc.SelectNodes("//t:Triggers/t:CalendarTrigger", ns);
+                Eq(2, triggers.Count);
+                Eq("2026-11-12T23:58:00", triggers[0].SelectSingleNode("t:StartBoundary", ns).InnerText);
+                Eq("PT10M", triggers[0].SelectSingleNode("t:Repetition/t:Interval", ns).InnerText);
+                Eq("PT10H4M", triggers[0].SelectSingleNode("t:Repetition/t:Duration", ns).InnerText);
+                Eq("true", triggers[0].SelectSingleNode("t:Repetition/t:StopAtDurationEnd", ns).InnerText);
+                Eq("2026-11-12T10:02:00", triggers[1].SelectSingleNode("t:StartBoundary", ns).InnerText);
+            });
+
+            Run("任务 XML：白天重试有界，不会撞进下一个夜间窗口", delegate
+            {
+                Eq(240, TaskXml.DayRetryMinutes("23:58", "10:02"));      // 14 小时白天，封顶 4 小时
+                Eq(0, TaskXml.DayRetryMinutes("10:30", "10:00"));        // 白天只有 30 分钟，不排重试
+
+                ScheduleSettings s = DefaultSchedule();
+                s.DayStart = "10:02";
+                s.NightStart = "23:58";
+                string xml = TaskXml.Build(s, "x.exe", "a", "", "", "", new DateTime(2026, 11, 12));
+                System.Xml.XmlDocument doc = new System.Xml.XmlDocument();
+                doc.LoadXml(xml);
+                System.Xml.XmlNamespaceManager ns = new System.Xml.XmlNamespaceManager(doc.NameTable);
+                ns.AddNamespace("t", TaskXml.Namespace);
+                System.Xml.XmlNodeList triggers = doc.SelectNodes("//t:Triggers/t:CalendarTrigger", ns);
+                Eq("PT4H", triggers[1].SelectSingleNode("t:Repetition/t:Duration", ns).InnerText);
+                Eq("PT30M", triggers[1].SelectSingleNode("t:Repetition/t:Interval", ns).InnerText);
+
+                // 10:02 + 4h = 14:02，远早于 23:58
+                True(4 * 60 < TaskXml.WindowMinutes("10:02", "23:58"), "白天重试必须在夜间窗口之前结束");
+            });
+
+            Run("任务 XML：自定义时间与开机/解锁触发器都保留", delegate
+            {
+                ScheduleSettings s = DefaultSchedule();
+                s.NightStart = "22:30";
+                s.DayStart = "12:30";
+                s.ReconcileIntervalMinutes = 15;
+                string xml = TaskXml.Build(s, "x.exe", "a", "", "", "", new DateTime(2026, 11, 12));
+                System.Xml.XmlDocument doc = new System.Xml.XmlDocument();
+                doc.LoadXml(xml);
+                System.Xml.XmlNamespaceManager ns = new System.Xml.XmlNamespaceManager(doc.NameTable);
+                ns.AddNamespace("t", TaskXml.Namespace);
+                System.Xml.XmlNodeList triggers = doc.SelectNodes("//t:Triggers/t:CalendarTrigger", ns);
+                Eq("2026-11-12T22:30:00", triggers[0].SelectSingleNode("t:StartBoundary", ns).InnerText);
+                Eq("PT15M", triggers[0].SelectSingleNode("t:Repetition/t:Interval", ns).InnerText);
+                Eq("PT14H", triggers[0].SelectSingleNode("t:Repetition/t:Duration", ns).InnerText);
+                Eq(1, doc.SelectNodes("//t:Triggers/t:BootTrigger", ns).Count);
+                Eq(1, doc.SelectNodes("//t:Triggers/t:LogonTrigger", ns).Count);
+                Eq(2, doc.SelectNodes("//t:Triggers/t:EventTrigger", ns).Count);
+                Eq("PT2M", doc.SelectSingleNode("//t:Triggers/t:BootTrigger/t:Delay", ns).InnerText);
+            });
+
+            Run("漂移分类：只有可修复偏差才允许自动重跑", delegate
+            {
+                // Degraded 也可能是可修复偏差（例如维护任务仍在运行），必须重试
+                Eq("night", ReconcileVerifier.RepairTarget(true, "none", true, ReconcileVerdict.Degraded));
+                Eq("night", ReconcileVerifier.RepairTarget(true, "none", true, DriftClass.ActionableDrift));
+                // 读不到：不许盲写
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, DriftClass.ObservationUnknown));
+                // 安全阻塞：不许动设备
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, DriftClass.SafetyBlocked));
+                // 重跑也修不好：交给状态机重试与人工，不做「立即强制重跑」
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, DriftClass.UnfixableDrift));
+                // 完全符合：一个字节都不写
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, DriftClass.Compliant));
+                Eq("day", ReconcileVerifier.RepairTarget(true, "none", false, DriftClass.ActionableDrift));
+            });
+
+            Run("漂移分类：安全 &gt; 可修复 &gt; 需人工 &gt; 未知 &gt; 符合", delegate
+            {
+                Eq(DriftClass.Compliant, DriftClassifier.Classify(new List<DriftItem>()));
+                Eq(DriftClass.ObservationUnknown, DriftClassifier.Classify(new List<DriftItem>
+                    { new DriftItem("disk", DriftKind.Unknown, false, "", "读不到") }));
+                Eq(DriftClass.UnfixableDrift, DriftClassifier.Classify(new List<DriftItem>
+                    { new DriftItem("maintenance", DriftKind.Mismatch, false, "", "权限被拒") }));
+                Eq(DriftClass.ActionableDrift, DriftClassifier.Classify(new List<DriftItem>
+                    { new DriftItem("disk", DriftKind.Unknown, false, "", "读不到"),
+                      new DriftItem("spindown", DriftKind.Mismatch, true, "", "不符") }));
+                Eq(DriftClass.SafetyBlocked, DriftClassifier.Classify(new List<DriftItem>
+                    { new DriftItem("spindown", DriftKind.Mismatch, true, "", "不符"),
+                      new DriftItem("disk", DriftKind.Safety, false, "", "身份不明") }));
+            });
+
+            Run("漂移分类：维护任务被重新启用是可修复偏差而不是模糊的失败", delegate
+            {
+                QuietModeConfig cfg = FullConfig();
+                SystemObservation obs = new SystemObservation();
+                ObservedTask t = new ObservedTask();
+                t.Path = @"\Microsoft\Windows\Defrag\";
+                t.Name = "ScheduledDefrag";
+                t.Presence = TaskPresence.Present;
+                t.Enabled = true;                       // 夜里又被人打开了
+                obs.Tasks.Add(t);
+
+                ReconcileVerification v = ReconcileVerifier.Verify("night", cfg, new BaselineSnapshot(), obs, null, null, null);
+                Eq(ReconcileVerdict.Failed, v.Verdict);
+                Eq(DriftClass.ActionableDrift, v.Classification);
+                True(v.Problems.Exists(p => p.Contains("仍然处于启用状态")), "应指出任务被重新启用");
+                Eq("night", ReconcileVerifier.RepairTarget(true, "none", true, v));
+            });
+
+            Run("漂移分类：身份不明的磁盘走安全阻塞，绝不自动脱机", delegate
+            {
+                QuietModeConfig cfg = FullConfig();
+                cfg.Maintenance.Enabled = false;
+                cfg.Fan.Enabled = false;
+                cfg.SpinDown.Enabled = false;
+
+                List<DiskStateObservation> disks = new List<DiskStateObservation>();
+                DiskStateObservation d = new DiskStateObservation();
+                d.UniqueId = "SAMPLE-UNIQUE-9999";
+                d.Matched = false;                      // 认不出是哪块盘
+                d.Error = "序列号不匹配";
+                disks.Add(d);
+
+                ReconcileVerification v = ReconcileVerifier.Verify("night", cfg, new BaselineSnapshot(), new SystemObservation(), disks, null, null);
+                Eq(DriftClass.SafetyBlocked, v.Classification);
+                Eq(ReconcileVerdict.Failed, v.Verdict);
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, v));
+            });
+
+            Run("漂移分类：全员读不到只算状态未知，不许当成功也不许盲写", delegate
+            {
+                QuietModeConfig cfg = FullConfig();
+                cfg.Maintenance.Enabled = false;
+                cfg.Disks.Enabled = false;
+                cfg.Fan.Enabled = true;
+                cfg.SpinDown.Enabled = true;
+
+                FanObservation fan = new FanObservation();
+                fan.Available = false;
+                fan.Error = "IPC 不可用";
+
+                SpinDownObservation spin = new SpinDownObservation();
+                spin.Enabled = true;
+                spin.ExpectedSeconds = cfg.SpinDown.Seconds;
+                spin.Captured = false;
+                spin.Error = "powercfg 被拒绝";
+
+                ReconcileVerification v = ReconcileVerifier.Verify("night", cfg, new BaselineSnapshot(),
+                    new SystemObservation(), null, fan, spin);
+                Eq(ReconcileVerdict.Degraded, v.Verdict);
+                Eq(DriftClass.ObservationUnknown, v.Classification);
+                Eq<string>(null, ReconcileVerifier.RepairTarget(true, "none", true, v));
             });
 
             Run("计划：停转开启时带上目标秒数，关闭时不下发", delegate
@@ -366,7 +639,24 @@ namespace QuietMode.Core.Tests
             i.State = new QuietModeState();
             i.Window = ScheduleWindow.Evaluate(s, now, TimeSpan.FromHours(3));
             i.Trigger = "timer";
+            i.Now = now;
             return i;
+        }
+
+        /// <summary>在指定时刻做一次决策（窗口与「现在」必须同一个时刻）。</summary>
+        private static Decision DecideAt(QuietModeState st, ScheduleSettings s, DateTime now)
+        {
+            DecisionInput i = NightInput(now);
+            i.Schedule = s;
+            i.State = st;
+            i.Window = ScheduleWindow.Evaluate(s, now, TimeSpan.FromHours(3));
+            i.LastRunFailed = StateMachine.IsLastRunFailed(st);
+            return StateMachine.Decide(i);
+        }
+
+        private static ScheduleSettings DefaultSchedule()
+        {
+            return NightInput(new DateTime(2026, 11, 12, 1, 0, 0)).Schedule;
         }
 
         private static QuietModeConfig FullConfig()

@@ -10,15 +10,29 @@ namespace QuietMode.Core.Models
     /// </summary>
     public sealed class QuietModeState
     {
-        public const int CurrentSchemaVersion = 3;
+        public const int CurrentSchemaVersion = 4;
 
         public int SchemaVersion = CurrentSchemaVersion;
         public bool ModeOn;
         public bool SchedulePaused;
         public bool AutoSilentActive;
         public bool AutoSilentSuppressed;
+        /// <summary>
+        /// 「今晚不再自动开启」这个抑制标记归属于哪一个夜间窗口，取值是窗口开始那一天的
+        /// 本地日期（yyyy-MM-dd）。空串表示旧版本写下的状态、尚未绑定窗口。
+        ///
+        /// 为什么需要它：抑制标记只对「按下按钮的那一夜」有效。早先它是个裸布尔，
+        /// 白天恢复成功后被顺手清掉，于是同一夜的下一次 reconcile 又进了夜间；
+        /// 反过来如果永远不清，第二天夜里就再也不自动静音。两种都是错的。
+        /// 把窗口标识持久化下来，才能做到「本夜不再进入、下一夜照常」。
+        /// </summary>
+        public string AutoSilentSuppressedWindow = "";
         /// <summary>最近一次 reconcile 的结论：Ok | Degraded | Failed | NotRun。</summary>
         public string LastVerdict = "";
+        /// <summary>最近一次验证的偏差分类：Compliant | ActionableDrift | UnfixableDrift | ObservationUnknown | SafetyBlocked。</summary>
+        public string LastDrift = "";
+        /// <summary>最近一次验证的失败项原文（最多保留 20 条）。state.json 必须能自己解释失败原因。</summary>
+        public List<string> LastProblems = new List<string>();
         public string LastErrorCode = "";
         /// <summary>最近一次 reconcile 执行的动作：night | day | restore | none。</summary>
         public string LastReconcileAction = "";
@@ -42,7 +56,13 @@ namespace QuietMode.Core.Models
             o.Set("schedulePaused", SchedulePaused);
             o.Set("autoSilentActive", AutoSilentActive);
             o.Set("autoSilentSuppressed", AutoSilentSuppressed);
+            o.Set("autoSilentSuppressedWindow", AutoSilentSuppressedWindow ?? "");
             o.Set("lastVerdict", LastVerdict ?? "");
+            o.Set("lastDrift", LastDrift ?? "");
+            JsonArray problems;
+            o.SetArray("lastProblems", out problems);
+            if (LastProblems != null)
+                foreach (string p in LastProblems) problems.Add(p ?? "");
             o.Set("lastErrorCode", LastErrorCode ?? "");
             o.Set("lastReconcileAction", LastReconcileAction ?? "");
             o.Set("consecutiveFailures", ConsecutiveFailures);
@@ -65,7 +85,19 @@ namespace QuietMode.Core.Models
             s.SchedulePaused = o.GetBool("schedulePaused", false);
             s.AutoSilentActive = o.GetBool("autoSilentActive", false);
             s.AutoSilentSuppressed = o.GetBool("autoSilentSuppressed", false);
+            s.AutoSilentSuppressedWindow = o.GetString("autoSilentSuppressedWindow", "");
             s.LastVerdict = o.GetString("lastVerdict", "");
+            s.LastDrift = o.GetString("lastDrift", "");
+            s.LastProblems.Clear();
+            JsonArray probs = o.GetArray("lastProblems");
+            if (probs != null)
+            {
+                for (int i = 0; i < probs.Count; i++)
+                {
+                    JsonNode item = probs[i];
+                    s.LastProblems.Add(item == null ? "" : item.AsString());
+                }
+            }
             s.LastErrorCode = o.GetString("lastErrorCode", "");
             s.LastReconcileAction = o.GetString("lastReconcileAction", "");
             s.ConsecutiveFailures = o.GetInt("consecutiveFailures", 0);
