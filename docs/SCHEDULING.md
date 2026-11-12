@@ -181,3 +181,50 @@ qmctl reconcile --apply       # 真的执行
 - **风扇验证依赖 `IpcCtl.exe`**。FanControl 没运行、IPC 无响应时风扇状态记为「未知」，结论降到 `Degraded`，不会假装切成功了。
 - **夜间重复校验只在机器醒着时跑**。`WakeToRun=false` 是硬要求，机器睡着就等它醒 —— 醒来时 `Power-Troubleshooter` 事件会补一次。
 - **首次安装尚未自动化**。`task install` 只注册任务，旧闸门停用、磁盘身份迁移仍由 Phase 6 的迁移流程负责。
+
+## 10. RC1 变更（2026-11-12）
+
+### 10.1 「今晚不再自动开」绑定窗口身份
+
+抑制标记原来是一个布尔值，白天恢复成功后就被清掉 —— 于是 00:5x 之后本夜又自动重开。
+现在抑制绑定到**夜间窗口身份**：
+
+- 身份 = 窗口开始那天的本地日期（`NightWindow.Key`，例如 `2026-11-11`）；
+- 跨午夜窗口在 00:00 之后仍属于前一天开始的那个窗口；
+- 存进 `state.autoSilentSuppressedWindow`（schema 3→4）；
+- 决策前 `StateMachine.NormalizeSuppression` 负责：旧标记按当前窗口认领、
+  过期标记释放、进下一个窗口自动失效。
+
+`ApplyRun` 的 day 分支**刻意不清抑制**。只有 `rearm` / `manual-quiet` / `auto`
+或窗口自然翻页才会清。
+
+### 10.2 漂移四分类
+
+`ReconcileVerification.Classification` 现在是判定的一部分：
+
+| 分类 | 含义 | 允许自动重跑 |
+|---|---|---|
+| `Compliant` | 全部达标 | 否 |
+| `ActionableDrift` | 可定点修复（维护任务被重新启用、DISKIDLE 偏离且 `enabled=true`、风扇档位被改） | 是 |
+| `UnfixableDrift` | 需要人处理（配置与系统能力冲突等） | 否 |
+| `ObservationUnknown` | 读不到，不能判成功也不能判失败 | 否 |
+| `SafetyBlocked` | 有安全风险（磁盘身份不明） | 否，且绝不自动脱机 |
+
+`IsLastRunFailed` 改按分类判定：`ObservationUnknown` 不再触发无限重试。
+
+### 10.3 任务 XML 的重复时长按窗口算
+
+夜间 `Repetition/Duration` 不再写死 `PT10H`，改由 `TaskXml.WindowMinutes` 按
+`nightStart → dayStart` 算（默认 23:58→10:02 = `PT10H4M`）。白天触发器另加
+**有界**重试（最多 4 小时、每 30 分钟），保证白天恢复失败能再试，但不会撞进下一个夜间窗口。
+
+### 10.4 心跳
+
+每次 reconcile 都往 `logs/reconcile.log` 写一行，**包括决策为 `none` 的那些**：
+
+```
+2026-11-12T01:18:01Z trigger=schedule action=none apply=1 verdict=Ok state=NightActive drift=Compliant why=-
+```
+
+`qmctl task status` 直接显示最后一条与距今分钟数。「任务没触发」和「触发了但没事干」
+终于是两件事。

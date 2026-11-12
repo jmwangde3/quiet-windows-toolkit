@@ -168,12 +168,17 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - 界面只显示观测值：`offline`/`exists` 读不到时序列化为 `null`，显示“状态未知”而不是“正常”；计划任务未注册、v1 闸门仍启用都会常驻警告。
   - 单测 81 项（新增 5 项托盘契约）+ `Test-QuietMode.ps1` 新增“托盘契约：status 字段齐全（只读）”，全部通过。
   - 详见 [`docs/TRAY.md`](docs/TRAY.md)。
-- **Phase 6 安装 / 迁移 / 回滚 — 脚本已就绪**
-  - `Install-QuietMode.ps1 -Mode DryRun|Apply|Rollback`（在 `powershell/` 下）：预检 → 部署二进制 → 迁移配置 → 校验 → 抓 baseline → 注册 `\QuietMode\QuietMode-Reconcile` → 停用 v1 闸门 → 交回自动调度 → 立即对齐一次 → 重启托盘。
+- **Phase 6 安装 / 迁移 / 回滚 — 已完成（RC2-01/02）**
+  - `Install-QuietMode.ps1 -Mode DryRun|Apply|Rollback`（在 `powershell/` 下）默认 DryRun，预检分七段，任一 FAIL 都不动系统：环境（PS 5.1 / .NET 4.8 / 管理员）→ 载体完整性（二进制 + 7 个模块 + Worker，逐个大小/版本/sha256）→ 现有安装（config / baseline / v1 三份配置 / v1 四条历史任务 / v2 任务）→ 磁盘稳定身份（必须 `matched` 且有 `uniqueId`）→ 静音窗口与 FanControl 依赖 → baseline 四态可信度 → 完整安装计划。之后：备份 → 部署 → 迁移 → 校验 → 抓 baseline → 权限加固 → 注册任务 → 停用 v1 → 交回自动 → 对齐一次 → 起托盘 → 收尾复核。
+  - **单调度不变量**：v2 注册后回读不到就退出（不动 v1）；v1 停不掉就回滚 v2（回到「只有 v1」）；收尾再复核一次没有并行调度。
+  - 改动前备份 `config.json` / `state.json` / `baseline.json` / v1 三份配置 / 旧任务 XML，并写 `migration-before.txt` 记录迁移前的观测值（明确标注「观测值 ≠ 原始值」）。
   - 默认 DryRun 只读；Apply 需管理员；Rollback 删 v2 任务、恢复 v1 闸门与安装前的二进制，配置与 baseline 保留便于复诊。
-  - 二进制从编译输出复制到部署目录，逐文件 SHA256 比对，覆盖前备份到 `recovery\install-<时间戳>\`。
-  - `\QuietHDD\` 下的 v1 任务对普通用户不可见，脚本未提权时输出「无法确认」而不是「不存在」。
-- **Phase 7**：测试与 CI 收尾，见规格 §11。
+- **Phase 6 恢复 / 卸载 / 体检 — 已完成（RC2-03/04）**
+  - `Uninstall-QuietMode.ps1`：停调度 → 确认已停 → 磁盘联机 → 维护任务 → SysMain/注册表 → 电源 → 风扇 → 托盘，顺序按「数据可访问性优先」，每步回读；不删 baseline/recovery/logs（那是失败时唯一的退路）；幂等，可重跑续做。
+  - `Repair-QuietMode.ps1`：只诊断，`-Apply` 才做三件低风险修复（重注册任务 / 对齐一次 / 加固权限）；不动磁盘、不动维护任务、不重建 baseline。
+  - `Test-Privilege.ps1`：配置根 ACL 只读体检 + 临时目录里的攻击自测（junction 识别、`..\` 逃逸、绝对路径、盘符、演练模式不改权限）。
+  - 特权路径纪律（`PrivilegedIo`）：请求/结果文件名带随机 nonce、写请求 `FileMode.CreateNew` 绝不跟随预置文件、目录或结果文件是重解析点直接拒绝。
+- **Phase 7** 测试与 CI 收尾：基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)；CI 尚未接入。
 
 ```powershell
 # 编译 + 自检（不改系统状态）

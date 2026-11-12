@@ -1,5 +1,109 @@
 # 变更记录
 
+## 2.0.0-rc.1 — 2026-11-12
+
+这一版只做可靠性、安装迁移与恢复，不加新功能。**基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)**：
+里面逐条写了验证了什么、没验证什么，未验证项不得当成已通过。
+
+### 修复：手动关闭静音只覆盖本夜
+
+- 抑制标记原来是个布尔值，白天恢复成功时被清掉，于是「今晚不再自动开」在
+  00:5x 之后失效、本夜又自动重开。现在抑制绑定到**夜间窗口身份**
+  （窗口开始日期，`NightWindow.Key`），存进 `state.autoSilentSuppressedWindow`；
+  跨午夜、重启、改时间之后都按同一个窗口判定。
+- `StateMachine.ApplyRun` 的 day 分支不再清抑制；只有 `rearm` / `manual-quiet` /
+  `auto` 或进入下一个窗口才清。schema 3→4 自动迁移，旧标记按当前窗口认领，
+  不会永久粘住。
+
+### 修复：漂移四分类，读不到不再当失败
+
+- 新增 `DriftClassifier`：`Compliant` / `ActionableDrift` / `UnfixableDrift` /
+  `ObservationUnknown` / `SafetyBlocked`。
+- 只有 `ActionableDrift` 允许自动重跑；未知与安全阻塞既不判成功、也不盲写。
+- 维护任务被外部重新启用、DISKIDLE 偏离且 `enabled=true`、风扇档位被切回 —— 算可修复；
+  磁盘身份不明 —— 算安全阻塞（绝不自动脱机）。
+- `state.json` 持久化 `lastDrift` / `lastProblems`；心跳行追加 `drift=` 与 `why=`，
+  `qmctl status` 能直接看到「为什么这一轮没通过」。
+
+### 修复：PowerShell 任务三态
+
+- `Get-QmTaskState` / `Invoke-QmStopTask` / `Invoke-QmSetTaskEnabled` 现在严格区分
+  `true` / `false` / `null`：按 COM `HRESULT` 低位码定性（2/3 = 任务不存在，
+  5 = 拒绝访问 = 未知），不靠中英文错误文本猜。
+- 权限不足不再当成「任务不存在」；写入后回读仍为 `null` 判验证失败。
+- 新增 `powershell/Test-TaskState.ps1`（13 项只读断言，PS 5.1 与 7.x 均通过）。
+
+### 修复：维护恢复的 Critical 语义
+
+- `s.Critical = desired` —— 原本启用的任务白天恢复不回来才是关键失败；
+  原本禁用的任务「收回禁用」失败也照样报告，但不升级成灾难。
+
+### 修复：唯一调度器
+
+- v1 遗留任务路径补齐为 4 条（含/不含 `\QuietHDD\` 文件夹的两种历史写法）。
+- 任务 XML 生成迁入 `QuietMode.Core.Scheduling.TaskXml`（可离线单测）：夜间
+  Repetition Duration 按窗口计算（23:58→10:02 = `PT10H4M`，原来写死 10 小时，
+  窗口一改就漏），白天触发器加有界重试（`PT4H` / 每 `PT30M`）。
+- 已确认 `WakeToRun=false`、忽略并发、10 分钟执行上限。
+
+### 修复：baseline 完整性与旧版本兼容
+
+- 新增 `BaselineHealth` 四态：`Missing` / `Corrupt` / `Partial` / `Complete`。
+  危险写操作只允许 `Complete` 或 `Partial`；`Corrupt` 一个字节都不用。
+- `snapshot verify` 输出 `state`，CLI 把损坏基线当「没有基线」处理。
+- 旧 schema 必须能读：只拒绝**比本版本更新**的 schema；升级不会把用户已有基线
+  判成损坏。
+- `baseline.previous.json` 只在现基线可信时轮换，不再无条件覆盖。
+- 白天没有可用基线时判 `Unknown`，不宣称「已完整恢复」。
+
+### 新增：baseline 记录「原始启用状态未知」
+
+- 夜间装机会在维护任务被闸门禁用的时候拍快照，此时观测到的 `enabled=false`
+  并不是原始状态。现在这种条目打 `originalUnknown=true` 并写明原因
+  （baseline schema 2→3）。
+- 白天计划遇到未知项保留 Pending 并说明，不启用也不禁用；白天验证判「无法确认」，
+  不判通过。`qmctl maint baseline-enable/disable` 视为用户确认，清除未知标记。
+- 新增字段默认值不落盘，所以升级不会让已有基线的完整性校验值失配。
+
+### 新增：安装器七段预检与单调度不变量
+
+`Install-QuietMode.ps1` 默认 DryRun，预检分七段，任一 FAIL 都不动系统：
+
+1. 环境：PowerShell ≥ 5.1、.NET 4.8、Windows 版本、管理员
+2. 载体：qmctl / Core / Windows / 托盘 + 7 个模块 + Worker + 操作脚本（大小、版本、sha256）
+3. 现有安装：config / baseline、v1 三份配置、v1 四条历史任务、v2 任务
+4. 磁盘稳定身份：每个目标盘必须 `matched` 且有 `uniqueId`，禁止按编号猜测
+5. 静音窗口：`HH:mm` 合法性、窗口长度、当前判定；FanControl 依赖与档位
+6. baseline 可信度：四态判定，`Corrupt` 直接拒绝
+7. 安装计划：把要做的 8 步和不变量先打印出来
+
+配套：改动前备份配置/任务 XML 并写 `migration-before.txt`；v2 注册后回读不到就退出、
+不动 v1；v1 停不掉就回滚 v2；收尾再复核一次没有并行调度。
+
+### 新增：卸载 / 恢复与体检脚本
+
+- `Uninstall-QuietMode.ps1`：停调度 → 确认已停 → 磁盘联机 → 维护任务 → SysMain/注册表
+  → 电源 → 风扇 → 托盘。顺序按「数据可访问性优先」，每步回读，失败保留
+  baseline / recovery / logs，可重复执行。
+- `Repair-QuietMode.ps1`：只诊断（文件 / 配置 / baseline / 调度与心跳 / 决策 / 组件 /
+  权限），`-Apply` 才做三件低风险修复。
+- 两者默认都不改系统；DryRun 均实跑通过。
+
+### 安全：特权目录不再跟随预置路径
+
+- 新增 `PrivilegedIo`：请求/结果文件名带随机 nonce；写请求用 `FileMode.CreateNew`
+  （目标已存在即失败，绝不覆盖、绝不跟随链接）；目录或结果文件是重解析点直接拒绝。
+- 新增 `powershell/Modules/QuietMode.Security.psm1`：ACL 体检与加固（只加 Deny ACE，
+  不改其它系统策略；`logs` 单独放行追加）。
+- 新增 `powershell/Test-Privilege.ps1`：实机 ACL 只读体检 + 临时目录里的攻击自测
+  （junction、`..\` 逃逸、绝对路径、盘符、演练模式不改权限），10 项全通过，已并入
+  `Test-QuietMode.ps1`。
+
+### 其它
+
+- `ProductInfo.Version` 从 `2.0.0-phase5` 更新为 `2.0.0-rc.1`。
+- 单元测试 89 → 106 项。
+
 ## 2.0.0-phase6.2 — 2026-11-12
 
 ### 新增：reconcile 心跳（`logs/reconcile.log`）

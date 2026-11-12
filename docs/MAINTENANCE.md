@@ -178,3 +178,37 @@ qmctl maint baseline-disable all --apply
   一旦系统版本里有它就会自动纳入管理。
 - **本阶段不动磁盘、不动风扇**。Phase 3 只做维护任务 / 服务 / 注册表三块；
   磁盘脱机在 Phase 2 的 `qmctl disks`，二者在 Phase 4 的 Worker 里串起来。
+
+## 11. RC1 / RC2 变更（2026-11-12）
+
+### 11.1 Critical 的语义修正
+
+`s.Critical = desired`：**原本启用**的任务白天恢复不回来才是关键失败 ——
+那是「用户的维护任务被我们关死了」。原本禁用的任务「收回禁用」失败也照样报告，
+但不该把整轮判成灾难。
+
+### 11.2 原始启用状态未知（baseline schema 2→3）
+
+夜间装机会在维护任务被夜间闸门禁用的时候拍快照。那一刻观测到的
+`enabled=false` 有两种可能：用户本来就没开，或者是我们刚刚关掉的。两者无法区分。
+
+现在这种条目在 baseline 里打 `originalUnknown=true` 并写明原因：
+
+- 白天计划遇到未知项 → **保留 Pending 并说明**，不启用也不禁用；
+- 白天验证遇到未知项 → 判「无法确认」，不判通过；
+- `qmctl maint baseline-enable/disable <序号> --apply` 视为用户确认，清除未知标记。
+
+新增字段的默认值**不落盘**，所以升级不会让已有基线的完整性校验值失配；
+旧 schema（2）按兼容模式读取并告警，只拒绝「比本版本更新」的 schema。
+
+### 11.3 白天恢复失败的重试边界
+
+任务 XML 的白天触发器带**有界**重试（最多 4 小时、每 30 分钟一次）。
+白天恢复失败还能再试，但不会一路重试撞进 23:58 的下一个夜间窗口。
+
+### 11.4 权限
+
+`C:/ProgramData/QuietMode` 下的 `config.json` / `state.json` / `baseline.json` /
+`run` / `recovery` 由 SYSTEM 读取并据此操作系统对象，普通用户**不应可写**。
+`QuietMode.Security.psm1` 负责体检与加固（只加 Deny ACE，`logs` 单独放行追加）。
+本机在 rc.1 时尚未加固，`Test-Privilege.ps1` 会如实报告。
