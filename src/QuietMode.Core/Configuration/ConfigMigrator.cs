@@ -190,6 +190,12 @@ namespace QuietMode.Core.Configuration
             // ---- 启动 ----
             c.Startup.AutoStart = GB(ini, "AutoStart", false);
             c.Startup.RestoreOnBoot = GB(ini, "RestoreOnBoot", false);
+            // v1 没有「开机补偿」这个概念（只有磁盘闸门里有 06:00 的近似处理）。
+            // 这里不改窗口含义，只把 v2 的新行为明确说出来，避免「升级后行为悄悄变了」。
+            r.Notes.Add("v2 新增开机补偿（schedule.startupOverrideEnabled=true：开机 "
+                        + c.Schedule.StartupGraceMinutes + " 分钟内且已过 "
+                        + c.Schedule.StartupDayStart + " 时按白天处理）；v1 无此逻辑，"
+                        + "如需完全保持原义请手动置为 false");
 
             r.Notes.Add("settings.ini 共 " + ini.Count + " 个键，已映射到 v2 结构");
             r.Config = c;

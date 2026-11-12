@@ -5,6 +5,7 @@ using System.Text;
 using QuietMode.Core.Configuration;
 using QuietMode.Core.Json;
 using QuietMode.Core.Models;
+using QuietMode.Core.Scheduling;
 using QuietMode.Windows.Native;
 
 namespace QuietMode.Windows
@@ -64,6 +65,21 @@ namespace QuietMode.Windows
             Paths.EnsureLayout();
             Directory.CreateDirectory(Paths.TaskBackupDir);
 
+            // 拍快照的时机本身会影响可信度：夜间窗口内维护任务是被本工具/旧闸门禁用的，
+            // 这时观测到的 Enabled=false 不能当成「原始状态」写进 baseline。
+            bool nightContext = false;
+            string nightReason = "";
+            try
+            {
+                WindowEvaluation w = ScheduleWindow.Evaluate(_config.Schedule, DateTime.Now, null);
+                if (w.IsNight)
+                {
+                    nightContext = true;
+                    nightReason = "快照拍摄于夜间窗口内（" + w.ToLine() + "），该任务此刻的禁用状态可能来自夜间闸门";
+                }
+            }
+            catch { }
+
             foreach (MaintenanceTaskDefinition def in MaintenanceCatalog.All)
             {
                 TaskSnapshot t = new TaskSnapshot();
@@ -75,6 +91,13 @@ namespace QuietMode.Windows
                 t.Exists = q.Exists;
                 t.Enabled = q.Enabled;
                 t.Error = q.Error ?? "";
+
+                if (nightContext && q.Enabled == false && def.NightDisableDefault)
+                {
+                    // 无法区分「本来就没开」与「今晚被关掉了」—— 明确记成未知，白天不据此做决定。
+                    t.OriginalUnknown = true;
+                    t.OriginalReason = nightReason;
+                }
 
                 if (q.Exists == true && !string.IsNullOrEmpty(q.Xml))
                 {
@@ -109,9 +132,18 @@ namespace QuietMode.Windows
                 {
                     // 拍快照时就是禁用：白天只会「恢复到禁用」，等于永远不开。
                     // 这多半是旧版本禁用后没恢复留下的，必须让人知道而不是悄悄接受。
-                    s.CaptureNotes.Add(def.FullName + "：快照记录为「禁用」，白天不会恢复启用。"
-                                       + "若这不是你的本意，说明快照拍在旧版本已禁用之后；"
-                                       + "确认后可用 qmctl maint baseline-enable 修正");
+                    if (t.OriginalUnknown)
+                    {
+                        s.CaptureNotes.Add(def.FullName + "：原始启用状态未知（" + t.OriginalReason
+                                           + "）。白天不会擅自启用或禁用；确认它应当保持启用后，"
+                                           + "执行 qmctl maint baseline-enable 再重建快照");
+                    }
+                    else
+                    {
+                        s.CaptureNotes.Add(def.FullName + "：快照记录为「禁用」，白天不会恢复启用。"
+                                           + "若这不是你的本意，说明快照拍在旧版本已禁用之后；"
+                                           + "确认后可用 qmctl maint baseline-enable 修正");
+                    }
                 }
 
                 s.ScheduledTasks.Add(t);

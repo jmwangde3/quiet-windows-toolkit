@@ -377,6 +377,8 @@ namespace QuietMode.Core.Tests
             t.Exists = true;
             t.Enabled = false;
             t.XmlSha256 = "samplehash";
+            t.OriginalUnknown = true;
+            t.OriginalReason = "快照拍摄于夜间窗口内";
             s.ScheduledTasks.Add(t);
 
             DiskSnapshot d = new DiskSnapshot();
@@ -398,6 +400,14 @@ namespace QuietMode.Core.Tests
 
             back.Disks[0].IsOffline = false;
             True(!SnapshotIntegrity.Matches(back), "篡改后应检出");
+
+            // 默认值不落盘：否则一次字段扩展就会让所有历史基线的校验值全部失配
+            TaskSnapshot plain = new TaskSnapshot();
+            plain.Path = @"\X\";
+            plain.Name = "Y";
+            True(plain.ToJson().ToJson(false).IndexOf("originalUnknown") < 0, "OriginalUnknown=false 不应写入 JSON");
+            plain.OriginalUnknown = true;
+            True(plain.ToJson().ToJson(false).IndexOf("originalUnknown") >= 0, "OriginalUnknown=true 必须写入 JSON");
         }
 
         /// <summary>
@@ -459,9 +469,19 @@ namespace QuietMode.Core.Tests
             incomplete.Metadata.IntegritySha256 = SnapshotIntegrity.Compute(incomplete);
             Eq(BaselineState.Partial, BaselineHealth.Evaluate(incomplete, delegate { return true; }, delegate { return "samplehash"; }).State);
 
-            BaselineSnapshot wrongSchema = BaselineSnapshot.FromJson(JsonNode.Parse(s.ToJson().ToJson(true)).AsObject());
-            wrongSchema.SchemaVersion = 1;
-            Eq(BaselineState.Corrupt, BaselineHealth.Evaluate(wrongSchema, delegate { return true; }, delegate { return "samplehash"; }).State);
+            // 比本版本更新的 schema 读不懂 → 一个字节都不能用
+            BaselineSnapshot futureSchema = BaselineSnapshot.FromJson(JsonNode.Parse(s.ToJson().ToJson(true)).AsObject());
+            futureSchema.SchemaVersion = BaselineSnapshot.CurrentSchemaVersion + 1;
+            Eq(BaselineState.Corrupt, BaselineHealth.Evaluate(futureSchema, delegate { return true; }, delegate { return "samplehash"; }).State);
+
+            // 旧 schema 必须能读：升级不能把用户已有的基线判成损坏
+            BaselineSnapshot oldSchema = BaselineSnapshot.FromJson(JsonNode.Parse(s.ToJson().ToJson(true)).AsObject());
+            oldSchema.SchemaVersion = 2;
+            oldSchema.Metadata.IntegritySha256 = SnapshotIntegrity.Compute(oldSchema);
+            BaselineHealth oldHealth = BaselineHealth.Evaluate(oldSchema, delegate { return true; }, delegate { return "samplehash"; });
+            Eq(BaselineState.Partial, oldHealth.State);
+            Eq(true, oldHealth.Usable);
+            Eq(false, oldHealth.Authoritative);
         }
 
         private static void TestMaintenanceCatalog()

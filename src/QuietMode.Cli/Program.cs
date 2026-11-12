@@ -898,6 +898,12 @@ namespace QuietMode.Cli
             {
                 TaskSnapshot b = MaintenancePlanner.FindTask(baseline, def.Path, def.Name);
                 if (b == null || b.Exists != true || !b.Enabled.HasValue || b.Enabled.Value) continue;
+                if (b.OriginalUnknown)
+                {
+                    list.Add(def.FullName + " 的原始启用状态未知（" + (b.OriginalReason ?? "").Trim() + "），"
+                             + "白天保留 Pending；确认应当启用则执行 qmctl maint baseline-enable");
+                    continue;
+                }
                 list.Add(def.FullName + " 在 baseline 里就是「禁用」，白天不会恢复启用"
                          + "（若这不是你的本意，说明快照拍在旧版本已禁用之后）");
             }
@@ -1038,6 +1044,13 @@ namespace QuietMode.Cli
             }
 
             if (changed.Count == 0) return Fail("没有可修改的条目");
+
+            // 用户显式指定 = 用户确认了原始状态，未知标记随之失效。
+            foreach (TaskSnapshot b in changed)
+            {
+                b.OriginalUnknown = false;
+                b.OriginalReason = "";
+            }
 
             if (!_json) foreach (TaskSnapshot b in changed)
                 Console.WriteLine("baseline " + b.FullName + " -> enabled=" + (enable ? "true" : "false"));

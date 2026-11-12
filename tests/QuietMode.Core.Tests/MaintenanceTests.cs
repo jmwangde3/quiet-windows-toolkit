@@ -26,6 +26,7 @@ namespace QuietMode.Core.Tests
             Run("白天计划：原本禁用的任务不擅自启用", TestDayPlanKeepsDisabled);
             Run("白天计划：被外部启用时按 baseline 收回禁用", TestDayPlanRestoresDisabled);
             Run("白天计划：恢复原本启用的任务是关键步骤，收回禁用不是", TestDayPlanCriticalGrading);
+            Run("白天计划：原始启用状态未知 → 留 Pending 不猜", TestDayPlanSkipsUnknownOriginal);
             Run("白天计划：baseline 没有的值 → 删除而不是写默认值", TestDayPlanDeletesAbsentValue);
             Run("白天计划：SysMain 按 baseline 的 Start 值恢复", TestDayPlanRestoresSysMain);
             Run("白天验证：注册表被改动 → Failed", TestDayVerifyRegistryDrift);
@@ -324,6 +325,41 @@ namespace QuietMode.Core.Tests
                 if (s.Action != MaintenanceAction.DisableTask) continue;
                 Eq(false, s.Critical);
             }
+        }
+
+        /// <summary>
+        /// baseline 自己说「原始启用状态未知」时，白天既不能启用也不能禁用。
+        /// 这是夜间拍快照、任务恰好被夜间闸门禁用时的唯一诚实做法：留 Pending 并说明，
+        /// 而不是把「拍摄那一刻的禁用」当成原始状态，也不是猜成启用。
+        /// </summary>
+        private static void TestDayPlanSkipsUnknownOriginal()
+        {
+            BaselineSnapshot baseline = BaselineAllEnabled();
+            foreach (TaskSnapshot t in baseline.ScheduledTasks)
+            {
+                t.Enabled = false;
+                t.OriginalUnknown = true;
+                t.OriginalReason = "快照拍摄于夜间窗口内";
+            }
+
+            SystemObservation obs = EmptyObservation();
+            SetAllNightTargets(obs, true, "Ready");   // 就算被外部改回启用，也不许凭猜收回
+            SetSysMain(obs, true, 4, "Stopped");
+
+            MaintenancePlan plan = MaintenancePlanner.BuildDay(DefaultConfig(), baseline, obs);
+            Eq(0, CountSteps(plan, MaintenanceAction.EnableTask));
+            Eq(0, CountSteps(plan, MaintenanceAction.DisableTask));
+
+            bool noted = false;
+            foreach (string n in plan.Notes) if (n.IndexOf("原始启用状态未知", StringComparison.Ordinal) >= 0) noted = true;
+            True(noted, "跳过时必须说明原因，不能静默");
+
+            // 验证器同样不能判通过：未知就是未知。
+            MaintenanceVerification v = MaintenanceVerifier.VerifyDay(DefaultConfig(), baseline, obs);
+            Eq(MaintenanceVerdict.Degraded, v.Verdict);
+            bool warned = false;
+            foreach (string w in v.Warnings) if (w.IndexOf("无法确认", StringComparison.Ordinal) >= 0) warned = true;
+            True(warned, "验证器应把未知标成无法确认，而不是当作已恢复");
         }
 
         private static void TestDayPlanDeletesAbsentValue()

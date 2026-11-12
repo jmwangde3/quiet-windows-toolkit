@@ -179,6 +179,13 @@ namespace QuietMode.Core.Maintenance
                     v.Notes.Add(def.FullName + "：baseline 未记录启用状态，不参与验证");
                     continue;
                 }
+                if (b.OriginalUnknown)
+                {
+                    // baseline 明确说「不知道」：不能判通过，也不能判失败 —— 判成无法确认。
+                    v.Warnings.Add(def.FullName + "：原始启用状态无法确认（" + (b.OriginalReason ?? "").Trim()
+                                   + "），未参与恢复验证；确认后执行 qmctl maint baseline-enable");
+                    continue;
+                }
                 if (t == null || t.Presence == TaskPresence.NotPresent)
                 {
                     if (b.Exists == true) v.Warnings.Add(def.FullName + "：baseline 记录存在，但现在找不到");

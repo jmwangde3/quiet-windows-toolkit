@@ -48,11 +48,21 @@ namespace QuietMode.Core.Models
 
             h.TaskCount = s.ScheduledTasks == null ? 0 : s.ScheduledTasks.Count;
 
-            if (s.SchemaVersion != BaselineSnapshot.CurrentSchemaVersion)
+            // 旧 schema 必须能读：升级不能把用户已有的基线判成损坏。
+            // 只有「比本版本还新」才真的读不懂 —— 那才是 Corrupt。
+            if (s.SchemaVersion <= 0 || s.SchemaVersion > BaselineSnapshot.CurrentSchemaVersion)
             {
                 h.State = BaselineState.Corrupt;
-                h.Errors.Add("schemaVersion=" + s.SchemaVersion + "，本版本期望 " + BaselineSnapshot.CurrentSchemaVersion);
+                h.Errors.Add("schemaVersion=" + s.SchemaVersion + "，本版本支持 1-" + BaselineSnapshot.CurrentSchemaVersion
+                             + "：读不懂的基线一个字节都不能用");
                 return h;
+            }
+            if (s.SchemaVersion < BaselineSnapshot.CurrentSchemaVersion)
+            {
+                h.Warnings.Add("基线来自旧 schema（" + s.SchemaVersion + "，当前 "
+                               + BaselineSnapshot.CurrentSchemaVersion + "）：已按兼容模式读取；"
+                               + "旧基线不含「原始启用状态未知」标记，若当时是在夜间采集的，"
+                               + "维护任务可能被误记为禁用");
             }
 
             string expected = s.Metadata == null ? "" : (s.Metadata.IntegritySha256 ?? "");

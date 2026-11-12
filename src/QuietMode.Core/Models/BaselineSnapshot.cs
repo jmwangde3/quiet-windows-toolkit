@@ -9,7 +9,11 @@ namespace QuietMode.Core.Models
     /// </summary>
     public sealed class BaselineSnapshot
     {
-        public const int CurrentSchemaVersion = 2;
+        /// <summary>
+        /// 3：TaskSnapshot 增加 originalUnknown / originalReason —— 允许 baseline 明确说
+        /// 「原始启用状态无法确定」，而不是把夜间被本工具禁用的状态当成原始状态。
+        /// </summary>
+        public const int CurrentSchemaVersion = 3;
 
         public int SchemaVersion = CurrentSchemaVersion;
         public SnapshotMetadata Metadata = new SnapshotMetadata();
@@ -143,6 +147,14 @@ namespace QuietMode.Core.Models
         public string XmlBackup = "";
         public string Error = "";
 
+        /// <summary>
+        /// Enabled 是「拍摄那一刻观测到的值」，不一定等于「原始值」。
+        /// 拍摄时正处在夜间窗口（或其它可证明的干扰条件下）且任务处于禁用状态时，
+        /// 两者无法区分 —— 此时置 true，白天恢复不得据此猜 Enabled。
+        /// </summary>
+        public bool OriginalUnknown;
+        public string OriginalReason = "";
+
         public JsonObject ToJson()
         {
             JsonObject o = new JsonObject();
@@ -154,6 +166,13 @@ namespace QuietMode.Core.Models
             o.Set("xmlSha256", XmlSha256 ?? "");
             o.Set("xmlBackup", XmlBackup ?? "");
             o.Set("error", Error ?? "");
+            // 只在「确实不知道」时写：默认值不落盘，老 baseline 的规范化文本才不会变，
+            // 否则一次字段扩展就会让所有历史基线的完整性校验值全部失配。
+            if (OriginalUnknown)
+            {
+                o.Set("originalUnknown", true);
+                o.Set("originalReason", OriginalReason ?? "");
+            }
             return o;
         }
 
@@ -170,6 +189,8 @@ namespace QuietMode.Core.Models
             t.XmlSha256 = o.GetString("xmlSha256", "");
             t.XmlBackup = o.GetString("xmlBackup", "");
             t.Error = o.GetString("error", "");
+            t.OriginalUnknown = o.GetBool("originalUnknown", false);
+            t.OriginalReason = o.GetString("originalReason", "");
             return t;
         }
 

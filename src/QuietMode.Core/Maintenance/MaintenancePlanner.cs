@@ -140,6 +140,14 @@ namespace QuietMode.Core.Maintenance
                     plan.Notes.Add(def.FullName + " 的 baseline 未记录启用状态，白天不擅自恢复");
                     continue;
                 }
+                if (b.OriginalUnknown)
+                {
+                    // baseline 自己说了它不知道。这时候动它就是在猜 —— 留在 Pending 并说明。
+                    plan.Notes.Add(def.FullName + " 的原始启用状态未知（" + Trim(b.OriginalReason)
+                                   + "），本步保留 Pending，不启用也不禁用；"
+                                   + "确认后执行 qmctl maint baseline-enable 或 baseline-disable");
+                    continue;
+                }
 
                 bool desired = b.Enabled.Value;
                 if (t.Enabled.HasValue && t.Enabled.Value == desired)
