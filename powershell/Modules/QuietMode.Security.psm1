@@ -164,6 +164,10 @@ function Get-QmPrivilegedPaths {
         foreach ($name in @('run', 'recovery')) { $list += (Join-Path $Root $name) }
     }
     if ($DeployDir) {
+        # 部署目录自身也要在名单里。只保护文件是不够的：删除一个文件需要的是
+        # 父目录的 FILE_DELETE_CHILD，而 H:\AI工作区 一路继承下来的 Authenticated Users:Modify
+        # 正好带着它 —— 于是「只读的 qmctl.exe」可以被删掉再换个同名文件，SYSTEM 照样执行。
+        $list += $DeployDir
         $list += (Join-Path $DeployDir 'powershell')
         foreach ($name in @('qmctl.exe', 'QuietMode.exe', 'QuietMode.Core.dll', 'QuietMode.Windows.dll')) {
             $list += (Join-Path $DeployDir $name)

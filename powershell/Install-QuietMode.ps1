@@ -894,16 +894,24 @@ if (-not (Test-Path -LiteralPath $secModule)) {
         if ($permBefore.ok) {
             Write-Ok ("权限布局已合规（检查 " + $permBefore.checked + " 项）")
         } else {
-            foreach ($p in $permBefore.problems) { Write-Warn2 $p }
+            # 修复前的告警只作为现场描述打印，不进汇总。加固成功后再把它们算成未解决问题，
+            # 会让人以为这一步没做成 —— 2026-11-13 21:48 那次就是「失败 0 项」却挂着 8 条
+            # 「普通用户可写」，而同一段的复检其实已经通过。
+            foreach ($p in $permBefore.problems) { Write-Log ("     WARN " + $p) 'Yellow' }
             if ($apply) {
                 $fix = Protect-QuietModeRoot -Root $Root -DeployDir $DeployDir -Apply
                 foreach ($l in $fix.lines) {
                     if ($l -like 'FAIL*') { Write-Bad $l } else { Write-Note $l }
                 }
                 $permAfter = Test-QmPrivilegedLayout -Root $Root -DeployDir $DeployDir
-                if ($permAfter.ok) { Write-Ok '加固后复检通过' }
-                else { foreach ($p in $permAfter.problems) { Write-Bad ("加固后仍不合规：" + $p) } }
+                if ($permAfter.ok) {
+                    Write-Ok ("加固后复检通过（上方 " + @($permBefore.problems).Count + " 条告警已当场解决，不计入汇总）")
+                } else {
+                    foreach ($p in $permAfter.problems) { Write-Bad ("加固后仍不合规：" + $p) }
+                }
             } else {
+                # 演练模式什么都没改，这些就是真实遗留，必须进汇总。
+                foreach ($p in $permBefore.problems) { $script:Warnings.Add($p) }
                 Write-Note '将拒绝 Users 对上述路径的写/删/改权限（logs 单独放行追加）'
             }
         }

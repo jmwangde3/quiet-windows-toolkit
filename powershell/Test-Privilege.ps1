@@ -172,6 +172,11 @@ try {
     Set-QmAcl -Path $plain -Acl $pacl
     Check '只有 ReadAndExecute 时判为只读（不误报）' (-not (Test-QmUserWritable -Path $plain))
 
+    # 2026-11-13：名单里只放文件、不放部署目录本身，等于没防住「删掉再放一个同名文件」——
+    # 删除一个文件要的是父目录的 FILE_DELETE_CHILD，不是文件自己的写权限。
+    $probe = Join-Path $sandbox 'deploy-probe'
+    Check '部署目录自身也在加固名单里' (@(Get-QmPrivilegedPaths -Root $Root -DeployDir $probe) -contains $probe)
+
     # ---- 5. 旧 Deny 残留：必须能拆，且拆之前连建子目录都会被拒 ----
     # 2026-11-13 21:41 那次 Apply 就死在这里：recovery\ 上还挂着上一版的 Users Deny
     # （含 Write），连管理员建 install-<时间戳> 备份目录都被拒，一个字节都没部署。
