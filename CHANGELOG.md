@@ -51,6 +51,14 @@
   SDDL 的控制位（`AI`/`PAI`）必须紧跟 `D:`，ACE 只能插在它后面；
   `FR` 是 `FILE_GENERIC_READ`，不等于 `GR`（`0x80000000`），手写掩码会写错权限。
 
+### 新增：`Verify-NightRun.ps1`（验收自动化，只读）
+
+- 对着 `worker.log` 的分步记录、`reconcile.log` 心跳、`state.json` 与
+  `qmctl --json status` 的实时观测，逐条判定 `V2_SPEC §12` 的 A01–A23；
+  `-Md <路径>` 直接产出证据表（含夜链/日链分步明细）。
+- 只读，不需要管理员；FAIL 时打印缺哪一步、哪条心跳不 Ok。
+- 本机入口 `verify-night.cmd`（GBK + CRLF，双击即跑，日志 `_verify-night.log`）。
+
 ## 2.0.0-rc.1 — 2026-11-12
 
 这一版只做可靠性、安装迁移与恢复，不加新功能。**基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)**：
