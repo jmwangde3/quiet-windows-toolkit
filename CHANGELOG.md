@@ -59,6 +59,19 @@
 - 只读，不需要管理员；FAIL 时打印缺哪一步、哪条心跳不 Ok。
 - 本机入口 `verify-night.cmd`（GBK + CRLF，双击即跑，日志 `_verify-night.log`）。
 
+### 新增：`Reset-Baseline.ps1`（重建 baseline，带相位闸门）
+
+- baseline 记的是维护任务的**原始状态**，schema 2 的基线会一直被
+  `snapshot verify` 报「旧 schema（2，当前 3）」，这条 WARN 只能重建消掉。
+- 重建前先看 `state.json` 的 `controllerState` / `lastReconcileAction`：
+  **夜间相位直接拒绝**（退出码 3）。夜里采会把「已禁用」记成原始状态，
+  之后每天白天都会把维护任务恢复成禁用。确需强行重建加 `-Force`。
+- 旧 `baseline.json` 先复制到 `recovery\baseline-<时间戳>\` 并校验 SHA256，
+  备份失败就放弃重建（不赌「大概没事」）。
+- 重建后回读：`snapshot verify` 不能再有旧 schema 告警、`complete=False` 要变
+  `True`、`maint status` 的 BASELINE 列要与 NOW 列一致。
+- 本机入口 `reset-baseline.cmd`（自提权，GBK + CRLF，日志 `_baseline.log`）。
+
 ## 2.0.0-rc.1 — 2026-11-12
 
 这一版只做可靠性、安装迁移与恢复，不加新功能。**基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)**：
