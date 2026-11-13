@@ -210,5 +210,14 @@ qmctl maint baseline-disable all --apply
 
 `C:/ProgramData/QuietMode` 下的 `config.json` / `state.json` / `baseline.json` /
 `run` / `recovery` 由 SYSTEM 读取并据此操作系统对象，普通用户**不应可写**。
-`QuietMode.Security.psm1` 负责体检与加固（只加 Deny ACE，`logs` 单独放行追加）。
-本机在 rc.1 时尚未加固，`Test-Privilege.ps1` 会如实报告。
+部署目录里被 SYSTEM 直接调起的 `qmctl.exe` / `QuietMode.exe` 与脚本树同理。
+
+`QuietMode.Security.psm1` 负责体检与加固：断继承 → 删掉 Users / Authenticated Users /
+Everyone 的写类 Allow → 补一条 `Users:ReadAndExecute` → 显式补 `Administrators` 与
+`SYSTEM` 的完全控制。`logs` 单独放行追加。判「普通用户」按三个 SID 而不是只按 Users 组，
+否则从 `H:\` 继承来的 `Authenticated Users:Modify` 会被漏掉 —— 那也是一条真实的写权限。
+
+早先用的是「给 Users 加 Deny ACE」，两个硬伤已经拆掉：管理员也在 Users 组里（Deny 连
+安装器一起挡），而 `state.json` 是原子替换写入，新文件继承父目录 ACL，Deny 当场消失。
+安装器现在在**第一个写操作之前**调用 `Unblock-QmLegacyDeny` 清掉残留 Deny —— 否则
+连 `recovery\install-<时间戳>` 这个备份目录都建不出来（2026-11-13 21:41 实测崩在这里）。

@@ -254,6 +254,46 @@ function Set-LegacyEnabled {
     return (Get-TaskState -FullName $FullName)
 }
 
+<#
+    拆掉上一版「Users Deny」加固留下的 ACE。
+
+    为什么必须放在部署最前面：那条 Deny 带了 Write + ChangePermissions，而管理员
+    也在 Users 组里，于是连「在 recovery\ 下建一个备份目录」都会被拒 —— 实测
+    New-Item 抛 UnauthorizedAccessException，整个 Apply 在第 8 步就崩了，一个字
+    节都没部署。DryRun 不建备份目录，所以演练永远看不到这颗雷。
+
+    顺序：先用 .NET 重写 DACL（对象属主是 Administrators，提权会话对属主有隐式
+    WRITE_DAC，能压过 Users 的 Deny）；失败再 takeown + icacls 兜底。
+#>
+function Unblock-QmLegacyDeny {
+    $sec = Join-Path $repoRoot 'powershell\Modules\QuietMode.Security.psm1'
+    if (-not (Test-Path -LiteralPath $sec)) {
+        Write-Warn2 '找不到 Security 模块，跳过旧 Deny 清理'
+        return
+    }
+    Import-Module $sec -Force
+    foreach ($p in (Get-QmPrivilegedPaths -Root $Root -DeployDir $DeployDir)) {
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $done = $false
+        try {
+            if (Remove-QmUserDeny -Path $p) { Write-Ok ('已拆除旧 Deny：' + $p) }
+            $done = $true
+        } catch {
+            Write-Warn2 ('写 DACL 被拒，改走 takeown：' + $p)
+        }
+        if ($done) { continue }
+        try {
+            $null = & takeown.exe /f $p /a 2>&1
+            $null = & icacls.exe $p /remove:d '*S-1-5-32-545' /c /q 2>&1
+        } catch { }
+        if (Test-QmUserDeny -Path $p) {
+            Write-Bad ('旧 Deny 拆不掉，请先手工执行：icacls "' + $p + '" /remove:d *S-1-5-32-545 /t /c')
+        } else {
+            Write-Ok ('已拆除旧 Deny（takeown）：' + $p)
+        }
+    }
+}
+
 # ---------------------------------------------------------------- 环境判定
 
 $repoRoot = Resolve-RepoRoot
@@ -621,18 +661,17 @@ if (-not (Test-Path -LiteralPath $DeployDir)) {
 }
 
 if ($apply) {
-    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
-    Write-Note ("安装备份 " + $backupRoot)
-    # 上一版加固用的是 Users Deny，管理员也在 Users 组里，Deny 会连部署一起挡下来。
-    # 覆盖任何文件之前先拆掉它，否则这次 Apply 会卡在「没有权限写 powershell\」。
-    $secForDeploy = Join-Path $repoRoot 'powershell\Modules\QuietMode.Security.psm1'
-    if (Test-Path -LiteralPath $secForDeploy) {
-        try {
-            Import-Module $secForDeploy -Force
-            foreach ($dp in (Get-QmPrivilegedPaths -Root $Root -DeployDir $DeployDir)) {
-                if (Remove-QmUserDeny -Path $dp) { Write-Note ("已拆除旧 Deny：" + $dp) }
-            }
-        } catch { Write-Warn2 ("拆除旧 Deny 失败（可能需要先手工 icacls）：" + $_.Exception.Message) }
+    # 第一个写操作之前就得拆旧 Deny：备份目录就建在 recovery\ 下面，
+    # 顺序反了会直接死在 New-Item 上（21:41 那次就是这么崩的）。
+    Unblock-QmLegacyDeny
+    try {
+        New-Item -ItemType Directory -Path $backupRoot -Force -ErrorAction Stop | Out-Null
+        Write-Note ("安装备份 " + $backupRoot)
+    } catch {
+        Write-Bad ("无法创建安装备份目录：" + $backupRoot + " — " + $_.Exception.Message)
+        Write-Log '  没有备份就不覆盖任何文件。先修权限再重试。' 'Red'
+        if ($script:LogPath) { Write-Log ("日志：" + $script:LogPath) 'Yellow' }
+        exit 3
     }
     Stop-Tray -Apply $true
 } else {

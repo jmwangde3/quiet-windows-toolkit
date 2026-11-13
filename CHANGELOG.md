@@ -1,5 +1,28 @@
 # 变更记录
 
+## 2.0.0-rc.2 — 2026-11-13
+
+### 修复：加固定位到写权限模型，安装器不再被自己的加固锁死
+
+- **旧 Deny 残留会让 Apply 死在第一步。** 上一版加固给 Users 加了 Deny（含 `Write`、
+  `ChangePermissions`），管理员也在 Users 组里，于是 `recovery\` 下连
+  `install-<时间戳>` 备份目录都建不出来 —— 实测 `New-Item` 抛
+  `UnauthorizedAccessException`，整个 Apply 在第 8 步退出，一个字节都没部署。
+  安装器现在把 `Unblock-QmLegacyDeny` 排在**第一个写操作之前**，失败还有
+  `takeown /a` + `icacls /remove:d` 兜底。
+- **「普通用户」按 SID 判全。** 原来只看 `S-1-5-32-545`，而部署目录在 `H:\` 下，
+  从 `H:\AI工作区` 继承来的 `Authenticated Users:Modify` 是一整条写权限。结果加固
+  报告「已是只读」，普通用户照样能改 SYSTEM 要执行的脚本。现在按
+  Users + Authenticated Users + Everyone 三个 SID 判与削。
+- **可写判定不再用超集掩码。** `FullControl` / `Modify` 拿去做 `-band` 会让
+  `ReadAndExecute` 也算命中（`131241 & 2032127 != 0`），六条只读路径全被报成
+  「普通用户可写」。改判原子位（Write / Delete / TakeOwnership / ChangePermissions）。
+- `Set-QmAcl` 用 `FileSystemInfo.SetAccessControl` 而不是 `Set-Acl`：后者回写整份安全
+  描述符（含 SACL），非提权会话直接报 `SeSecurityPrivilege`。
+- `Test-Privilege.ps1` 10 → 21 项：旧 Deny 下建子目录确实被拒、`Remove-QmUserDeny`
+  能拆掉含 `ChangePermissions` 的 Deny、加固后 Authenticated Users 也不再有写权、
+  加固后 Administrators 仍保留完全控制（提权安装器还要写备份）。
+
 ## 2.0.0-rc.1 — 2026-11-12
 
 这一版只做可靠性、安装迁移与恢复，不加新功能。**基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)**：

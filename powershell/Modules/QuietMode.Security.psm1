@@ -9,6 +9,9 @@
 
         * config.json / state.json / baseline.json / run\ / recovery\ / powershell\
           普通用户只能读，不能写、不能删、不能改名、不能替换。
+          「普通用户」按 Users + Authenticated Users + Everyone 三个 SID 判：
+          部署目录在 H:\ 下，Authenticated Users 的 Modify 会一路继承进去，
+          只盯 Users 组会漏判。
         * logs\ 允许追加（普通用户跑 qmctl 时也要能留日志），但不允许删除目录。
         * 不关闭 UAC、不改系统级策略、不动继承以外的全局设置。
 
@@ -32,11 +35,19 @@ $script:UsersSid = 'S-1-5-32-545'
 $script:AdminsSid = 'S-1-5-32-544'
 $script:SystemSid = 'S-1-5-18'
 
+<#
+    「普通用户」不只 Users 组：每个交互登录的令牌都带 Authenticated Users(S-1-5-11)，
+    Everyone(S-1-1-0) 也是。部署目录在 H:\ 下，从 H:\AI工作区 继承来的
+    Authenticated Users:Modify 就是一条真实的写权限 —— 只盯 S-1-5-32-545 会让加固
+    报告「已是只读」，而普通用户照样能改 SYSTEM 要执行的脚本。
+#>
+$script:UserSids = @('S-1-5-32-545', 'S-1-5-11', 'S-1-1-0')
+
 function Test-QmUserDeny {    param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path)) { return $false }
     $acl = Get-Acl -LiteralPath $Path
     foreach ($ace in $acl.Access) {
-        if ((Get-QmSidValue $ace.IdentityReference) -eq $script:UsersSid -and
+        if ($script:UserSids -contains (Get-QmSidValue $ace.IdentityReference) -and
             [string]$ace.AccessControlType -eq 'Deny') { return $true }
     }
     return $false
@@ -52,7 +63,7 @@ function Remove-QmUserDeny {
     $acl = Get-Acl -LiteralPath $Path
     $n = 0
     foreach ($ace in @($acl.Access)) {
-        if ((Get-QmSidValue $ace.IdentityReference) -eq $script:UsersSid -and
+        if ($script:UserSids -contains (Get-QmSidValue $ace.IdentityReference) -and
             [string]$ace.AccessControlType -eq 'Deny') {
             $acl.RemoveAccessRule($ace) | Out-Null
             $n++
@@ -128,7 +139,7 @@ function Test-QmUserWritable {
     $denied = $false
     $writeAllow = $false
     foreach ($ace in $acl.Access) {
-        if ((Get-QmSidValue $ace.IdentityReference) -ne $script:UsersSid) { continue }
+        if ($script:UserSids -notcontains (Get-QmSidValue $ace.IdentityReference)) { continue }
         $type = [string]$ace.AccessControlType
         if ($type -eq 'Deny' -and ($ace.FileSystemRights -band $needDeny) -eq $needDeny) { $denied = $true }
         elseif ($type -eq 'Allow' -and ($ace.FileSystemRights -band $script:WriteRights) -ne 0) { $writeAllow = $true }
@@ -250,7 +261,7 @@ function Set-QmRestrictedAcl {
     # 1) 清掉早先 Deny 方案留下的 ACE（Deny 对提权管理员也生效，必须拆掉）
     $removedDeny = $false
     foreach ($ace in @($acl.Access)) {
-        if ((Get-QmSidValue $ace.IdentityReference) -eq $script:UsersSid -and
+        if ($script:UserSids -contains (Get-QmSidValue $ace.IdentityReference) -and
             [string]$ace.AccessControlType -eq 'Deny') {
             $acl.RemoveAccessRule($ace) | Out-Null
             $removedDeny = $true
@@ -271,7 +282,7 @@ function Set-QmRestrictedAcl {
     # 3) 删掉 Users 的写类 Allow，只留只读
     $removedWrite = $false
     foreach ($ace in @($acl.Access)) {
-        if ((Get-QmSidValue $ace.IdentityReference) -ne $script:UsersSid) { continue }
+        if ($script:UserSids -notcontains (Get-QmSidValue $ace.IdentityReference)) { continue }
         if ([string]$ace.AccessControlType -ne 'Allow') { continue }
         if (($ace.FileSystemRights -band $script:WriteRights) -eq 0) { continue }
         $acl.RemoveAccessRule($ace) | Out-Null
@@ -348,7 +359,7 @@ function Protect-QuietModeRoot {
                 $acl = Get-Acl -LiteralPath $logDir
                 $hasWrite = $false
                 foreach ($ace in $acl.Access) {
-                    if ((Get-QmSidValue $ace.IdentityReference) -eq $script:UsersSid -and
+                    if ($script:UserSids -contains (Get-QmSidValue $ace.IdentityReference) -and
                         [string]$ace.AccessControlType -eq 'Allow' -and
                         ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) -ne 0) {
                         $hasWrite = $true

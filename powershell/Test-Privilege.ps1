@@ -128,17 +128,29 @@ try {
     $sidAdm = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
     $sidSys = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
     $sidUsr = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $sidAuth = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-11')
     $vacl = Get-Acl -LiteralPath $vroot
     $vacl.SetAccessRuleProtection($true, $false)
     foreach ($a in @($vacl.Access)) { [void]$vacl.RemoveAccessRule($a) }
     $vacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
     $vacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSys, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
     $vacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidUsr, 'ReadAndExecute, Write', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
+    # H:\ 下真实存在的一条：Authenticated Users 的 Modify 会一路继承进 powershell\。
+    # 只看 Users 组会漏掉它，加固「成功」但普通用户照样能改脚本。
+    $vacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAuth, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
     Set-QmAcl -Path $vroot -Acl $vacl
 
     Check '加固前：Users 可写被识别' (Test-QmUserWritable -Path $vroot)
     (Protect-QuietModeRoot -Root $vroot -Apply) | Out-Null
     Check '加固后：Users 不再可写' (-not (Test-QmUserWritable -Path $vroot))
+    $authWrite = $false
+    foreach ($ace in (Get-Acl -LiteralPath $vroot).Access) {
+        $sid = ''
+        try { $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($sid -eq 'S-1-5-11' -and [string]$ace.AccessControlType -eq 'Allow' -and
+            ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write) -ne 0) { $authWrite = $true }
+    }
+    Check '加固后：Authenticated Users 也不再有写权限' (-not $authWrite)
     $usersRead = $false
     foreach ($ace in (Get-Acl -LiteralPath $vroot).Access) {
         $sid = ''
@@ -159,6 +171,42 @@ try {
     $pacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidUsr, 'ReadAndExecute', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
     Set-QmAcl -Path $plain -Acl $pacl
     Check '只有 ReadAndExecute 时判为只读（不误报）' (-not (Test-QmUserWritable -Path $plain))
+
+    # ---- 5. 旧 Deny 残留：必须能拆，且拆之前连建子目录都会被拒 ----
+    # 2026-11-13 21:41 那次 Apply 就死在这里：recovery\ 上还挂着上一版的 Users Deny
+    # （含 Write），连管理员建 install-<时间戳> 备份目录都被拒，一个字节都没部署。
+    # 安装器现在把 Unblock-QmLegacyDeny 排在第一个写操作之前，这段把前提钉死。
+    $droot = Join-Path $sandbox 'droot'
+    New-Item -ItemType Directory -Path $droot -Force | Out-Null
+    $dacl = Get-Acl -LiteralPath $droot
+    $dacl.SetAccessRuleProtection($true, $false)
+    foreach ($a in @($dacl.Access)) { [void]$dacl.RemoveAccessRule($a) }
+    $dacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
+    $dacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidUsr, 'Write, Delete, ChangePermissions, TakeOwnership', 'ContainerInherit, ObjectInherit', 'None', 'Deny'))) | Out-Null
+    Set-QmAcl -Path $droot -Acl $dacl
+
+    $blocked = $false
+    try {
+        New-Item -ItemType Directory -Path (Join-Path $droot 'install-blocked') -ErrorAction Stop | Out-Null
+    } catch { $blocked = $true }
+    Check '旧 Deny 下建子目录被拒（复现 21:41 现场）' $blocked
+
+    # 这一条是安装器第 8 步之前的真实动作：Deny 里带 ChangePermissions，
+    # 但对象属主有隐式 WRITE_DAC，所以纯 .NET 写 DACL 就能拆掉。
+    $removed = $false
+    try { $removed = Remove-QmUserDeny -Path $droot } catch { $removed = $false }
+    Check 'Remove-QmUserDeny 能拆掉含 ChangePermissions 的 Deny' ($removed -and -not (Test-QmUserDeny -Path $droot))
+
+    (Protect-QuietModeRoot -Root $droot -Apply) | Out-Null
+    $adminFull = $false
+    foreach ($ace in (Get-Acl -LiteralPath $droot).Access) {
+        $sid = ''
+        try { $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($sid -eq 'S-1-5-32-544' -and [string]$ace.AccessControlType -eq 'Allow' -and
+            ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne 0) { $adminFull = $true }
+    }
+    Check '加固后：Administrators 保留完全控制（提权安装器还要往这里写备份）' $adminFull
+    Check '加固后：Users 仍被削到只读且无 Deny' ((-not (Test-QmUserWritable -Path $droot)) -and (-not (Test-QmUserDeny -Path $droot)))
 } finally {
     # 自测里会故意把临时目录加固成只读，删之前先把继承与 ACE 还原
     try { if (Test-Path -LiteralPath $sandbox) { & icacls $sandbox /reset /T /C | Out-Null } } catch { }
