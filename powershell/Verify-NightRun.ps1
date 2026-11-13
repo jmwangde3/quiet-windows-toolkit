@@ -191,13 +191,145 @@ $bakCount = 0
 if (Test-Path -LiteralPath $recoveryDir) { $bakCount = @(Get-ChildItem -LiteralPath $recoveryDir -Directory -ErrorAction SilentlyContinue).Count }
 Add-Row 'A20' '失败时保留恢复文件' $(if ($bakCount -gt 0) { 'PASS' } else { 'INFO' }) ('recovery 下有 ' + $bakCount + ' 个备份目录')
 
-# A03 / A04 / A06 / A13 / A14 / A15 需管理员读系统状态，这里标手工
-Add-Row 'A03' 'Regular Maintenance 被正确管理' 'MANUAL' 'baseline 未记录该项启用状态（已知 WARN）'
-Add-Row 'A04' 'SysMain 夜间禁用' 'MANUAL' '需夜跑时快照 Get-Service SysMain'
-Add-Row 'A06' '维护窗口调整到白天' 'MANUAL' '需管理员读任务设置'
-Add-Row 'A13' '原始维护任务状态恢复' 'MANUAL' 'maint verify day 需管理员'
-Add-Row 'A14' 'SysMain 原始状态恢复' 'MANUAL' '需管理员'
-Add-Row 'A15' '原始注册表/电源设置恢复' 'MANUAL' '需管理员'
+# ------------------------------------------------------------------ 维护项实况
+# qmctl --json maint status 不需要管理员：任务的 presence/enabled、SysMain 的启动
+# 类型、注册表 MaintenanceBoundary/WakeUp、电源方案都在里面。A04/A06/A13/A14/A15
+# 全靠这份观测判定，不用再让人手工去开管理员窗口。
+$maint = $null
+try {
+    $maintRaw = & $Qmctl --json maint status 2>&1 | Out-String
+    $maint = $maintRaw | ConvertFrom-Json
+} catch { $maint = $null }
+
+$mObsTasks = @(); $mObsSvc = $null; $mObsReg = @(); $mObsPp = $null
+$mBaseTasks = @(); $mBaseSvc = $null; $mBaseReg = @(); $mBasePp = $null
+$cfgHour = 10
+if ($maint) {
+    $mObsTasks = @($maint.observation.tasks)
+    $mObsSvc   = @($maint.observation.services | Where-Object { $_.serviceName -eq 'SysMain' }) | Select-Object -First 1
+    $mObsReg   = @($maint.observation.registry)
+    $mObsPp    = $maint.observation.powerPlan
+    if ($maint.baseline) {
+        $mBaseTasks = @($maint.baseline.scheduledTasks)
+        $mBaseSvc   = @($maint.baseline.services | Where-Object { $_.serviceName -eq 'SysMain' }) | Select-Object -First 1
+        $mBaseReg   = @($maint.baseline.registry)
+        $mBasePp    = $maint.baseline.powerPlan
+    }
+    if ($null -ne $maint.config -and $null -ne $maint.config.maintenanceHour) {
+        $cfgHour = [int]$maint.config.maintenanceHour
+    }
+}
+
+# A03 可以自动判定：只要 baseline 里记下了 Regular Maintenance 的 exists/enabled，
+# 夜链恢复时就有据可依。这条以前固定报「已知 WARN」，schema 3 的基线重建后应该消失。
+$a03State = 'MANUAL'
+$a03Why = 'baseline.json 不存在或读不出来'
+$baselineFile = Join-Path $Root 'baseline.json'
+if (Test-Path -LiteralPath $baselineFile) {
+    try {
+        $bj = Get-Content -LiteralPath $baselineFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        $rm = $null
+        foreach ($t in $bj.scheduledTasks) {
+            if ($t.name -eq 'Regular Maintenance') { $rm = $t; break }
+        }
+        if (-not $rm) {
+            $a03State = 'FAIL'; $a03Why = 'baseline 里没有 Regular Maintenance 这条'
+        } elseif ($null -eq $rm.exists) {
+            $a03State = 'MANUAL'; $a03Why = 'exists 未知（采集时读不到，可能未提权）'
+        } elseif ($rm.exists -eq $false) {
+            $a03State = 'PASS'; $a03Why = '本机无此任务，baseline 已记录 exists=false（不会误禁/误恢复）'
+        } elseif ($null -eq $rm.enabled) {
+            $a03State = 'MANUAL'; $a03Why = '任务存在但启用状态未知'
+        } else {
+            $a03State = 'PASS'; $a03Why = 'baseline 已记录 exists=true enabled=' + $rm.enabled
+        }
+    } catch {
+        $a03State = 'MANUAL'
+        $a03Why = 'baseline.json 解析失败：' + $_.Exception.Message
+    }
+}
+Add-Row 'A03' 'Regular Maintenance 被正确管理' $a03State $a03Why
+
+# A04 SysMain 夜间禁用 —— 只有夜跑时才能看实况
+if (-not $mObsSvc) {
+    Add-Row 'A04' 'SysMain 夜间禁用' 'INFO' '读不到 SysMain（服务不存在或查询失败）'
+} elseif ($isNight) {
+    $sysOff = ($mObsSvc.startupType -eq 'disabled') -or ($mObsSvc.status -eq 'Stopped')
+    Add-Row 'A04' 'SysMain 夜间禁用' $(if ($sysOff) { 'PASS' } else { 'FAIL' }) ('夜间实况 startup=' + $mObsSvc.startupType + ' status=' + $mObsSvc.status)
+} else {
+    Add-Row 'A04' 'SysMain 夜间禁用' 'MANUAL' ('白天窗口，SysMain=' + $mObsSvc.startupType + '/' + $mObsSvc.status + '；夜跑期间重跑本脚本会自动判定')
+}
+
+# A06 维护窗口调整到白天
+$mb = $mObsReg | Where-Object { $_.valueName -eq 'MaintenanceBoundary' } | Select-Object -First 1
+if (-not $mb) {
+    Add-Row 'A06' '维护窗口调整到白天' 'MANUAL' '读不到 MaintenanceBoundary'
+} else {
+    $okA06 = ([string]$mb.value -eq [string]$cfgHour)
+    Add-Row 'A06' '维护窗口调整到白天' $(if ($okA06) { 'PASS' } else { 'FAIL' }) ('MaintenanceBoundary=' + $mb.value + '，配置 maintenanceHour=' + $cfgHour)
+}
+
+# A13 原始维护任务状态恢复 —— 白天判「已恢复」，夜间无法判
+if ($mBaseTasks.Count -eq 0) {
+    Add-Row 'A13' '原始维护任务状态恢复' 'MANUAL' '读不到 baseline 的任务清单'
+} elseif ($isNight) {
+    Add-Row 'A13' '原始维护任务状态恢复' 'MANUAL' '夜间窗口（此刻应当正是禁用状态），10:02 日链跑完后再验'
+} else {
+    $mism = @(); $checked = 0
+    foreach ($bt in $mBaseTasks) {
+        if ($null -eq $bt.enabled) { continue }
+        $ot = $mObsTasks | Where-Object { $_.path -eq $bt.path -and $_.name -eq $bt.name } | Select-Object -First 1
+        if (-not $ot) { $mism += ($bt.name + '=读不到'); continue }
+        $checked++
+        if ($null -eq $ot.enabled) { continue }
+        if ([bool]$ot.enabled -ne [bool]$bt.enabled) {
+            $mism += ($bt.name + ' ' + $(if ($bt.enabled) { '启用' } else { '禁用' }) + '→' + $(if ($ot.enabled) { '启用' } else { '禁用' }))
+        }
+    }
+    if ($checked -eq 0) {
+        Add-Row 'A13' '原始维护任务状态恢复' 'MANUAL' 'baseline 里的任务状态全是未知'
+    } elseif ($mism.Count -eq 0) {
+        Add-Row 'A13' '原始维护任务状态恢复' 'PASS' ($checked.ToString() + ' 项与 baseline 完全一致')
+    } else {
+        Add-Row 'A13' '原始维护任务状态恢复' 'FAIL' (($mism -join '；'))
+    }
+}
+
+# A14 SysMain 原始状态恢复
+if (-not $mBaseSvc -or -not $mObsSvc) {
+    Add-Row 'A14' 'SysMain 原始状态恢复' 'MANUAL' 'baseline 或实况里没有 SysMain'
+} elseif ($isNight) {
+    Add-Row 'A14' 'SysMain 原始状态恢复' 'MANUAL' '夜间窗口，恢复验证留给日链'
+} else {
+    $okA14 = ([string]$mBaseSvc.startupType -eq [string]$mObsSvc.startupType)
+    Add-Row 'A14' 'SysMain 原始状态恢复' $(if ($okA14) { 'PASS' } else { 'FAIL' }) ('baseline=' + $mBaseSvc.startupType + ' 现在=' + $mObsSvc.startupType)
+}
+
+# A15 原始注册表 / 电源设置恢复
+if ($mBaseReg.Count -eq 0) {
+    Add-Row 'A15' '原始注册表/电源设置恢复' 'MANUAL' 'baseline 里没有注册表项'
+} else {
+    $regMism = @()
+    foreach ($br in $mBaseReg) {
+        $or = $mObsReg | Where-Object { $_.keyPath -eq $br.keyPath -and $_.valueName -eq $br.valueName } | Select-Object -First 1
+        if (-not $or) { $regMism += ($br.valueName + '=读不到'); continue }
+        if ([string]$or.value -ne [string]$br.value) { $regMism += ($br.valueName + ' ' + $br.value + '→' + $or.value) }
+    }
+    $ppText = '电源方案不参与比对（维护探针不采该项）'
+    if ($mBasePp -and $mBasePp.captured) {
+        if ($mObsPp -and $mObsPp.captured) {
+            if ([string]$mObsPp.activeSchemeGuid -ne [string]$mBasePp.activeSchemeGuid) {
+                $regMism += ('电源方案 ' + $mBasePp.activeSchemeGuid + '→' + $mObsPp.activeSchemeGuid)
+            } else { $ppText = '电源方案一致' }
+        } else { $ppText = '电源方案本次未采到' }
+    }
+    $regText = ($mBaseReg.Count.ToString() + ' 项注册表 + ' + $ppText)
+    if ($regMism.Count -eq 0) {
+        Add-Row 'A15' '原始注册表/电源设置恢复' 'PASS' $regText
+    } else {
+        Add-Row 'A15' '原始注册表/电源设置恢复' 'FAIL' (($regMism -join '；'))
+    }
+}
 
 # ------------------------------------------------------------------ 输出
 $pass = @($rows | Where-Object { $_.State -eq 'PASS' }).Count
