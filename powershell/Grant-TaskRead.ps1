@@ -29,6 +29,12 @@
         追加一条 (A;;FR;;;BU)。走服务自己的 API，TaskCache 那份由服务更新；
         不删任务、不重注册、触发器与 principal 一个字节都不动；原值先备份。
 
+    2026-11-13 22:19 修正：SetSecurityDescriptor **是生效的**，骗人的是回读。
+      服务在 SetSecurityDescriptor 之后会让手上那个 IRegisteredTask 失效，
+      同一个对象立刻 GetSecurityDescriptor 返回空串 → 被误判成「服务没接受」，
+      日志里两个 v1 闸门都报 FAIL；下一轮非提权复验时它们其实早就有 BU 了。
+      → 回读必须重新 GetTask 一次，并且给服务几百毫秒落地（见 Wait-TaskSd）。
+
     两条死路，别再走（22:1x 各踩一次）：
       a) 直接写 HKLM\...\TaskCache\Tree\<路径>\SD —— 那键默认只给 SYSTEM/管理员读，
          普通用户那句会误报成「任务未注册」；就算提权写了，服务也未必重载。
@@ -89,6 +95,29 @@ function Add-DaclAce {
     $m = [regex]::Match($Sddl, '^D:[A-Z]*')
     if (-not $m.Success) { return $null }
     return $m.Value + $Ace + $Sddl.Substring($m.Value.Length)
+}
+
+# SetSecurityDescriptor 之后原来那个对象就作废了，同对象立刻回读得到空串 —— 实测
+# 2026-11-13 22:19 两个 v1 闸门因此被误判成「服务没接受」，其实早写进去了。
+# 所以回读一律重新取对象，并且给服务几百毫秒落地。
+function Wait-SecurityDescriptor {
+    param(
+        [scriptblock]$Fetch,
+        [int]$Flags = 4,
+        [int]$Tries = 8,
+        [int]$DelayMs = 150
+    )
+    for ($i = 0; $i -lt $Tries; $i++) {
+        if ($i -gt 0) { Start-Sleep -Milliseconds $DelayMs }
+        $obj = $null
+        try { $obj = & $Fetch } catch { continue }
+        if ($null -eq $obj) { continue }
+        try {
+            $s = [string]$obj.GetSecurityDescriptor($Flags)
+            if ($s) { return $s }
+        } catch { }
+    }
+    return $null
 }
 
 function Grant-TaskFileRead {
@@ -247,8 +276,7 @@ foreach ($raw in $Folders) {
         continue
     }
 
-    $check = $null
-    try { $check = [string]$folder.GetSecurityDescriptor($DaclOnly) } catch { }
+    $check = Wait-SecurityDescriptor -Fetch { $svc.GetFolder($path) } -Flags $DaclOnly
     if (-not $check) {
         Write-Host '  FAIL 写入后回读不到安全描述符' -ForegroundColor Red
         $failed++
@@ -315,6 +343,7 @@ if ($IncludeTasks) {
         $seen = 0; $done = 0; $bad = 0
         foreach ($t in $tasks) {
             $name = [string]$t.Name
+            $fullName = $path.TrimEnd('\') + '\' + $name
             $seen++
 
             $before = $null
@@ -352,11 +381,11 @@ if ($IncludeTasks) {
                 $bad++; continue
             }
 
-            $check = $null
-            try { $check = [string]$t.GetSecurityDescriptor($DaclOnly) } catch { }
+            $check = Wait-SecurityDescriptor -Fetch { $folder.GetTask($name) } -Flags $DaclOnly
             if (-not $check) {
-                Write-Host ("  FAIL " + $name + " 写入后回读不到 SD（服务没接受）") -ForegroundColor Red
+                Write-Host ("  FAIL " + $name + " 写入后回读不到 SD（重新取对象重试 8 次全空）") -ForegroundColor Red
                 Write-Host ("       原值已备份：" + $bak) -ForegroundColor Yellow
+                Write-Host ("       兜底：Fix-TaskVisibility.ps1 -Apply -Targets '" + $fullName + "'") -ForegroundColor Yellow
                 $bad++; continue
             }
             if ($check -notmatch '\(A;[^()]*;;;BU\)') {

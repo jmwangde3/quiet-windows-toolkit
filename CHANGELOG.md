@@ -34,11 +34,19 @@
 - `SchedulerInstaller.Install` 现在注册时显式传 SDDL：
   `D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;BU)`（管理员/系统全控，普通用户读）。
   传 `null` 拿到的默认 SD 只有 BA/SY 两条。
-- 新增 `powershell/Fix-TaskVisibility.ps1`：安装器发现 v2 任务缺 Users 读时，用任务
-  自己的 XML 原样重新注册（只换 sddl），先备份到 `recovery\task-visibility-<时间戳>\`。
-- `Grant-TaskRead.ps1` 新增 `-IncludeTasks`：对**已注册**任务直接改 TaskCache 里那份
-  二进制 SD，追加一条 `(A;;FR;;;BU)` 再写回，不删任务、不重注册、触发器与 principal
-  一个字节都不动；原值先备份到 `%TEMP%\qm-tasksd-<时间戳>\`。
+- 新增 `powershell/Fix-TaskVisibility.ps1`：多目标任务修复器。先试
+  `IRegisteredTask::SetSecurityDescriptor`（不删任务）；回读为空就走删+重建，
+  用任务自己的 XML 原样重新注册（只换 `<SecurityDescriptor>`），按原 `Enabled`
+  回填，核对 `State`/触发器数与改前一致。备份到 `recovery\task-visibility-<时间戳>\`。
+- `Grant-TaskRead.ps1` 新增 `-IncludeTasks`：`GetTasks(1)` 枚举 → 逐个
+  `GetSecurityDescriptor` / `SetSecurityDescriptor` 追加 `(A;;FR;;;BU)`，
+  不删任务、不重注册、触发器与 principal 一个字节都不动；原值先备份到
+  `%TEMP%\qm-tasksd-<时间戳>\`。
+- **回读必须重新取对象。** 实测 22:19 那一轮两个 v1 闸门都报
+  「服务没接受」——其实是假阴性：`SetSecurityDescriptor` 之后手里那个
+  `IRegisteredTask` 就失效了，同一个对象立刻 `GetSecurityDescriptor` 返回空串。
+  下一轮非提权复验时它们早就有 `(A;;FR;;;BU)` 了。现在统一走
+  `Wait-SecurityDescriptor`（重新 `GetTask`，最多 8 次、每次 150ms）。
 - 踩过的坑写进脚本注释：`ITaskFolder::GetFolder` 不接受结尾反斜杠（0x8007007B）；
   SDDL 的控制位（`AI`/`PAI`）必须紧跟 `D:`，ACE 只能插在它后面；
   `FR` 是 `FILE_GENERIC_READ`，不等于 `GR`（`0x80000000`），手写掩码会写错权限。

@@ -63,7 +63,11 @@ namespace QuietMode.Windows
             if (Exists == true)
             {
                 sb.AppendLine("  状态      : " + State);
-                sb.AppendLine("  上次运行  : " + LastRunTime + "（结果 " + LastResult + "）");
+                // 267011 = 0x41303 SCHED_S_TASK_HAS_NOT_RUN。重建任务会清掉运行历史，
+                // 这时 LastRunTime 是 1999-11-30 这个占位值，直说「从未运行」更准确。
+                sb.AppendLine("  上次运行  : " + (LastResult == "267011"
+                    ? "从未运行过（0x41303，注册后尚未执行）"
+                    : LastRunTime + "（结果 " + LastResult + "）"));
             }
             if (!string.IsNullOrEmpty(Error)) sb.AppendLine("  错误      : " + Error);
             sb.AppendLine("v1 遗留闸门：");
