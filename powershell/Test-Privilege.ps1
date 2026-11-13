@@ -116,7 +116,52 @@ try {
     $plan = Protect-QuietModeRoot -Root $base -DeployDir $null
     $after = @(Get-Acl -LiteralPath $base).Access.Count
     Check 'Protect-QuietModeRoot 默认只给计划不动手' ($plan.apply -eq $false -and $before -eq $after)
+
+    # ---- 4. 加固必须真的削权，且「只读」不能被误判成「可写」 ----
+    # 早先的实现拿 FullControl 这个超集掩码做 -band，ReadAndExecute 也会命中，
+    # 于是六条全是只读的路径被报成「普通用户可写」。这一段把它钉死。
+    $vroot = Join-Path $sandbox 'vroot'
+    New-Item -ItemType Directory -Path $vroot -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $vroot 'logs') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $vroot 'config.json') -Value '{}' -Encoding UTF8
+
+    $sidAdm = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $sidSys = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $sidUsr = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $vacl = Get-Acl -LiteralPath $vroot
+    $vacl.SetAccessRuleProtection($true, $false)
+    foreach ($a in @($vacl.Access)) { [void]$vacl.RemoveAccessRule($a) }
+    $vacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidAdm, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
+    $vacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidSys, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
+    $vacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidUsr, 'ReadAndExecute, Write', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
+    Set-QmAcl -Path $vroot -Acl $vacl
+
+    Check '加固前：Users 可写被识别' (Test-QmUserWritable -Path $vroot)
+    (Protect-QuietModeRoot -Root $vroot -Apply) | Out-Null
+    Check '加固后：Users 不再可写' (-not (Test-QmUserWritable -Path $vroot))
+    $usersRead = $false
+    foreach ($ace in (Get-Acl -LiteralPath $vroot).Access) {
+        $sid = ''
+        try { $sid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { }
+        if ($sid -eq 'S-1-5-32-545' -and [string]$ace.AccessControlType -eq 'Allow' -and
+            ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read) -ne 0) { $usersRead = $true }
+    }
+    Check '加固后：Users 仍保留读取（托盘/非提权 qmctl 要用）' $usersRead
+    Check '加固后：没有残留 Deny（Deny 会挡住提权管理员）' (-not (Test-QmUserDeny -Path $vroot))
+    Check '加固后：子项随父目录一起变只读' (-not (Test-QmUserWritable -Path (Join-Path $vroot 'config.json')))
+
+    # 只剩 ReadAndExecute 的路径不能被判成可写（回归：超集掩码误判）
+    $plain = Join-Path $sandbox 'plain'
+    New-Item -ItemType Directory -Path $plain -Force | Out-Null
+    $pacl = Get-Acl -LiteralPath $plain
+    $pacl.SetAccessRuleProtection($true, $false)
+    foreach ($a in @($pacl.Access)) { [void]$pacl.RemoveAccessRule($a) }
+    $pacl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidUsr, 'ReadAndExecute', 'ContainerInherit, ObjectInherit', 'None', 'Allow'))) | Out-Null
+    Set-QmAcl -Path $plain -Acl $pacl
+    Check '只有 ReadAndExecute 时判为只读（不误报）' (-not (Test-QmUserWritable -Path $plain))
 } finally {
+    # 自测里会故意把临时目录加固成只读，删之前先把继承与 ACE 还原
+    try { if (Test-Path -LiteralPath $sandbox) { & icacls $sandbox /reset /T /C | Out-Null } } catch { }
     try { if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue } } catch { }
 }
 

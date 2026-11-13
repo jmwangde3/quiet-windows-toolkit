@@ -623,6 +623,17 @@ if (-not (Test-Path -LiteralPath $DeployDir)) {
 if ($apply) {
     New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
     Write-Note ("安装备份 " + $backupRoot)
+    # 上一版加固用的是 Users Deny，管理员也在 Users 组里，Deny 会连部署一起挡下来。
+    # 覆盖任何文件之前先拆掉它，否则这次 Apply 会卡在「没有权限写 powershell\」。
+    $secForDeploy = Join-Path $repoRoot 'powershell\Modules\QuietMode.Security.psm1'
+    if (Test-Path -LiteralPath $secForDeploy) {
+        try {
+            Import-Module $secForDeploy -Force
+            foreach ($dp in (Get-QmPrivilegedPaths -Root $Root -DeployDir $DeployDir)) {
+                if (Remove-QmUserDeny -Path $dp) { Write-Note ("已拆除旧 Deny：" + $dp) }
+            }
+        } catch { Write-Warn2 ("拆除旧 Deny 失败（可能需要先手工 icacls）：" + $_.Exception.Message) }
+    }
     Stop-Tray -Apply $true
 } else {
     Stop-Tray -Apply $false
