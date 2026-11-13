@@ -143,9 +143,19 @@ Add-Row 'A07' '配置硬盘全部 Offline（夜间）' $(if ($nightChk.Ok) { 'PA
 Add-Row 'A08' 'FanControl 静音配置生效（夜间）' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('fan/silent @ ' + (Get-StepText $night 'fan/silent'))
 
 # A11 / A12 / A17 —— 日链
+# A12 / A17 判的是「白天应有的状态」，夜里跑必然看到相反值。这类断言按相位取：
+# 夜里只报 MANUAL（磁盘本来就该离线、风扇本来就该静音），把 PASS/FAIL 留给日链之后。
 Add-Row 'A11' '10:02 自动进入白天模式' $(if ($dayChk.Ok) { 'PASS' } else { 'FAIL' }) ('日链 ' + $dayChk.Detail + '；' + $dayChk.Text)
-Add-Row 'A12' '磁盘全部 Online（白天）' $(if ($targets.Count -eq 0) { 'FAIL' } elseif ($allOffline) { 'FAIL' } else { 'PASS' }) (($targets.Count - $offlineCount).ToString() + '/' + $targets.Count + ' 在线（Offline ' + $offlineCount + ' 块）；disk/online @ ' + (Get-StepText $day 'disk/online'))
-Add-Row 'A17' 'FanControl 常态配置（白天）' $(if ($st.fan.match -eq 'normal') { 'PASS' } elseif ($st.fan.match -eq 'silent') { 'FAIL' } else { 'INFO' }) ('match=' + $st.fan.match + ' current=' + $st.fan.currentProfile)
+if ($isNight) {
+    Add-Row 'A12' '磁盘全部 Online（白天）' 'MANUAL' ('夜间窗口，磁盘按设计应为 Offline（现 ' + $offlineCount + '/' + $targets.Count + ' 离线）；10:02 日链后重跑本脚本判定')
+} else {
+    Add-Row 'A12' '磁盘全部 Online（白天）' $(if ($targets.Count -eq 0) { 'FAIL' } elseif ($allOffline) { 'FAIL' } else { 'PASS' }) (($targets.Count - $offlineCount).ToString() + '/' + $targets.Count + ' 在线（Offline ' + $offlineCount + ' 块）；disk/online @ ' + (Get-StepText $day 'disk/online'))
+}
+if ($isNight) {
+    Add-Row 'A17' 'FanControl 常态配置（白天）' 'MANUAL' ('夜间窗口，期望值正是 silent（match=' + $st.fan.match + ' current=' + $st.fan.currentProfile + '）；10:02 日链后重跑本脚本判定')
+} else {
+    Add-Row 'A17' 'FanControl 常态配置（白天）' $(if ($st.fan.match -eq 'normal') { 'PASS' } elseif ($st.fan.match -eq 'silent') { 'FAIL' } else { 'INFO' }) ('match=' + $st.fan.match + ' current=' + $st.fan.currentProfile)
+}
 
 # A16 DISKIDLE
 $wantAc = [int]$st.spinDown.configuredMinutes * 60
