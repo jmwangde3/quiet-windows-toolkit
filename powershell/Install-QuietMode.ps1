@@ -987,6 +987,28 @@ foreach ($tf in $taskFiles) {
     } catch { Write-Warn2 ("处理 " + $tf + " 失败：" + $_.Exception.Message) }
 }
 
+# 文件 ACL 只管「能不能读这个文件」；任务计划器的访问检查先过「文件夹」这一关。
+# 2026-11-13 实测：文件上给了 Users 读，普通用户枚举 216 个任务时名字带 Quiet 的
+# 一个都看不到 —— 因为 \QuietMode\ 与 \QuietHDD\ 这两个文件夹对象里没有 Users 的读 ACE。
+if ($apply) {
+    $grantScript = Join-Path $repoRoot 'powershell\Grant-TaskRead.ps1'
+    if (Test-Path -LiteralPath $grantScript) {
+        try {
+            $text = (& $grantScript -Apply 2>&1 | Out-String)
+            foreach ($line in ($text -split "`r?`n")) {
+                $t = $line.Trim()
+                if (-not $t) { continue }
+                if ($t -match '^FAIL') { Write-Bad $t }
+                elseif ($t -match '^(DONE|OK)\s') { Write-Ok $t }
+            }
+        } catch { Write-Warn2 ("任务文件夹授权失败：" + $_.Exception.Message) }
+    } else {
+        Write-Note ("缺少 " + $grantScript + "，跳过文件夹级授权（托盘非提权仍看不到任务状态）")
+    }
+} else {
+    Write-Note '将给 \QuietMode\ 与 \QuietHDD\ 文件夹加 Users 只读 ACE（托盘免提权才看得到任务）'
+}
+
 # ================================================================ 7 停用 v1
 Write-Step '停用 v1 闸门'
 $legacyStillOn = New-Object System.Collections.Generic.List[string]
