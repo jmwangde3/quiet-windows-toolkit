@@ -9,28 +9,48 @@
       文件夹 \QuietMode\ 与 \QuietHDD\ 的安全描述符里没有 Users 的读 ACE，
       里面的任务连枚举都出不来，托盘于是永远显示「已注册、无读取权限」。
 
-    做法：只往文件夹 DACL 里加一条 Users 只读 ACE（含 OI/CI 继承），
-    不改、不删任何已有 ACE；SDDL 原值打印出来，出问题可以照抄回去。
-    重复执行安全（已有 ACE 就跳过），非管理员执行只报计划不动手。
+    2026-11-13 22:0x 修复三处（21:58 那轮 2 个文件夹全 FAIL 的原因）：
+      1) ITaskFolder::GetFolder 不接受结尾反斜杠：'\QuietMode\' 直接
+         0x8007007B「文件名、目录名或卷标语法不正确」。必须归一化成 '\QuietMode'。
+      2) SDDL 的控制位（AI / PAI）必须紧跟 D:，ACE 只能插在它后面。旧代码
+         `-replace '^D:', ...` 会产出 D:(A;...;;;BU)AI(A;...;;;BA) 这种非法串。
+      3) 权限位从 GRGX 改成 FR：照抄 \Microsoft\Windows 给 AU 的读法（同机实测
+         非提权可枚举该文件夹下的任务），generic read 由服务端自己映射成任务权限。
+
+    做法：只往 DACL 里加一条 Users 只读 ACE（含 OI/CI 继承），不改、不删任何
+    已有 ACE；SDDL 原值打印出来，出问题可以照抄回去。文件夹改完再补每个任务
+    文件自己的只读 ACE（已有就不动）。重复执行安全，非管理员执行只报计划不动手。
+
+    2026-11-13 22:3x 追加实测：文件夹 ACE 对**已存在**的任务无效。
+      \QuietHDD\ 文件夹早就补了 (A;OICI;FR;;;BU)，里面的两个任务依旧 0x80070005 ——
+      因为每个任务在 HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\
+      TaskCache\Tree\<任务路径>\SD 里另存一份自相对安全描述符（二进制），
+      访问检查用的是这一份，注册那一刻就固化了。
+      → 加 -IncludeTasks：逐个任务读这份二进制 SD，追加一条 (A;;FR;;;BU) 再写回。
+        不删任务、不重注册、触发器与 principal 一个字节都不动；原值先备份。
 
     用法：
-      .\Grant-TaskRead.ps1                        # 演练：只说要改什么
-      .\Grant-TaskRead.ps1 -Apply                 # 真改（需要管理员）
+      .\Grant-TaskRead.ps1                 # 演练：只说要改什么
+      .\Grant-TaskRead.ps1 -Apply          # 真改（需要管理员）
+      .\Grant-TaskRead.ps1 -Check          # 只读自检：当前身份能枚举到几个任务
+      .\Grant-TaskRead.ps1 -Apply -IncludeTasks              # 连任务对象一起处理
       .\Grant-TaskRead.ps1 -Apply -Folders '\QuietMode\','\QuietHDD\'
 #>
 [CmdletBinding()]
 param(
     [string[]]$Folders = @('\QuietMode\', '\QuietHDD\'),
-    [switch]$Apply
+    [switch]$Apply,
+    [switch]$Check,
+    [switch]$IncludeTasks
 )
 
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
 
-# DACL_SECURITY_INFORMATION = 0x00000004。只要 DACL 段，SACL 不碰。
-$DaclOnly = 4
-# Users 只读 + 目录/对象继承：GR = 读，GX = 执行，OICI = 子对象继承
-$UsersReadAce = '(A;OICI;GRGX;;;BU)'
+$DaclOnly     = 4                        # DACL_SECURITY_INFORMATION，只碰 DACL
+$UsersReadAce = '(A;OICI;FR;;;BU)'       # Users 只读，含子对象继承
+$UsersSid     = 'S-1-5-32-545'           # BUILTIN\Users
+$TaskRoot     = Join-Path $env:SystemRoot 'System32\Tasks'
 
 $elevated = $false
 try {
@@ -39,23 +59,173 @@ try {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 } catch { }
 
+function ConvertTo-TaskFolderPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+    $p = $Path.Trim()
+    if (-not $p.StartsWith('\')) { $p = '\' + $p }
+    # 根是 '\'，不能剥；其余一律剥掉结尾反斜杠
+    while ($p.Length -gt 1 -and $p.EndsWith('\')) { $p = $p.Substring(0, $p.Length - 1) }
+    return $p
+}
+
+function Test-UsersReadAce {
+    param([string]$Sddl)
+    if ([string]::IsNullOrEmpty($Sddl)) { return $false }
+    return [bool]($Sddl -match '\(A;[^()]*;;;BU\)')
+}
+
+function Add-DaclAce {
+    param([string]$Sddl, [string]$Ace)
+    if ([string]::IsNullOrEmpty($Sddl)) { return 'D:' + $Ace }
+    if ($Sddl -eq 'D:NO_ACCESS_CONTROL') { return 'D:' + $Ace }
+    $m = [regex]::Match($Sddl, '^D:[A-Z]*')
+    if (-not $m.Success) { return $null }
+    return $m.Value + $Ace + $Sddl.Substring($m.Value.Length)
+}
+
+function Grant-TaskFileRead {
+    param([string]$FolderPath)
+
+    $stat = [pscustomobject]@{ Total = 0; Added = 0; Failed = 0 }
+    $leaf = $FolderPath.TrimStart('\')
+    if ([string]::IsNullOrEmpty($leaf)) { return $stat }
+    $dir = Join-Path $TaskRoot $leaf
+    if (-not (Test-Path -LiteralPath $dir)) { return $stat }
+
+    foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
+        $stat.Total++
+        try {
+            $fi = New-Object System.IO.FileInfo($file.FullName)
+            $sec = $fi.GetAccessControl()
+            $has = $false
+            foreach ($r in @($sec.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
+                if ($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -eq $UsersSid) { $has = $true; break }
+            }
+            if ($has) { continue }
+
+            $sidObj = New-Object System.Security.Principal.SecurityIdentifier($UsersSid)
+            $ace = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sidObj,
+                [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+                [System.Security.AccessControl.InheritanceFlags]::None,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)
+            $sec.AddAccessRule($ace) | Out-Null
+            $fi.SetAccessControl($sec)
+            $stat.Added++
+        } catch {
+            Write-Host ("      WARN 任务文件补授权失败：" + $file.Name + " -> " + $_.Exception.Message) -ForegroundColor Yellow
+            $stat.Failed++
+        }
+    }
+    return $stat
+}
+
+# ---------------------------------------------------------------- 任务对象 SD
+# Task Scheduler 为每个任务在 TaskCache\Tree\<路径>\SD 里另存一份自相对安全描述符，
+# 访问检查用这一份；文件夹 ACE 只影响「以后注册的任务」，改不动已注册任务的那份副本。
+$TaskCacheRoot    = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree'
+$UsersReadTaskAce = '(A;;FR;;;BU)'
+
+function Get-TaskCacheKey {
+    param([string]$FolderPath, [string]$TaskName, [bool]$Writable)
+    $leaf = $FolderPath.Trim('\')
+    if ([string]::IsNullOrEmpty($leaf)) { $sub = $TaskCacheRoot + '\' + $TaskName }
+    else { $sub = $TaskCacheRoot + '\' + $leaf + '\' + $TaskName }
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            [Microsoft.Win32.RegistryView]::Registry64)
+        return $base.OpenSubKey($sub, $Writable)
+    } catch { return $null }
+}
+
+function Read-TaskCacheSd {
+    param($Key)
+    if (-not $Key) { return $null }
+    try {
+        if (($Key.GetValueNames()) -notcontains 'SD') { return $null }
+        $kind = $Key.GetValueKind('SD')
+        $v = $Key.GetValue('SD')
+        if ($v -is [byte[]]) {
+            $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor($v, 0)
+            $sddl = [string]$raw.GetSddlForm([System.Security.AccessControl.AccessControlSections]::All)
+            return [pscustomobject]@{ Sddl = $sddl; IsBinary = $true; Bytes = $v; AceCount = $raw.DiscretionaryAcl.Count }
+        }
+        return [pscustomobject]@{ Sddl = [string]$v; IsBinary = $false; Bytes = $null; AceCount = ([regex]::Matches([string]$v, '\(A;')).Count }
+    } catch { return $null }
+}
+
+# 直接改 RawAcl 再序列化：字符串手术容易把 O:/G:/S: 段弄坏，这里一个字符都不碰。
+function Add-UsersReadToTaskSd {
+    param([byte[]]$Binary)
+    $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor($Binary, 0)
+    if ($null -eq $raw.DiscretionaryAcl) { throw '该任务的安全描述符里没有 DACL' }
+    # 让 SDDL 解析器自己算掩码：FR 是 FILE_GENERIC_READ，不等于 GR(0x80000000)，
+    # 手写常量会把 FR 写成 GR，权限看着给了、实际映射不到任务对象的读权限。
+    $probe = New-Object System.Security.AccessControl.RawSecurityDescriptor('D:' + $UsersReadTaskAce)
+    $ace = $probe.DiscretionaryAcl[0]
+    $acl = $raw.DiscretionaryAcl
+    $acl.InsertAce(0, $ace)
+    $raw.DiscretionaryAcl = $acl
+    $out = New-Object byte[] $raw.BinaryLength
+    $raw.GetBinaryForm($out, 0)
+    return $out
+}
+
+# 只读自检
+
+if ($Check) {
+    Write-Host ''
+    Write-Host '计划任务读取自检（只读）' -ForegroundColor White
+    Write-Host ("  当前身份 : " + [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+    Write-Host ("  管理员   : " + $elevated)
+    Write-Host ''
+    $bad = 0
+    foreach ($raw in $Folders) {
+        $path = ConvertTo-TaskFolderPath $raw
+        if (-not $path) { continue }
+        Write-Host ("[" + $path + "]")
+        $svc = $null
+        try {
+            $svc = New-Object -ComObject Schedule.Service
+            $svc.Connect()
+            $folder = $svc.GetFolder($path)
+            $tasks = @($folder.GetTasks(1))
+            Write-Host ("  OK   枚举到 " + $tasks.Count + " 个任务") -ForegroundColor Green
+            foreach ($t in $tasks) {
+                $stateName = @('Unknown', 'Disabled', 'Queued', 'Ready', 'Running')[[int]$t.State]
+                Write-Host ("       - " + $t.Name + "  [" + $stateName + "]")
+            }
+        } catch {
+            Write-Host ("  FAIL " + $_.Exception.Message) -ForegroundColor Red
+            $bad++
+        } finally {
+            if ($svc) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($svc) } catch { } }
+        }
+    }
+    Write-Host ''
+    if ($bad -gt 0) { Write-Host ("结果：" + $bad + " 个文件夹不可读") -ForegroundColor Red; exit 2 }
+    exit 0
+}
+
+# ---------------------------------------------------------------- 授权 / 演练
 Write-Host ''
 Write-Host '计划任务文件夹读取权限' -ForegroundColor White
 Write-Host ("  管理员 : " + $elevated)
 Write-Host ("  模式   : " + $(if ($Apply) { 'Apply' } else { 'DryRun（只报计划）' }))
 Write-Host ''
 
-if (-not ($Apply -and $elevated)) {
-    if ($Apply -and -not $elevated) {
-        Write-Host '  需要管理员：改任务计划器的安全描述符要提权。' -ForegroundColor Yellow
-    }
+if ($Apply -and -not $elevated) {
+    Write-Host '  需要管理员：改任务计划器的安全描述符要提权。' -ForegroundColor Yellow
+    Write-Host ''
 }
 
 $failed = 0
-foreach ($path in $Folders) {
+foreach ($raw in $Folders) {
+    $path = ConvertTo-TaskFolderPath $raw
     if (-not $path) { continue }
-    if (-not $path.StartsWith('\')) { $path = '\' + $path }
-    if (-not $path.EndsWith('\')) { $path = $path + '\' }
 
     Write-Host ("[" + $path + "]")
     $svc = $null
@@ -67,6 +237,7 @@ foreach ($path in $Folders) {
         $folder = $svc.GetFolder($path)
     } catch {
         Write-Host ("  FAIL 打不开文件夹：" + $_.Exception.Message) -ForegroundColor Red
+        Write-Host ("       已尝试路径：" + $path) -ForegroundColor DarkGray
         $failed++
         continue
     }
@@ -80,8 +251,13 @@ foreach ($path in $Folders) {
     }
     Write-Host ("  DACL 原值 : " + $before)
 
-    if ($before -match '\(A;[^()]*;;;BU\)') {
-        Write-Host '  OK   已有 Users 读权限，跳过' -ForegroundColor Green
+    if (Test-UsersReadAce $before) {
+        Write-Host '  OK   已有 Users 读权限，跳过文件夹' -ForegroundColor Green
+        if ($Apply -and $elevated) {
+            $r0 = Grant-TaskFileRead -FolderPath $path
+            Write-Host ("  任务文件 : 共 " + $r0.Total + " 个，补授权 " + $r0.Added + " 个")
+            if ($r0.Failed -gt 0) { $failed++ }
+        }
         continue
     }
     if (-not $Apply) {
@@ -93,9 +269,12 @@ foreach ($path in $Folders) {
         continue
     }
 
-    # 把 ACE 插在 D: 之后、已有 ACE 之前。列表顺序不影响允许类 ACE 的判定，
-    # 但保持「先加的新 ACE 在最前」便于人眼比对。
-    $after = $before -replace '^D:', ('D:' + $UsersReadAce)
+    $after = Add-DaclAce -Sddl $before -Ace $UsersReadAce
+    if (-not $after) {
+        Write-Host '  FAIL 安全描述符不是 D: 开头，拒绝改写' -ForegroundColor Red
+        $failed++
+        continue
+    }
     try {
         $folder.SetSecurityDescriptor($after, 0)
     } catch {
@@ -107,11 +286,159 @@ foreach ($path in $Folders) {
 
     $check = $null
     try { $check = [string]$folder.GetSecurityDescriptor($DaclOnly) } catch { }
-    if ($check -and $check -match '\(A;[^()]*;;;BU\)') {
-        Write-Host ("  DONE 已追加 : " + $check) -ForegroundColor Green
-    } else {
-        Write-Host '  FAIL 写入后回读不到 Users ACE' -ForegroundColor Red
+    if (-not $check) {
+        Write-Host '  FAIL 写入后回读不到安全描述符' -ForegroundColor Red
         $failed++
+        continue
+    }
+    if (-not (Test-UsersReadAce $check)) {
+        Write-Host '  FAIL 写入后回读不到 Users ACE' -ForegroundColor Red
+        Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+        $failed++
+        continue
+    }
+    # 原有 ACE 一条都不能少（防止 SetSecurityDescriptor 把 DACL 覆盖成只剩新 ACE）
+    $lost = 0
+    foreach ($m in [regex]::Matches($before, '\([AD];[^()]*\)')) {
+        if ($check.IndexOf($m.Value) -lt 0) { $lost++ }
+    }
+    if ($lost -gt 0) {
+        Write-Host ("  FAIL 写回后丢了 " + $lost + " 条原有 ACE") -ForegroundColor Red
+        Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+        $failed++
+        continue
+    }
+    Write-Host ("  DONE 已追加 : " + $check) -ForegroundColor Green
+
+    $r = Grant-TaskFileRead -FolderPath $path
+    Write-Host ("  任务文件 : 共 " + $r.Total + " 个，补授权 " + $r.Added + " 个")
+    if ($r.Failed -gt 0) { $failed++ }
+
+    if ($svc) { try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($svc) } catch { } }
+}
+
+# ---------------------------------------------------------------- 任务对象
+if ($IncludeTasks) {
+    Write-Host ''
+    Write-Host '任务对象读取权限（TaskCache\Tree\...\SD）' -ForegroundColor White
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backupDir = Join-Path $env:TEMP ('qm-tasksd-' + $stamp)
+
+    foreach ($raw in $Folders) {
+        $path = ConvertTo-TaskFolderPath $raw
+        if (-not $path) { continue }
+        Write-Host ("[" + $path + "]")
+
+        $leaf = $path.Trim('\')
+        $treePath = if ([string]::IsNullOrEmpty($leaf)) { $TaskCacheRoot } else { $TaskCacheRoot + '\' + $leaf }
+        $rootKey = $null
+        try {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                [Microsoft.Win32.RegistryHive]::LocalMachine,
+                [Microsoft.Win32.RegistryView]::Registry64)
+            $rootKey = $base.OpenSubKey($TaskCacheRoot, $false)
+        } catch { $rootKey = $null }
+        if (-not $rootKey) {
+            # TaskCache\Tree 默认只给 SYSTEM/Administrators 读，普通用户打不开很正常 ——
+            # 这不是「没注册」，别把权限问题报成不存在。
+            Write-Host '  SKIP 读不到 TaskCache\Tree（需要管理员；-Check 走 COM 那条路）' -ForegroundColor Yellow
+            continue
+        }
+        $topNames = @($rootKey.GetSubKeyNames())
+        if ($topNames -notcontains $leaf) {
+            $rootKey.Close()
+            Write-Host '  （TaskCache 里没有这个文件夹：任务未注册）' -ForegroundColor DarkGray
+            continue
+        }
+        $treeKey = $null
+        try { $treeKey = $rootKey.OpenSubKey($leaf, $false) } catch { $treeKey = $null }
+        $rootKey.Close()
+        if (-not $treeKey) {
+            Write-Host '  SKIP 打不开该文件夹的 TaskCache 键' -ForegroundColor Yellow
+            continue
+        }
+        $names = @($treeKey.GetSubKeyNames())
+        $treeKey.Close()
+        if ($names.Count -eq 0) {
+            Write-Host '  （没有子任务）' -ForegroundColor DarkGray
+            continue
+        }
+
+        $seen = 0; $done = 0; $bad = 0
+        foreach ($name in $names) {
+            $rk = Get-TaskCacheKey -FolderPath $path -TaskName $name -Writable $false
+            if (-not $rk) { continue }
+            $isTask = @($rk.GetValueNames()) -contains 'Path'
+            $rk.Close()
+            if (-not $isTask) { continue }      # 子文件夹，跳过
+            $seen++
+
+            $wk = Get-TaskCacheKey -FolderPath $path -TaskName $name -Writable ([bool]($Apply -and $elevated))
+            if (-not $wk) { Write-Host ("  FAIL 打不开 " + $name + " 的 TaskCache 键（需要管理员）") -ForegroundColor Red; $bad++; continue }
+            $sd = Read-TaskCacheSd $wk
+            if (-not $sd) { Write-Host ("  FAIL 读不到 " + $name + " 的安全描述符") -ForegroundColor Red; $wk.Close(); $bad++; continue }
+
+            if ($sd.Sddl -match '\(A;[^()]*;;;BU\)') {
+                Write-Host ("  OK   " + $name + " 已有 Users 读") -ForegroundColor Green
+                $wk.Close(); continue
+            }
+            if (-not $Apply) {
+                Write-Host ("  将追加 : " + $name + "  " + $UsersReadTaskAce + "（不改触发器、不重注册）") -ForegroundColor Yellow
+                $wk.Close(); continue
+            }
+            if (-not $elevated) {
+                Write-Host ("  SKIP " + $name + "（未提权）") -ForegroundColor Yellow
+                $wk.Close(); continue
+            }
+            if (-not $sd.IsBinary) {
+                Write-Host ("  FAIL " + $name + " 的 SD 不是二进制自相对格式，本脚本不猜格式") -ForegroundColor Red
+                $wk.Close(); $bad++; continue
+            }
+
+            try {
+                $newBytes = Add-UsersReadToTaskSd -Binary $sd.Bytes
+            } catch {
+                Write-Host ("  FAIL " + $name + " 构造新 SD 失败：" + $_.Exception.Message) -ForegroundColor Red
+                $wk.Close(); $bad++; continue
+            }
+
+            if (-not (Test-Path -LiteralPath $backupDir)) { New-Item -ItemType Directory -Path $backupDir -Force | Out-Null }
+            $bak = Join-Path $backupDir (($name -replace '[\\/:*?"<>|]', '_') + '.sd.bin')
+            [IO.File]::WriteAllBytes($bak, $sd.Bytes)
+
+            try { $wk.SetValue('SD', $newBytes, [Microsoft.Win32.RegistryValueKind]::Binary) }
+            catch {
+                Write-Host ("  FAIL 写入 " + $name + " 失败：" + $_.Exception.Message) -ForegroundColor Red
+                Write-Host ("       原值已备份：" + $bak) -ForegroundColor Yellow
+                $wk.Close(); $bad++; continue
+            }
+            $wk.Close()
+
+            $rd = Get-TaskCacheKey -FolderPath $path -TaskName $name -Writable $false
+            $after = Read-TaskCacheSd $rd
+            if ($rd) { $rd.Close() }
+            if (-not $after) {
+                Write-Host ("  FAIL " + $name + " 写入后回读不到 SD") -ForegroundColor Red
+                $bad++; continue
+            }
+            if ($after.Sddl -notmatch '\(A;[^()]*;;;BU\)') {
+                Write-Host ("  FAIL " + $name + " 回读仍没有 Users 读") -ForegroundColor Red
+                $bad++; continue
+            }
+            $expect = $sd.AceCount + 1
+            if ($after.AceCount -ne $expect) {
+                Write-Host ("  FAIL " + $name + " ACE 数不对：旧 " + $sd.AceCount + " 应为 " + $expect + "，实际 " + $after.AceCount) -ForegroundColor Red
+                $bad++; continue
+            }
+            Write-Host ("  DONE " + $name + "  ACE " + $sd.AceCount + " → " + $after.AceCount) -ForegroundColor Green
+            Write-Host ("       现值：" + $after.Sddl) -ForegroundColor DarkGray
+            $done++
+        }
+        Write-Host ("  任务对象 : 共 " + $seen + " 个，补授权 " + $done + " 个，失败 " + $bad + " 个")
+        if ($bad -gt 0) { $failed++ }
+    }
+    if ($Apply -and $elevated -and (Test-Path -LiteralPath $backupDir)) {
+        Write-Host ("  原值备份 : " + $backupDir) -ForegroundColor DarkGray
     }
 }
 
@@ -124,5 +451,7 @@ if (-not $Apply) {
     Write-Host '演练结束：系统状态未改变。加 -Apply（管理员）执行。' -ForegroundColor Yellow
 } else {
     Write-Host '完成。普通用户现在应能枚举到这些文件夹里的任务。' -ForegroundColor Green
+    if ($IncludeTasks) { Write-Host '      任务对象也已按需补上 Users 读（-IncludeTasks）。' -ForegroundColor Green }
+    Write-Host '复验：不要用管理员窗口，直接跑 .\Grant-TaskRead.ps1 -Check' -ForegroundColor DarkGray
 }
 exit 0

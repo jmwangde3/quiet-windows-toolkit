@@ -162,6 +162,15 @@ namespace QuietMode.Windows
             return st;
         }
 
+        /// <summary>
+        /// 任务对象的安全描述符：Administrators / SYSTEM 全控，普通用户只读。
+        /// Task Scheduler 在注册时把这份 SDDL 固化进
+        /// HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\&lt;路径&gt;\SD，
+        /// 访问检查用的是它；事后改任务文件（C:\Windows\System32\Tasks\...）的 ACL
+        /// 改不到这份副本。所以「普通用户能看任务状态」只能在注册这一步给。
+        /// </summary>
+        public const string TaskSddl = "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;BU)";
+
         /// <summary>注册（或覆盖）唯一任务。需要管理员。</summary>
         public static string Install(ScheduleSettings s, string root, bool apply, out string xml)
         {
@@ -186,7 +195,8 @@ namespace QuietMode.Windows
 
                 const int TASK_CREATE_OR_UPDATE = 6;
                 const int TASK_LOGON_SERVICE_ACCOUNT = 5;
-                folder.RegisterTask(TaskName, xml, TASK_CREATE_OR_UPDATE, "SYSTEM", null, TASK_LOGON_SERVICE_ACCOUNT, null);
+                // sddl 不能传 null：默认只给 BA/SY，未提权的托盘会拿到 0x80070005。
+                folder.RegisterTask(TaskName, xml, TASK_CREATE_OR_UPDATE, "SYSTEM", null, TASK_LOGON_SERVICE_ACCOUNT, TaskSddl);
                 return "";
             }
             catch (Exception ex)

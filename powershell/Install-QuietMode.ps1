@@ -949,42 +949,59 @@ if ($apply) {
 
 # ================================================================ 6 授权读取
 Write-Step '授予普通用户读取计划任务（托盘免提权才看得到状态）'
-$taskFiles = @(
-    (Join-Path $env:WINDIR 'System32\Tasks\QuietMode\QuietMode-Reconcile'),
-    (Join-Path $env:WINDIR 'System32\Tasks\QuietHDD\QuietHDD_NightGate'),
-    (Join-Path $env:WINDIR 'System32\Tasks\QuietHDD\QuietHDD_DiskGate')
-)
-$usersSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
-foreach ($tf in $taskFiles) {
-    $exists = Test-PathSafe $tf
-    if ($exists -eq $false) { Write-Note "不存在：$tf"; continue }
-    if ($exists -eq $null) { Write-Note ("无权访问 " + $tf + "（读不到 ≠ 不存在；Apply 时会以管理员重试）"); continue }
-    try {
-        $acl = Get-Acl -LiteralPath $tf
-        $hasRead = $false
-        foreach ($ace in $acl.Access) {
-            if ($ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $usersSid.Value -and
-                ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read) -ne 0) {
-                $hasRead = $true
-            }
-        }
-        if ($hasRead) { Write-Ok ("已有读取权限：" + (Split-Path -Leaf $tf)); continue }
-        if (-not $apply) { Write-Note ("将授予 Users 读取：" + (Split-Path -Leaf $tf)); continue }
 
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($usersSid, 'ReadAndExecute', 'Allow')
-        $acl.AddAccessRule($rule) | Out-Null
-        Set-Acl -LiteralPath $tf -AclObject $acl
-        $after = Get-Acl -LiteralPath $tf
-        $ok = $false
-        foreach ($ace in $after.Access) {
-            if ($ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $usersSid.Value -and
-                ($ace.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Read) -ne 0) {
-                $ok = $true
+# 2026-11-13 实测，三句话记住，别再走回头路：
+#   1) Task Scheduler 给每个任务在 HKLM\...\Schedule\TaskCache\Tree\<路径>\SD
+#      另存一份安全描述符，访问检查用的是这一份。
+#   2) 改任务文件 C:\Windows\System32\Tasks\... 的 ACL 改不到这份副本 ——
+#      旧版安装器就在这里白干了一轮，回读全是 OK，托盘照样 0x80070005。
+#   3) GetFolder('\QuietMode') 从来就打得开，卡住看到任务的是任务对象自己那条 SD。
+# 所以：文件夹补一条 Users 只读（以后新注册的任务能继承到），任务对象缺 ACE 就
+# 用 Fix-TaskVisibility.ps1 拿自己的 XML 重新注册一次（XML 原样，只换 sddl）。
+$taskCacheRoot = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree'
+$v2TaskKey = $taskCacheRoot + '\QuietMode\QuietMode-Reconcile'
+
+function Get-QmTaskCacheSddl {
+    param([string]$Key)
+    try {
+        $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($Key, $false)
+        if (-not $k) { return $null }
+        try {
+            if (($k.GetValueNames()) -notcontains 'SD') { return $null }
+            $v = $k.GetValue('SD')
+            if ($v -is [byte[]]) {
+                $raw = New-Object System.Security.AccessControl.RawSecurityDescriptor($v, 0)
+                return [string]$raw.GetSddlForm('Access')
             }
-        }
-        if ($ok) { Write-Ok ("已授予读取：" + (Split-Path -Leaf $tf)) }
-        else { Write-Bad ("授予读取后回读不到 ACE：" + (Split-Path -Leaf $tf)) }
-    } catch { Write-Warn2 ("处理 " + $tf + " 失败：" + $_.Exception.Message) }
+            return [string]$v
+        } finally { $k.Close() }
+    } catch { return $null }
+}
+
+$v2Sddl = Get-QmTaskCacheSddl $v2TaskKey
+if ($v2Sddl -and $v2Sddl -match '\(A;[^()]*;;;BU\)') {
+    Write-Ok '任务对象已含 Users 读 ACE'
+} elseif (-not $apply) {
+    Write-Note '任务对象缺 Users 读 ACE → Apply 时重新注册（XML 原样，只换 sddl）'
+} else {
+    $fixScript = Join-Path $repoRoot 'powershell\Fix-TaskVisibility.ps1'
+    if (Test-Path -LiteralPath $fixScript) {
+        try {
+            $text = (& $fixScript -Apply 2>&1 | Out-String)
+            $v2Sddl = Get-QmTaskCacheSddl $v2TaskKey
+            if ($v2Sddl -and $v2Sddl -match '\(A;[^()]*;;;BU\)') {
+                Write-Ok '任务对象已重新注册并含 Users 读 ACE'
+            } else {
+                Write-Bad '任务对象仍缺 Users 读 ACE（重新注册没生效）'
+                foreach ($line in ($text -split "`r?`n")) {
+                    $t = $line.Trim()
+                    if ($t -match '^FAIL') { Write-Note ('  ' + $t) }
+                }
+            }
+        } catch { Write-Warn2 ('重新注册任务失败：' + $_.Exception.Message) }
+    } else {
+        Write-Warn2 ('缺少 ' + $fixScript + '，托盘非提权仍看不到任务状态')
+    }
 }
 
 # 文件 ACL 只管「能不能读这个文件」；任务计划器的访问检查先过「文件夹」这一关。
@@ -994,7 +1011,7 @@ if ($apply) {
     $grantScript = Join-Path $repoRoot 'powershell\Grant-TaskRead.ps1'
     if (Test-Path -LiteralPath $grantScript) {
         try {
-            $text = (& $grantScript -Apply 2>&1 | Out-String)
+            $text = (& $grantScript -Apply -IncludeTasks 2>&1 | Out-String)
             foreach ($line in ($text -split "`r?`n")) {
                 $t = $line.Trim()
                 if (-not $t) { continue }
@@ -1006,7 +1023,7 @@ if ($apply) {
         Write-Note ("缺少 " + $grantScript + "，跳过文件夹级授权（托盘非提权仍看不到任务状态）")
     }
 } else {
-    Write-Note '将给 \QuietMode\ 与 \QuietHDD\ 文件夹加 Users 只读 ACE（托盘免提权才看得到任务）'
+    Write-Note '将给 \QuietMode\ 与 \QuietHDD\ 文件夹及其中的任务对象加 Users 只读（托盘免提权才看得到任务）'
 }
 
 # ================================================================ 7 停用 v1

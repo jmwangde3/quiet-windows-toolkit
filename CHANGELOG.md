@@ -23,6 +23,26 @@
   能拆掉含 `ChangePermissions` 的 Deny、加固后 Authenticated Users 也不再有写权、
   加固后 Administrators 仍保留完全控制（提权安装器还要写备份）。
 
+### 修复：托盘非提权看不到任务状态（任务对象自带一份安全描述符）
+
+- **改任务文件的 ACL 没用。** Task Scheduler 在注册那一刻把任务的 SD 固化进
+  `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\<路径>\SD`
+  （自相对二进制），访问检查用的是这一份；`C:\Windows\System32\Tasks\...` 的 ACL
+  只影响读文件。给文件加 `Users:ReadAndExecute` 后回读全 OK，托盘照样 0x80070005。
+- **只给文件夹 ACE 也不够。** `\QuietHDD\` 文件夹补了 `(A;OICI;FR;;;BU)`，里面
+  **已注册**的两个 v1 闸门依旧不可读 —— 文件夹 ACE 只让以后注册的任务继承到。
+- `SchedulerInstaller.Install` 现在注册时显式传 SDDL：
+  `D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;BU)`（管理员/系统全控，普通用户读）。
+  传 `null` 拿到的默认 SD 只有 BA/SY 两条。
+- 新增 `powershell/Fix-TaskVisibility.ps1`：安装器发现 v2 任务缺 Users 读时，用任务
+  自己的 XML 原样重新注册（只换 sddl），先备份到 `recovery\task-visibility-<时间戳>\`。
+- `Grant-TaskRead.ps1` 新增 `-IncludeTasks`：对**已注册**任务直接改 TaskCache 里那份
+  二进制 SD，追加一条 `(A;;FR;;;BU)` 再写回，不删任务、不重注册、触发器与 principal
+  一个字节都不动；原值先备份到 `%TEMP%\qm-tasksd-<时间戳>\`。
+- 踩过的坑写进脚本注释：`ITaskFolder::GetFolder` 不接受结尾反斜杠（0x8007007B）；
+  SDDL 的控制位（`AI`/`PAI`）必须紧跟 `D:`，ACE 只能插在它后面；
+  `FR` 是 `FILE_GENERIC_READ`，不等于 `GR`（`0x80000000`），手写掩码会写错权限。
+
 ## 2.0.0-rc.1 — 2026-11-12
 
 这一版只做可靠性、安装迁移与恢复，不加新功能。**基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)**：
