@@ -37,7 +37,12 @@ param(
 
     [switch]$KeepLegacy,
 
-    [switch]$Force
+    [switch]$Force,
+
+    # 只对 -Mode Rollback 生效：打印将回滚的动作，不删任务、不动 v1 闸门、不还原二进制。
+    # Rollback 没有 Apply 那样的两步语义，缺这个开关就等于「一敲就真回滚」——
+    # 2026-11-14 审阅发现它连 $apply 都没判过，是全脚本唯一没有演练路径的写操作分支。
+    [switch]$DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -333,7 +338,7 @@ if ($isAdmin) { $adminText = '是' }
 Write-Log (" 管理员   " + $adminText)
 if ($script:LogPath) { Write-Log (" 日志     " + $script:LogPath) }
 
-if ($Mode -ne 'DryRun' -and -not $isAdmin) {
+if ($Mode -ne 'DryRun' -and -not $isAdmin -and -not ($Mode -eq 'Rollback' -and $DryRun)) {
     Write-Log ''
     Write-Log '需要管理员权限：请右键「以管理员身份运行」，或从提权的终端执行。' 'Red'
     exit 5
@@ -345,10 +350,17 @@ $script:QmctlPath = $srcQmctl
 
 # ================================================================ ROLLBACK
 if ($Mode -eq 'Rollback') {
+    $rbApply = (-not $DryRun)
+    if (-not $rbApply) {
+        Write-Log ''
+        Write-Log '  [演练] -DryRun：只打印回滚动作，不删任务、不改闸门、不还原二进制。' 'Yellow'
+    }
+
     Write-Step '删除 v2 计划任务'
     $st = Get-TaskState -FullName $script:TaskFullName
     if ($st.Exists -eq $false) { Write-Note 'v2 任务不存在，跳过' }
     elseif ($st.Exists -eq $null) { Write-Warn2 ("无法确认 v2 任务状态：" + $st.Error) }
+    elseif (-not $rbApply) { Write-Note ('将删除 ' + $script:TaskFullName) }
     else {
         try {
             Unregister-ScheduledTask -TaskPath '\QuietMode\' -TaskName 'QuietMode-Reconcile' -Confirm:$false
@@ -363,6 +375,7 @@ if ($Mode -eq 'Rollback') {
         if ($s.Exists -eq $false) { Write-Note "$full 不存在（v1 未安装过？）"; continue }
         if ($s.Exists -eq $null) { Write-Bad ("$full 无法确认：" + $s.Error); continue }
         if ($s.Enabled -eq $true) { Write-Note "$full 已是启用状态"; continue }
+        if (-not $rbApply) { Write-Note "将启用 $full"; continue }
         try {
             $a = Set-LegacyEnabled -FullName $full -Enabled $true
             if ($a.Enabled -eq $true) { Write-Ok "$full 已启用" } else { Write-Bad "$full 启用后回读仍为禁用" }
@@ -370,23 +383,37 @@ if ($Mode -eq 'Rollback') {
     }
 
     Write-Step '恢复旧二进制（若存在安装备份）'
+    # 白名单而不是黑名单：备份目录里还有 migration-before.txt、task-*.xml 这类
+    # 审计产物，用 -notlike '*.json' 过滤会把它们一起搬进部署目录。
+    $restoreNames = @(
+        'qmctl.exe', 'qmctl.exe.config',
+        'QuietMode.Core.dll', 'QuietMode.Windows.dll',
+        'QuietMode.exe', 'QuietMode.exe.config'
+    )
     $latest = Get-ChildItem -Path (Join-Path $Root 'recovery') -Directory -Filter 'install-*' -ErrorAction SilentlyContinue |
         Sort-Object Name -Descending | Select-Object -First 1
     if (-not $latest) { Write-Note '没有找到安装备份，跳过' }
     else {
-        foreach ($f in @(Get-ChildItem -LiteralPath $latest.FullName -File -ErrorAction SilentlyContinue)) {
-            if ($f.Name -like '*.json' -or $f.Name -like '*.log') { continue }
-            $target = Join-Path $DeployDir $f.Name
-            Copy-Item -LiteralPath $f.FullName -Destination $target -Force
-            Write-Ok "还原 $($f.Name) ← $($latest.Name)"
+        foreach ($n in $restoreNames) {
+            $src = Join-Path $latest.FullName $n
+            if (-not (Test-Path -LiteralPath $src)) { continue }
+            if (-not $rbApply) { Write-Note ("将还原 " + $n + " ← " + $latest.Name); continue }
+            try {
+                Copy-Item -LiteralPath $src -Destination (Join-Path $DeployDir $n) -Force
+                Write-Ok ("还原 " + $n + " ← " + $latest.Name)
+            } catch { Write-Bad ("还原 " + $n + " 失败：" + $_.Exception.Message) }
         }
     }
 
     Write-Step '托盘'
-    Start-Tray -ExePath (Join-Path $DeployDir $script:ExeName) -Apply $true
+    Start-Tray -ExePath (Join-Path $DeployDir $script:ExeName) -Apply $rbApply
 
     Write-Log ''
-    Write-Log '回滚完成。config.json / baseline.json 保留在配置根，便于复诊后再决定是否清理。' 'Yellow'
+    if ($rbApply) {
+        Write-Log '回滚完成。config.json / baseline.json 保留在配置根，便于复诊后再决定是否清理。' 'Yellow'
+    } else {
+        Write-Log '演练完成：系统状态未改变。去掉 -DryRun 执行回滚。' 'Yellow'
+    }
     Write-Log ("失败 " + $script:Failures.Count + " 项 / 警告 " + $script:Warnings.Count + " 项")
     if ($script:Failures.Count -gt 0) { exit 2 } else { exit 0 }
 }
