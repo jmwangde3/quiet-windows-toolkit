@@ -17,16 +17,33 @@ Windows 本机「深夜静音」工具集：让风扇降速、机械硬盘整盘
 > 仓库内容已脱敏。所有本机账号名、用户目录、工作区路径、软件安装路径都替换成了
 > `<USER>` / `<FAN_ROOT>` / `<TOOLS>` / `<WORKSPACES>` 等占位符，部署时按你的机器改。
 
+**装之前先读 [`SAFETY.md`](SAFETY.md)。** 它会改你的计划任务、`SysMain` 服务、自动维护注册表、
+`DISKIDLE` 电源设置、目标磁盘的联机状态和 FanControl 当前配置——这六类全部列出；
+同时明确写清了绝不动的东西（Windows Update / Defender / 防火墙 / BitLocker / 证书服务、
+系统盘 / 页面文件盘 / 存储池成员）、三条失败语义（默认演练、写后必回读、未提权不做一半）
+和五级退路（手动静音 → 修复 → 重建 baseline → 卸载 → 回滚）。
+
 ## 目录
 
 ```
 .gitattributes              统一 LF 换行
+SAFETY.md                   会动什么 / 绝不动什么 / 出问题怎么退  ← 装之前先读这页
 enable-utf8-console.ps1     PS 5.1 控制台 UTF-8 输出
 set-winx-pwsh.ps1           PowerShell 7 终端配置辅助
 run_ps.py                  中文路径 + 嵌套引号安全的 PowerShell 调用包装
 ide-terminal-settings.jsonc VS Code / Cursor / Trae 终端配置示例
 fix-rtss-scanlinesync.ps1   RTSS 扫描线同步修复
-quiet-hdd-*.ps1             机械盘夜间闸门的安装 / 状态 / 暂停 / 磁盘号配置
+quiet-hdd-*.ps1             v1 遗留闸门脚本（v2 起不再使用，保留供回滚与对照）
+QuietMode.sln               Core / Windows / Cli / 托盘 / 单测
+src/
+  QuietMode.Core/           配置、校验、迁移、快照、状态机、计划器、验证器（无系统调用）
+  QuietMode.Windows/        WMI / 任务 COM / 注册表 / 电源 / 磁盘 / 调度注册（唯一系统层）
+  QuietMode.Cli/            qmctl 命令行
+powershell/                 安装 / 卸载 / 回滚 / 修复 / 验收脚本 + 7 个 .psm1 模块
+tests/
+  QuietMode.Core.Tests/     C# 单测（自建 runner，无外部依赖）
+  ps/                       Pester 5 测试（7 个模块的确定性逻辑）
+.github/workflows/ci.yml    windows-latest：build → C# 单测 → Pester
 QuietMode/
   Program.cs                托盘入口（单实例 / --diag / --status / --selftest）
   App/                      路径与日志、HKCU 自启、Win11 托盘常显
@@ -114,9 +131,11 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
 - 脱机 / 联机磁盘、启停计划任务需要管理员权限（托盘程序会按需弹 UAC）
 - FanControl（风扇曲线切换，用户态命名管道，无需管理员）
 
-## v2.0 重构（进行中）
+## v2.0 重构（已完成）
 
-完整规格见 [`docs/V2_SPEC.md`](docs/V2_SPEC.md)。按阶段推进，不一次性重写全部代码。
+完整规格见 [`docs/V2_SPEC.md`](docs/V2_SPEC.md)。Phase 0–7 逐段推进，每一段都在真机上跑过再进下一段，不一次性重写全部代码。
+
+**当前版本 `2.0.0`**：C# 单测 118 项、Pester 79 条断言、CI 在 `windows-latest` 上全绿、首夜实测 18 PASS / 0 FAIL、Rollback 与 Uninstall 均已在真机走过一遍并装回。
 
 - **Phase 0 代码审计与行为基线 — 已完成**
   - `docs/LEGACY_AUDIT.md`：全部脚本入口、计划任务、注册表 / 服务 / 电源 / 磁盘 / 进程 / FanControl IPC 修改点，依赖图，缺口清单；未识别的系统修改 = 0。
@@ -178,7 +197,12 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   - `Repair-QuietMode.ps1`：只诊断，`-Apply` 才做三件低风险修复（重注册任务 / 对齐一次 / 加固权限）；不动磁盘、不动维护任务、不重建 baseline。
   - `Test-Privilege.ps1`：配置根 ACL 只读体检 + 临时目录里的攻击自测（junction 识别、`..\` 逃逸、绝对路径、盘符、演练模式不改权限）。
   - 特权路径纪律（`PrivilegedIo`）：请求/结果文件名带随机 nonce、写请求 `FileMode.CreateNew` 绝不跟随预置文件、目录或结果文件是重解析点直接拒绝。
-- **Phase 7** 测试与 CI 收尾：基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)；CI 尚未接入。
+- **Phase 7 测试与 CI 收尾 — 已完成**
+  - C# 单测 **118 项**（`tests/QuietMode.Core.Tests`，自建 runner，无 xUnit / NUnit 依赖，`dotnet build` 后直接跑 exe）。
+  - Pester 5 测试 **79 条断言**（`tests/ps`，7 个模块），选点优先钉死历史故障而不是追覆盖率：`ConvertFrom-QmTaskHResult` 的 `267011`（从未运行）不得判成 NotPresent、`Resolve-QmSafeChild` 必须拒绝 `..`/盘符/ADS、`Get-QmDiskIdleSeconds` 的 AC/DC 顺序、`Format-QmSize` 的进位边界、维护任务启用位读不到时不得当「已停用」。
+  - CI `.github/workflows/ci.yml`（`windows-latest`）：全解决方案 `dotnet build` → C# 单测 → `qmctl --help` 产物校验 → 装 Pester 5.7 → `tests/ps` → 上传 NUnit XML。不需要 Visual Studio，SDK 风格 csproj + `Microsoft.NETFramework.ReferenceAssemblies` 足以构建 net481。
+  - `powershell/Verify-NightRun.ps1` 把规格 §12 的 A01–A24 变成可复跑的验收表，A24 不再人工，改读「ci.yml 在位 + 本机同批 Pester 全绿」。首夜实测 18 PASS / 0 FAIL / 5 待 10:02 日链。
+  - 基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)。
 
 ```powershell
 # 编译 + 自检（不改系统状态）

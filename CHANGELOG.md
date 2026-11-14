@@ -1,5 +1,57 @@
 # 变更记录
 
+## 2.0.0 — 2026-11-15
+
+v2 重构收尾。Phase 0–7 全部完成，`ProductInfo.Version` 从 `2.0.0-rc.1` 抬到 `2.0.0`。
+
+### 新增：安全边界文档
+
+- `SAFETY.md`（245 行）：写面清单 16 项逐条列到「哪个任务 / 哪个注册表值 / 哪个磁盘」；禁改范围 6 条前缀；磁盘硬阻断 6 种原因；失败语义 4 条（默认演练、写后必回读、未提权不做一半、Worker 不做判断）；三条不变量（单调度器 / 看不见不等于不存在 / 没回读不算成功）；五级退路（手动静音 → Repair → Reset-Baseline → Uninstall → Rollback）；已知风险 7 条诚实清单。
+- README 顶部加了指向；`目录` 段补齐 `src/` `tests/` `.github/` 真实结构。
+
+### 新增：PowerShell 模块的 Pester 测试（79 条断言）
+
+- `tests/ps/` 六个文件，覆盖 `Common` / `Config` / `Disk` / `Maintenance` / `Power` / `Security`。
+- 选点原则是钉死历史故障，不是追覆盖率：`ConvertFrom-QmTaskHResult` 的 `267011`（从未运行）不得判成 NotPresent；`Resolve-QmSafeChild` 必须拒绝 `..`、盘符前缀、`:`（NTFS ADS）；`Get-QmDiskIdleSeconds` 的「倒数第二 = AC、最后 = DC」顺序锁死；`Format-QmSize` 的 1023/1024 进位边界；维护任务启用位读不到时不得当「已停用」。
+- `Write-QuietModeLog` 断言追加而非覆盖、父目录自建、行首 `[yyyy-MM-dd HH:mm:ss] LEVEL` 格式。
+
+### 新增：Windows CI
+
+- `.github/workflows/ci.yml`，`windows-latest`：全解决方案 `dotnet build` → C# 单测 → `qmctl --help` 产物校验 → 装 Pester 5.7 → `tests/ps` → 上传 NUnit XML。
+- 不需要 Visual Studio：SDK 风格 csproj + `Microsoft.NETFramework.ReferenceAssemblies` 足以在 `dotnet build` 下构建 net481。
+
+### 变更：A24 不再是人工项
+
+- `Verify-NightRun.ps1` 的 A24 三段判定：缺 `ci.yml` → FAIL；有 `ci.yml` 但本机无 Pester 5.7+ → MANUAL；有 `ci.yml` 且本机同批用例全绿 → PASS。不查远端 API，验收脚本保持只读离线可用。
+
+### 新增：Rollback 的演练路径
+
+- `Install-QuietMode.ps1` 新增 `-DryRun`：Rollback 分支过去完全没有演练守卫（`$apply` 在分支之后才赋值），现在每个写操作都判。
+- 权限门放行「Rollback + DryRun」的非提权演练。
+- 备份还原从黑名单（跳过 `*.json` / `*.log`）改**白名单**（六个二进制文件名）—— 旧逻辑会把 `migration-before.txt` 复制进部署目录。
+
+### 修复：删掉 v2 任务后谎报「重复调度」
+
+- `SchedulerStatus.Conflict` 在 `Exists == false` 时直接返回 false。回滚后 v2 任务已删、v1 闸门启用，旧逻辑仍报「存在重复调度」并让 `task status` 退出码 2 —— 一次完全成功的回滚在脚本看来是失败。
+- `Exists == null`（任务读不到）**保持保守报冲突**：看不见不等于不存在。
+- `ToText()` 新增回滚态两个分支，并引入 `LegacyActive` 区分「v1 接管」与「当前没有调度器」。
+- `Uninstall-QuietMode.ps1` 第 160 行读同一个标志，旧逻辑让每次正常卸载都多一条假 WARN。
+
+### 修复：`state.json` 说真话
+
+- `controllerState` 过去只在 `run.Decision != null`（非 `none`）时写回，一次 `action=none` 的心跳就会让它永远停在 `EnteringNight` —— `reconcile.log` 与 `qmctl status` 显示 `NightActive`，状态文件却说还在进夜。现在收尾落到稳定态，版本号抬到当前值。
+
+### 修复：安装器的中文输出乱码
+
+- `Install-QuietMode.ps1` 是 17 个脚本里唯一没设 `Console.OutputEncoding` 的那个。`qmctl` 自己按 UTF-8 输出，提权会话按 936 解码，日志里就出现 `宸叉敞鍐?`。同一台机器同一 exe 的对照实测确认后补上该行。
+
+### 实测记录
+
+- 首夜（11-14 23:58）五步链 18 秒跑完：`maintenance/night` 23:58:01 → `verify/night` 23:58:19，5/5 全 `done`，`verdict=Ok`。
+- 之后 00:08、00:18 两次 10 分钟心跳均为 `action=none` —— 手动静音不再重跑整条夜链。
+- 验收表 18 PASS / 0 FAIL / 5 待 10:02 日链（A11 A12 A13 A14 A17）。
+- `Install -Mode Rollback` 与 `Uninstall -Mode Apply` 均已真机跑过并装回：回滚后二进制回到 58,880 / 133,120，`migration-before.txt` 未进部署目录；卸载后八条判据（v2 任务消失、5 盘 Online、7 项维护 enabled、SysMain `Start=2`/Running、`MaintenanceBoundary=10`、`WakeUp=0`、DISKIDLE 1200s、托盘退出）全部实测通过。
+
 ## 2.0.0-rc.3 — 2026-11-14
 
 ### 修复：手动静音每十分钟把整条夜间链重跑一遍
