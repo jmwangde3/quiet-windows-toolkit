@@ -90,7 +90,7 @@ namespace QuietMode.Core.Models
         {
             QuietModeState s = new QuietModeState();
             if (o == null) return s;
-            s.SchemaVersion = o.GetInt("schemaVersion", 1);
+            // 版本号在函数末尾统一盖成当前值，见那里的说明。
             s.ModeOn = o.GetBool("modeOn", false);
             s.ModeOnSinceUtc = o.GetString("modeOnSinceUtc", "");
             s.SchedulePaused = o.GetBool("schedulePaused", false);
@@ -120,6 +120,12 @@ namespace QuietMode.Core.Models
             s.LastBootReconcileUtc = o.GetString("lastBootReconcileUtc", "");
             JsonObject r = o.GetObject("recovery");
             if (r != null) s.Recovery = RecoveryProgress.FromJson(r);
+
+            // 文件里的版本号只是「写下它的那一版」，不代表字段语义。这组字段从没改过名、
+            // 缺字段一律取默认值，所以读完就不存在旧格式要兼容了 —— 直接盖上当前版本号。
+            // 早先照抄文件值，state.json 永久停在安装那天的 3，与代码里的 5 对不上，
+            // 排查时白花时间去怀疑「是不是旧二进制还在跑」。
+            s.SchemaVersion = CurrentSchemaVersion;
             return s;
         }
     }

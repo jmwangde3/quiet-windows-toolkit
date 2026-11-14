@@ -42,6 +42,24 @@ namespace QuietMode.Core.Scheduling
             }
         }
 
+        /// <summary>
+        /// 一条链跑完之后，控制器实际停在哪个状态。
+        ///
+        /// 决策给出的 State 是「跑之前打算进哪个状态」（EnteringNight / EnteringDay）。
+        /// 跑成功了却不改成稳定态，state.json 就会整夜写着「正在进入夜间」、
+        /// 整个白天写着「正在恢复白天」，跟实际相位永远差一格，排查时很误导。
+        /// 验证没通过才保留过渡态或降级态 —— 那时候确实还没落地。
+        /// </summary>
+        public static ControllerState Settle(string action, bool verificationOk, ControllerState decided)
+        {
+            if (string.Equals(action, "night", StringComparison.OrdinalIgnoreCase))
+                return verificationOk ? ControllerState.NightActive : ControllerState.NightDegraded;
+            if (string.Equals(action, "day", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(action, "restore", StringComparison.OrdinalIgnoreCase))
+                return verificationOk ? ControllerState.DayActive : ControllerState.EnteringDay;
+            return decided;
+        }
+
         public static bool IsNight(ControllerState s)
         {
             return s == ControllerState.NightActive || s == ControllerState.NightDegraded

@@ -424,7 +424,15 @@ namespace QuietMode.Windows
                         ? run.Verification.Problems.GetRange(0, 20)
                         : run.Verification.Problems);
                 StateMachine.ApplyRun(state, run.Action, verdict, run.Error, DateTime.UtcNow, nightOk);
-                if (run.Decision != null) state.ControllerState = run.Decision.State.ToString();
+                // 写「跑完之后停在哪」，不是「跑之前打算进哪」：照抄决策值会让 state.json
+                // 整夜停在 EnteringNight、整个白天停在 EnteringDay，与实机相位差一格。
+                if (run.Decision != null)
+                {
+                    state.ControllerState = ControllerStates.Settle(
+                        run.Action,
+                        run.Verification != null && run.Verification.Verdict == ReconcileVerdict.Ok,
+                        run.Decision.State).ToString();
+                }
                 new StateStore(paths).Save(state);
                 run.StateSaved = true;
             }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using QuietMode.Core.Maintenance;
 using QuietMode.Core.Configuration;
+using QuietMode.Core.Json;
 using QuietMode.Core.Models;
 using QuietMode.Core.Scheduling;
 
@@ -696,6 +697,56 @@ namespace QuietMode.Core.Tests
                 ReconcileVerification v = ReconcileVerifier.Verify("night", cfg, new BaselineSnapshot(), new SystemObservation(), null, fan);
                 Eq(ReconcileVerdict.Ok, v.Verdict);
                 Eq("NightActive", v.VerdictText);
+            });
+
+            // 2026-11-15 00:15 实测发现：夜间链跑完后 state.json 里 controllerState 仍写着
+            // EnteringNight（决策值），整夜与实机相位差一格。收尾必须落到稳定态。
+            Run("状态：链跑完后控制器落到稳定态而不是过渡态", delegate
+            {
+                Eq(ControllerState.NightActive,
+                   ControllerStates.Settle("night", true, ControllerState.EnteringNight));
+                Eq(ControllerState.DayActive,
+                   ControllerStates.Settle("day", true, ControllerState.EnteringDay));
+                Eq(ControllerState.DayActive,
+                   ControllerStates.Settle("restore", true, ControllerState.EnteringDay));
+                Eq(ControllerState.NightActive,
+                   ControllerStates.Settle("NIGHT", true, ControllerState.EnteringNight));
+            });
+
+            Run("状态：验证没过就保留过渡态或降级态", delegate
+            {
+                Eq(ControllerState.NightDegraded,
+                   ControllerStates.Settle("night", false, ControllerState.EnteringNight));
+                Eq(ControllerState.EnteringDay,
+                   ControllerStates.Settle("day", false, ControllerState.EnteringDay));
+                // none / verify 不改相位：决策说手动静音，就不许被收尾逻辑改成白天
+                Eq(ControllerState.ManualQuiet,
+                   ControllerStates.Settle("none", true, ControllerState.ManualQuiet));
+                Eq(ControllerState.SchedulePaused,
+                   ControllerStates.Settle("verify", true, ControllerState.SchedulePaused));
+            });
+
+            Run("状态：读完旧文件后 schemaVersion 抬到当前值", delegate
+            {
+                JsonObject o = new JsonObject();
+                o.Set("schemaVersion", 3);
+                o.Set("modeOn", true);
+                o.Set("lastVerdict", "Ok");
+                QuietModeState st = QuietModeState.FromJson(o);
+                Eq(QuietModeState.CurrentSchemaVersion, st.SchemaVersion);
+                True(st.SchemaVersion > 3, "旧文件里的 3 必须被抬到当前版本，否则排查会怀疑旧二进制还在跑");
+                Eq(true, st.ModeOn);
+                Eq("Ok", st.LastVerdict);
+            });
+
+            Run("状态：往返一圈版本号不低于当前值", delegate
+            {
+                QuietModeState st = new QuietModeState();
+                st.ModeOn = false;
+                st.ControllerState = "NightActive";
+                QuietModeState back = QuietModeState.FromJson(st.ToJson());
+                Eq(QuietModeState.CurrentSchemaVersion, back.SchemaVersion);
+                Eq("NightActive", back.ControllerState);
             });
         }
 
