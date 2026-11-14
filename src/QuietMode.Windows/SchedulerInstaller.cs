@@ -41,15 +41,33 @@ namespace QuietMode.Windows
         /// <summary>
         /// 是否可能存在重复调度。读不到就按「可能有」处理 —— 不能把「看不见」当成「不存在」，
         /// 这正是 v1 那次「10:02 没联机」的根因之一。
+        ///
+        /// 例外：v2 任务明确不存在时不算冲突。回滚和卸载都会先删 v2 再让 v1 接管，
+        /// 那时没有第二个调度器可与 v1 重复。2026-11-14 14:07 那次回滚后这里仍报
+        /// 「存在重复调度」并让 <c>task status</c> 返回退出码 2，卸载脚本还多出一条假 WARN。
         /// </summary>
         public bool Conflict
         {
             get
             {
+                if (Exists == false) return false;
                 foreach (TaskQueryResult t in Legacy)
                 {
                     if (!t.Exists.HasValue) return true;
                     if (t.Exists.Value && t.Enabled != false) return true;
+                }
+                return false;
+            }
+        }
+
+        /// <summary>v1 遗留闸门里确实有「确认启用」的条目：回滚态靠它区分「v1 接管」与「全空」。</summary>
+        public bool LegacyActive
+        {
+            get
+            {
+                foreach (TaskQueryResult t in Legacy)
+                {
+                    if (t.Exists == true && t.Enabled == true) return true;
                 }
                 return false;
             }
@@ -80,11 +98,23 @@ namespace QuietMode.Windows
                 sb.AppendLine("  " + LegacyNames[i] + " : " + s + " / " + e
                               + (string.IsNullOrEmpty(t.Error) ? "" : "（" + t.Error + "）"));
             }
-            sb.AppendLine("结论：" + (Conflict
-                ? (LegacyUnknown
-                    ? "无法确认 v1 闸门是否仍在启用（需要管理员权限读取 \\QuietHDD\\）；按「可能有重复调度」处理"
-                    : "存在重复调度（v1 闸门仍在启用）")
-                : "没有检测到重复调度"));
+            string verdict;
+            if (Exists == false)
+            {
+                // 回滚 / 卸载后的正常形态：v2 已删，看 v1 是否在接管。
+                verdict = LegacyActive
+                    ? "v2 未注册；调度由 v1 闸门接管（回滚态，不是冲突）"
+                    : "v2 未注册；v1 闸门也未启用（当前没有调度器）";
+            }
+            else
+            {
+                verdict = Conflict
+                    ? (LegacyUnknown
+                        ? "无法确认 v1 闸门是否仍在启用（需要管理员权限读取 \\QuietHDD\\）；按「可能有重复调度」处理"
+                        : "存在重复调度（v1 闸门仍在启用）")
+                    : "没有检测到重复调度";
+            }
+            sb.AppendLine("结论：" + verdict);
             return sb.ToString().TrimEnd();
         }
     }

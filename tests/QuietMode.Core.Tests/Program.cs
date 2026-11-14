@@ -53,6 +53,7 @@ namespace QuietMode.Core.Tests
             RunMaintenanceTests();
             RunSchedulingTests();
             RunTrayContractTests();
+            RunSchedulerStatusTests();
 
             Console.WriteLine();
             Console.WriteLine("通过 " + _pass + " / 失败 " + _fail);

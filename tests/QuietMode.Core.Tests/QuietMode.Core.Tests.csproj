@@ -20,6 +20,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\QuietMode.Core\QuietMode.Core.csproj" />
+    <!-- 只为了 SchedulerStatus 这类纯判定逻辑：不碰 COM，构造对象之后全是属性计算。 -->
+    <ProjectReference Include="..\..\src\QuietMode.Windows\QuietMode.Windows.csproj" />
   </ItemGroup>
 
   <ItemGroup>
