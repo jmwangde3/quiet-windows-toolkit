@@ -54,12 +54,15 @@ try { $st = $statusJson | ConvertFrom-Json } catch {
 
 # worker.log → 每次运行（日期 时间 相位 结果 步号 步骤名）
 $runs = @()
+$seq = 0
 if (Test-Path -LiteralPath $workerLog) {
     $rx = '^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+\[(night|day)\]\s+(\S+)\s+(\d+)\s+(\S+)\s*$'
     foreach ($line in (Get-Content -LiteralPath $workerLog -Encoding UTF8)) {
         $m = [regex]::Match($line, $rx)
         if (-not $m.Success) { continue }
+        $seq++
         $runs += [pscustomobject]@{
+            Seq    = $seq
             At     = [datetime]($m.Groups[1].Value + ' ' + $m.Groups[2].Value)
             Phase  = $m.Groups[3].Value
             Result = $m.Groups[4].Value
@@ -69,14 +72,59 @@ if (Test-Path -LiteralPath $workerLog) {
     }
 }
 
-function Get-LastChain {
+function ConvertTo-Minutes {
+    param([string]$Hhmm)
+    if ($Hhmm -match '^(\d{1,2}):(\d{2})$') { return ([int]$Matches[1] * 60 + [int]$Matches[2]) }
+    return -1
+}
+
+# 一条链 = 从步号 1 开始到下一次步号 1 之前。
+# 排序必须带 Seq 兜底：几步常常落在同一秒，而 Sort-Object 对相同键的顺序不稳定，
+# 只按时间排会把 12:42:22 的 5 步打散成 1 步 + 2 步 + 另外一批。
+function Get-Chains {
     param([string]$Phase)
-    $mine = @($runs | Where-Object { $_.Phase -eq $Phase } | Sort-Object At)
-    if ($mine.Count -eq 0) { return $null }
-    # 以「步号 1」为界切分批次，取最后一批
-    $start = 0
-    for ($i = 0; $i -lt $mine.Count; $i++) { if ($mine[$i].StepNo -eq 1) { $start = $i } }
-    return @($mine[$start..($mine.Count - 1)])
+    $mine = @($runs | Where-Object { $_.Phase -eq $Phase } |
+              Sort-Object -Property @{Expression = 'At'; Ascending = $true},
+                                    @{Expression = 'Seq'; Ascending = $true})
+    $chains = New-Object System.Collections.ArrayList
+    $cur = $null
+    foreach ($r in $mine) {
+        if ($r.StepNo -eq 1 -or $null -eq $cur) {
+            if ($null -ne $cur -and $cur.Count -gt 0) { [void]$chains.Add($cur) }
+            $cur = New-Object System.Collections.ArrayList
+        }
+        [void]$cur.Add($r)
+    }
+    if ($null -ne $cur -and $cur.Count -gt 0) { [void]$chains.Add($cur) }
+    return , $chains
+}
+
+function Get-LastChain {
+    param([string]$Phase, [int]$AnchorMinutes = -1, [int]$AnchorWindow = 45, [datetime]$Since = [datetime]::MinValue)
+    $chains = Get-Chains $Phase
+    if ($chains.Count -eq 0) { return $null }
+    if ($AnchorMinutes -ge 0) {
+        # 只认「按点触发」的那一次：起点落在 anchor 之后 AnchorWindow 分钟内（跨午夜按环形算）。
+        for ($i = $chains.Count - 1; $i -ge 0; $i--) {
+            $c = $chains[$i]
+            if ($null -eq $c -or $c.Count -eq 0) { continue }
+            if ($c[0].At -lt $Since) { continue }
+            $mins = $c[0].At.Hour * 60 + $c[0].At.Minute
+            $delta = ($mins - $AnchorMinutes + 1440) % 1440
+            if ($delta -le $AnchorWindow) { return $c }
+        }
+        return $null
+    }
+    return $chains[$chains.Count - 1]
+}
+
+# 锚点时间「最近一次」应当发生在什么时候：今天这个点还没到，就算昨天那次。
+function Get-LastAnchorTime {
+    param([int]$Minutes)
+    $now = Get-Date
+    $t = $now.Date.AddMinutes($Minutes)
+    if ($t -gt $now) { $t = $t.AddDays(-1) }
+    return $t
 }
 
 function Test-Chain {
@@ -108,8 +156,14 @@ function Get-StepText {
     return ($s[-1].At.ToString('HH:mm:ss') + ' ' + $s[-1].Result)
 }
 
-$night = Get-LastChain 'night'
-$day = Get-LastChain 'day'
+# A01/A11 判的是「按点自动触发」的那一次，不能被「后来手动补跑的一次」冒充。
+# 2026-11-14 中午开机把夜间链跑了一遍，原来按「最近一次」取就把那条当成了 23:58 的夜跑。
+$nightStartMin = ConvertTo-Minutes $st.schedule.nightStart
+$dayStartMin = ConvertTo-Minutes $st.schedule.dayStart
+$nightSched = if ($nightStartMin -ge 0) { Get-LastChain 'night' -AnchorMinutes $nightStartMin -Since (Get-LastAnchorTime $nightStartMin) } else { $null }
+$daySched = if ($dayStartMin -ge 0) { Get-LastChain 'day' -AnchorMinutes $dayStartMin -Since (Get-LastAnchorTime $dayStartMin) } else { $null }
+$night = if ($nightSched) { $nightSched } else { Get-LastChain 'night' }
+$day = if ($daySched) { $daySched } else { Get-LastChain 'day' }
 $nightChk = Test-Chain $night $nightSteps
 $dayChk = Test-Chain $day $daySteps
 
@@ -137,15 +191,28 @@ $allOffline = ($targets.Count -gt 0 -and $offlineCount -eq $targets.Count)
 $allMatched = ($targets.Count -gt 0 -and @($targets | Where-Object { -not $_.matched }).Count -eq 0)
 
 # A01 / A02 / A05 / A07 / A08 —— 夜链分步
-Add-Row 'A01' '23:58 自动进入夜间模式' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('夜链 ' + $nightChk.Detail + '；' + $nightChk.Text)
-Add-Row 'A02' '目标维护任务全部停止并禁用' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('maintenance/night @ ' + (Get-StepText $night 'maintenance/night'))
-Add-Row 'A07' '配置硬盘全部 Offline（夜间）' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('disk/offline @ ' + (Get-StepText $night 'disk/offline'))
-Add-Row 'A08' 'FanControl 静音配置生效（夜间）' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('fan/silent @ ' + (Get-StepText $night 'fan/silent'))
+if ($nightSched) {
+    Add-Row 'A01' '23:58 自动进入夜间模式' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('夜链 ' + $nightChk.Detail + '；' + $nightChk.Text)
+    Add-Row 'A02' '目标维护任务全部停止并禁用' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('maintenance/night @ ' + (Get-StepText $night 'maintenance/night'))
+    Add-Row 'A07' '配置硬盘全部 Offline（夜间）' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('disk/offline @ ' + (Get-StepText $night 'disk/offline'))
+    Add-Row 'A08' 'FanControl 静音配置生效（夜间）' $(if ($nightChk.Ok) { 'PASS' } else { 'FAIL' }) ('fan/silent @ ' + (Get-StepText $night 'fan/silent'))
+} else {
+    $latestNight = if ($night) { $night[0].At.ToString('MM-dd HH:mm:ss') + '（' + $nightChk.Text + '）' } else { '无' }
+    Add-Row 'A01' '23:58 自动进入夜间模式' 'FAIL' ('没有起点落在夜开始后 45 分钟内的夜链；最近一次夜链 ' + $latestNight)
+    Add-Row 'A02' '目标维护任务全部停止并禁用' 'MANUAL' '按点夜链缺失，无从核对'
+    Add-Row 'A07' '配置硬盘全部 Offline（夜间）' 'MANUAL' '按点夜链缺失，无从核对'
+    Add-Row 'A08' 'FanControl 静音配置生效（夜间）' 'MANUAL' '按点夜链缺失，无从核对'
+}
 
 # A11 / A12 / A17 —— 日链
 # A12 / A17 判的是「白天应有的状态」，夜里跑必然看到相反值。这类断言按相位取：
 # 夜里只报 MANUAL（磁盘本来就该离线、风扇本来就该静音），把 PASS/FAIL 留给日链之后。
-Add-Row 'A11' '10:02 自动进入白天模式' $(if ($dayChk.Ok) { 'PASS' } else { 'FAIL' }) ('日链 ' + $dayChk.Detail + '；' + $dayChk.Text)
+if ($daySched) {
+    Add-Row 'A11' '10:02 自动进入白天模式' $(if ($dayChk.Ok) { 'PASS' } else { 'FAIL' }) ('日链 ' + $dayChk.Detail + '；' + $dayChk.Text)
+} else {
+    $latestDay = if ($day) { $day[0].At.ToString('MM-dd HH:mm:ss') + '（' + $dayChk.Text + '，非按点触发）' } else { '无' }
+    Add-Row 'A11' '10:02 自动进入白天模式' 'MANUAL' ('10:02 那次没有执行记录（当时可能未开机）；最近一次日链 ' + $latestDay)
+}
 if ($isNight) {
     Add-Row 'A12' '磁盘全部 Online（白天）' 'MANUAL' ('夜间窗口，磁盘按设计应为 Offline（现 ' + $offlineCount + '/' + $targets.Count + ' 离线）；10:02 日链后重跑本脚本判定')
 } else {
@@ -350,8 +417,8 @@ Write-Host ''
 Write-Host '========== QuietMode 验收（只读） ==========' -ForegroundColor White
 Write-Host ('  现在     : ' + $now.ToString('yyyy-MM-dd HH:mm:ss') + '  窗口=' + $st.window.band + '  控制器=' + $st.controller.state)
 Write-Host ('  配置     : 夜 ' + $st.schedule.nightStart + ' → 日 ' + $st.schedule.dayStart + '  夜间=' + $st.window.isNight)
-Write-Host ('  最近夜链 : ' + $(if ($night) { $night[0].At.ToString('MM-dd HH:mm:ss') } else { '-' }) + '  ' + $nightChk.Text)
-Write-Host ('  最近日链 : ' + $(if ($day) { $day[0].At.ToString('MM-dd HH:mm:ss') } else { '-' }) + '  ' + $dayChk.Text)
+Write-Host ('  夜链     : ' + $(if ($night) { $night[0].At.ToString('MM-dd HH:mm:ss') } else { '-' }) + '  ' + $nightChk.Text + $(if ($nightSched) { '  [按点]' } else { '  [非按点]' }))
+Write-Host ('  日链     : ' + $(if ($day) { $day[0].At.ToString('MM-dd HH:mm:ss') } else { '-' }) + '  ' + $dayChk.Text + $(if ($daySched) { '  [按点]' } else { '  [非按点]' }))
 Write-Host ('  心跳     : 近 ' + $Hours + ' 小时 ' + $beats.Count + ' 条，其中夜间 ' + $nightBeats.Count + ' 条，非 Ok ' + $badBeats.Count + ' 条')
 Write-Host ''
 Write-Host ('  {0,-5} {1,-28} {2,-7} {3}' -f '编号', '验收项', '结论', '证据')
@@ -383,8 +450,8 @@ if ($Md) {
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('- 生成时间：' + $now.ToString('yyyy-MM-dd HH:mm:ss'))
     [void]$sb.AppendLine('- 窗口：' + $st.window.band + ' / 控制器：' + $st.controller.state + '（' + $st.controller.text + '）')
-    [void]$sb.AppendLine('- 最近夜链：' + $(if ($night) { $night[0].At.ToString('yyyy-MM-dd HH:mm:ss') } else { '-' }) + '，' + $nightChk.Text)
-    [void]$sb.AppendLine('- 最近日链：' + $(if ($day) { $day[0].At.ToString('yyyy-MM-dd HH:mm:ss') } else { '-' }) + '，' + $dayChk.Text)
+    [void]$sb.AppendLine('- 夜链：' + $(if ($night) { $night[0].At.ToString('yyyy-MM-dd HH:mm:ss') } else { '-' }) + '，' + $nightChk.Text + $(if ($nightSched) { '（按点触发）' } else { '（非按点触发）' }))
+    [void]$sb.AppendLine('- 日链：' + $(if ($day) { $day[0].At.ToString('yyyy-MM-dd HH:mm:ss') } else { '-' }) + '，' + $dayChk.Text + $(if ($daySched) { '（按点触发）' } else { '（非按点触发）' }))
     [void]$sb.AppendLine('- 汇总：PASS ' + $pass + ' / FAIL ' + $fail + ' / 待人工 ' + $manual)
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('| 编号 | 验收项 | 结论 | 证据 |')
