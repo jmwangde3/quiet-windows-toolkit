@@ -2,7 +2,7 @@
 <#
     Verify-NightRun.ps1 — QuietMode v2 夜跑/日回验收（只读，不需要管理员）。
 
-    把 docs/V2_SPEC.md 第 12 节的验收项 A01–A23 里能自动判定的部分，
+    把 docs/V2_SPEC.md 第 12 节的验收项 A01–A24 里能自动判定的部分，
     对着「worker.log 的分步执行记录 + reconcile.log 的心跳 + state.json +
     qmctl --json status 的实时观测」逐条给出结论，失败项直接指出缺哪一步。
 
@@ -250,8 +250,52 @@ $consistent = $true
 if ($st.controller.targetNight -or $st.controller.state -like '*Night*') { $consistent = $allOffline } else { $consistent = -not $allOffline }
 Add-Row 'A23' '状态显示与实机一致' $(if ($consistent) { 'PASS' } else { 'FAIL' }) ('controller=' + $st.controller.state + '(' + $claim + ') 实测离线 ' + $offlineCount + '/' + $targets.Count)
 
-# A24 CI
-Add-Row 'A24' 'CI 自动测试通过' 'MANUAL' '看 GitHub Actions（分支 codex/quietmode-v2-rc）'
+# A24 CI：配置文件在 + 本机能跑通等价的 Pester（CI 的 Pester 步骤与这里同一批用例）
+$repoRoot = Split-Path $PSScriptRoot -Parent
+$ciYml = Join-Path $repoRoot '.github\workflows\ci.yml'
+$psTests = Join-Path $repoRoot 'tests\ps'
+$ciState = 'MANUAL'
+$ciNote = '需要人工看 GitHub Actions 页面'
+if (-not (Test-Path -LiteralPath $ciYml)) {
+    $ciState = 'FAIL'
+    $ciNote = '缺少 .github/workflows/ci.yml'
+}
+elseif (-not (Test-Path -LiteralPath $psTests)) {
+    $ciNote = 'ci.yml 存在，但本机没有 tests\ps 目录'
+}
+else {
+    $pester5 = Get-Module -ListAvailable Pester -ErrorAction SilentlyContinue |
+        Where-Object { $_.Version -ge [version]'5.7.0' } | Select-Object -First 1
+    if (-not $pester5) {
+        $ciNote = 'ci.yml 存在；本机无 Pester 5.7+，跳过等价验证'
+    }
+    else {
+        try {
+            Import-Module Pester -MinimumVersion 5.7.0 -Force
+            $pcfg = New-PesterConfiguration
+            $pcfg.Run.Path = $psTests
+            $pcfg.Run.PassThru = $true
+            $pcfg.Output.Verbosity = 'None'
+            $pres = Invoke-Pester -Configuration $pcfg
+            if ($pres.TotalCount -eq 0) {
+                $ciState = 'FAIL'
+                $ciNote = 'Pester 没有执行任何测试'
+            }
+            elseif ($pres.FailedCount -gt 0) {
+                $ciState = 'FAIL'
+                $ciNote = "本机 Pester 失败 $($pres.FailedCount) 项（通过 $($pres.PassedCount)/$($pres.TotalCount)）"
+            }
+            else {
+                $ciState = 'PASS'
+                $ciNote = "ci.yml 在位；本机 Pester $($pres.PassedCount)/$($pres.TotalCount) 全绿（与 CI 同一批用例）"
+            }
+        }
+        catch {
+            $ciNote = '本机无法执行 Pester：' + $_.Exception.Message
+        }
+    }
+}
+Add-Row 'A24' 'CI 自动测试通过' $ciState $ciNote
 
 # A09 / A10 触发器是否还在
 $taskXml = ''
