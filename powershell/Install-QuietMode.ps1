@@ -41,6 +41,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# qmctl 把 Console.OutputEncoding 设成 UTF-8；提权会话默认 936，不跟着换
+# 就会把「已注册 \QuietMode\...」解成「宸叉敞鍐?...」，日志也跟着脏。
+# 其余 16 个脚本都有这一行，安装器是唯一漏的（2026-11-14 13:40 那次 Apply 暴露）。
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { }
+
 $script:Failures = New-Object System.Collections.Generic.List[string]
 $script:Warnings = New-Object System.Collections.Generic.List[string]
 $script:StepNo = 0
