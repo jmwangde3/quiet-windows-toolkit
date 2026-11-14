@@ -392,6 +392,51 @@ namespace QuietMode.Core.Tests
                 Eq("day", day.Steps[0].Action);
             });
 
+            // 2026-11-15 真机缺陷：夜间窗口里托盘点「立即联机硬盘」走 reconcile day，
+            // 但目标是取自时间窗口的 targetNight=true，于是展开成整条夜间链，
+            // 第一步 disk/offline —— 盘不但没联机，还被再脱一次，用户看到的就是「失败」。
+            Run("显式 day 在夜间窗口里必须真的联机，不得被窗口改写成夜间链", delegate
+            {
+                ReconcilePlan p = ReconcilePlanner.Build("day", "manual", "", FullConfig(), DayMaintenance(), true);
+                Eq("day", p.Action);
+                Eq("disk", p.Steps[0].Module);
+                Eq("online", p.Steps[0].Action);
+                Eq("maintenance", p.Steps[1].Module);
+                Eq("day", p.Steps[1].Action);
+                Eq("normal", p.Steps[3].Action);
+                Eq("verify", p.Steps[4].Module);
+                Eq("day", p.Steps[4].Action);
+            });
+
+            Run("显式 night 在白天窗口里必须真的脱机，不得被窗口改写成白天链", delegate
+            {
+                ReconcilePlan p = ReconcilePlanner.Build("night", "manual", "", FullConfig(), NightMaintenance(), false);
+                Eq("night", p.Action);
+                Eq("maintenance", p.Steps[0].Module);
+                Eq("night", p.Steps[0].Action);
+                Eq("disk", p.Steps[1].Module);
+                Eq("offline", p.Steps[1].Action);
+                Eq("silent", p.Steps[3].Action);
+                Eq("night", p.Steps[4].Action);
+            });
+
+            Run("restore 与 day 同链，同样不受窗口改写", delegate
+            {
+                ReconcilePlan p = ReconcilePlanner.Build("restore", "uninstall", "", FullConfig(), DayMaintenance(), true);
+                Eq("restore", p.Action);
+                Eq("disk", p.Steps[0].Module);
+                Eq("online", p.Steps[0].Action);
+                Eq("day", p.Steps[4].Action);
+            });
+
+            Run("显式 night/day 不受 targetNight 缺省值影响（null 时也按动作走）", delegate
+            {
+                ReconcilePlan night = ReconcilePlanner.Build("night", "manual", "", FullConfig(), NightMaintenance(), null);
+                Eq("offline", night.Steps[1].Action);
+                ReconcilePlan day = ReconcilePlanner.Build("day", "manual", "", FullConfig(), DayMaintenance(), null);
+                Eq("online", day.Steps[0].Action);
+            });
+
             Run("漂移修复：无需动作但回读 Failed → 按目标相位重跑", delegate
             {
                 Eq("night", ReconcileVerifier.RepairTarget(true, "none", true, ReconcileVerdict.Failed));

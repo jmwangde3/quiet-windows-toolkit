@@ -149,6 +149,13 @@ namespace QuietMode.Windows
                 run.Plan.Notes.Add("显式指定动作 " + resolved + "，覆盖自动决策（" + run.Decision.State + "）");
             }
 
+            // 显式动作与时间窗口相反时，调度器会在下一次心跳把它改回去。
+            // 不提示的话，用户会以为「点完又掉了」是操作失败。
+            if ((resolved == "day" || resolved == "restore") && run.Window != null && run.Window.Band == TimeBand.Night)
+                run.Plan.Notes.Add("现在是夜间窗口，本次只生效到下一次心跳（10 分钟内）；要整夜保持在白天状态，用 qmctl apply manual-normal");
+            if (resolved == "night" && run.Window != null && run.Window.Band == TimeBand.Day)
+                run.Plan.Notes.Add("现在是白天窗口，本次只生效到下一次心跳；要整白天保持在夜间状态，用 qmctl apply manual-quiet");
+
             run.EndUtc = NowIso();
             return run;
         }

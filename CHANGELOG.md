@@ -1,5 +1,64 @@
 # 变更记录
 
+## 2.0.1 — 2026-11-15
+
+### 修复：夜间窗口里「立即联机硬盘」把盘又脱了一次
+
+真机报障：夜间静音生效时，托盘点「立即联机硬盘（恢复白天状态）」无效，但「关闭静音模式」可用。
+
+根因在 `ReconcilePlanner.Build` 的相位判定：
+
+```csharp
+bool night = targetNight.HasValue ? targetNight.Value : p.Action == "night";
+```
+
+`targetNight` 描述的是「此刻时间窗口应该是什么相位」，由 `Decision.TargetNight` 传入。夜间窗口里
+恒为 `true`，于是**显式要求 day 也会被判成 night**，展开出来的是整条夜间链：
+
+```
+1. maintenance night     ← 又把维护任务停一遍
+2. disk        offline   ← 盘刚刚联机，立刻被再脱一次
+3. fan         silent
+```
+
+托盘的「立即联机硬盘」走的正是 `qmctl reconcile day --apply`，所以它不但没把盘放回来，
+还主动又脱了一次。「关闭静音模式」走 `qmctl apply manual-normal`，决策变成 `ManualNormal`
+（`TargetNight=false`），恰好绕过了这个缺陷 —— 这正是两者一个坏一个好用的原因。
+
+对称的缺陷同样存在：白天窗口里显式 `reconcile night` 会被展开成白天链。
+
+修法是把优先级摆正 —— **显式动作 > 目标相位**，`targetNight` 只留给「只读核对」（`none` / `verify`）：
+
+```csharp
+bool night;
+if (p.Action == "night") night = true;
+else if (p.Action == "day" || p.Action == "restore") night = false;
+else night = targetNight.HasValue && targetNight.Value;
+```
+
+`RepairTarget` 返回的相位始终与 `targetNight` 一致，不受影响。
+
+### 变更：托盘「立即联机硬盘」在静音中改为关静音
+
+即使相位修对，夜间窗口里只跑一次 `reconcile day` 也只生效到下一次 10 分钟心跳 ——
+`ApplyRun("day")` 会把 `AutoSilentActive` 置 false，下一次心跳按窗口判定为夜间，
+盘又被脱回去。用户看到的仍是「刚点完又掉了」。
+
+这个菜单项的语义本来就是「我现在要用盘」，所以静音开着时改为走 `apply manual-normal`
+（写抑制标记，本夜不再自动进夜，并执行白天链）；静音没开时才走 `reconcile day`。
+
+### 新增：相位与窗口相反时的显式提示
+
+`qmctl reconcile day`（夜间）或 `reconcile night`（白天）现在会多一行说明：
+本次只生效到下一次心跳，要整段保持请用 `qmctl apply manual-normal` / `manual-quiet`。
+不提示的话，用户会以为「点完又掉了」是操作失败。
+
+### 测试
+
+C# 单测 118 → **122**，新增四例钉死这条边界：显式 day 在夜间窗口必须 online、
+显式 night 在白天窗口必须 offline、restore 与 day 同链且不被改写、
+`targetNight` 为 null 时仍按动作走。
+
 ## 2.0.0 — 2026-11-15
 
 v2 重构收尾。Phase 0–7 全部完成，`ProductInfo.Version` 从 `2.0.0-rc.1` 抬到 `2.0.0`。

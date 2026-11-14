@@ -21,6 +21,9 @@ namespace QuietMode.Core.Scheduling
         /// targetNight 只在 action=none / verify（即「只回读核对」）时有意义：
         /// 夜里核对必须按夜间的期望来，否则「维护任务应当启用」这种白天条件会把一个
         /// 完全正常的夜间状态判成 Failed。早期固定成 day，正是漂移修复每十分钟空转的原因。
+        ///
+        /// 显式 night / day / restore 时 targetNight 一律忽略：动作就是相位。
+        /// 夜间窗口里 reconcile day 必须真的联机（而不是照窗口再脱一次机）。
         /// </summary>
         public static ReconcilePlan Build(string action, string trigger, string reason,
                                           QuietModeConfig cfg, MaintenancePlan maintenance, bool? targetNight)
@@ -32,7 +35,15 @@ namespace QuietMode.Core.Scheduling
             p.Reason = reason ?? "";
             p.CreatedUtc = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture);
 
-            bool night = targetNight.HasValue ? targetNight.Value : p.Action == "night";
+            // 相位判定优先级：显式动作 > 目标相位。
+            // targetNight 只描述「此刻的时间窗口应该是什么相位」，是给「只读核对」和
+            // 「无需动作」用的。显式要 night / day / restore 的时候必须按动作本身展开 ——
+            // 否则夜间窗口里点「立即联机硬盘」（reconcile day）会拿到整条夜间链，
+            // 第一步就是 disk/offline：盘不但没回来，还被再脱一次。
+            bool night;
+            if (p.Action == "night") night = true;
+            else if (p.Action == "day" || p.Action == "restore") night = false;
+            else night = targetNight.HasValue && targetNight.Value;
             int enabledTargets = CountEnabledTargets(cfg);
 
             if (p.Action == "verify")

@@ -184,7 +184,15 @@ namespace QuietMode.Ui
             menu.Items.Add(reapply);
 
             bringOnline = new ToolStripMenuItem("立即联机硬盘（恢复白天状态）");
-            bringOnline.Click += delegate { Reconcile("day", "立即恢复白天状态"); };
+            // 夜间窗口里只跑 reconcile day 是不够的：盘会联机，但下一次 10 分钟心跳
+            // 按窗口判定又会把它脱回去，用户看到的是「刚点完又掉了」。
+            // 这个菜单的语义是「我现在要用盘」，所以静音开着时先关掉静音
+            // （写 manual-normal 抑制标记，本夜不再自动进夜），再走白天链。
+            bringOnline.Click += delegate
+            {
+                if (WantQuiet()) DoApply("manual-normal", "立即恢复白天状态");
+                else Reconcile("day", "立即恢复白天状态");
+            };
             menu.Items.Add(bringOnline);
 
             menu.Items.Add(new ToolStripSeparator());
