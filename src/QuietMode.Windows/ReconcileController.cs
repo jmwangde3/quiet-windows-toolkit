@@ -115,7 +115,11 @@ namespace QuietMode.Windows
             input.LastRunFailed = StateMachine.IsLastRunFailed(input.State);
             // 抑制标记先对账到当前夜间窗口：窗口换了就自动松开，旧状态就补上窗口。
             StateMachine.NormalizeSuppression(input.State, cfg.Schedule, now);
+            // 开机后第一次 reconcile：上次开机前留下的手动静音不在白天恢复。
+            string manualExpired = StateMachine.ExpireStaleManualOverride(
+                input.State, run.Window, DateTime.UtcNow, SystemClock.Uptime());
             run.Decision = StateMachine.Decide(input);
+            if (manualExpired.Length > 0) run.Decision.Notes.Add(manualExpired);
 
             string resolved = ResolveAction(action, run.Decision);
             run.Action = resolved;

@@ -374,10 +374,12 @@ namespace QuietMode.Cli
                     s.SchedulePaused = false;
                     StateMachine.ClearSuppression(s);
                     s.ModeOn = false;
+                    s.ModeOnSinceUtc = "";
                     return SaveState(store, s, "已重新武装：清除暂停与今晚的抑制标记");
 
                 case "manual-quiet":
                     s.ModeOn = true;
+                    s.ModeOnSinceUtc = SystemClock.NowIso();
                     StateMachine.ClearSuppression(s);
                     return SaveState(store, s, "手动静音已记录（下一次 reconcile 执行）");
 
@@ -389,6 +391,7 @@ namespace QuietMode.Cli
 
                 case "auto":
                     s.ModeOn = false;
+                    s.ModeOnSinceUtc = "";
                     StateMachine.ClearSuppression(s);
                     s.SchedulePaused = false;
                     return SaveState(store, s, "已交回自动调度");
@@ -1348,6 +1351,7 @@ namespace QuietMode.Cli
             {
                 case "manual-quiet":
                     state.ModeOn = true;
+                    state.ModeOnSinceUtc = SystemClock.NowIso();
                     StateMachine.ClearSuppression(state);
                     break;
                 case "manual-normal":
@@ -1355,6 +1359,7 @@ namespace QuietMode.Cli
                     break;
                 case "auto":
                     state.ModeOn = false;
+                    state.ModeOnSinceUtc = "";
                     StateMachine.ClearSuppression(state);
                     state.SchedulePaused = false;
                     break;
@@ -1364,6 +1369,7 @@ namespace QuietMode.Cli
                     state.SchedulePaused = false;
                     StateMachine.ClearSuppression(state);
                     state.ModeOn = false;
+                    state.ModeOnSinceUtc = "";
                     break;
             }
 

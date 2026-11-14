@@ -147,6 +147,80 @@ namespace QuietMode.Core.Tests
                 Eq("night", d.Action);
             });
 
+            Run("状态机：手动静音已生效时不再每十分钟重跑整条夜间链", delegate
+            {
+                // 2026-11-14 实测缺陷：00:49 手动静音后，00:49/00:58/01:08 各留一条完整
+                // 5 步 worker 记录 —— 因为 ModeOn 分支无条件返回 action=night，
+                // 每根心跳都把磁盘置离线、维护任务禁用、风扇配置重载一遍。
+                ScheduleSettings sc = DefaultSchedule();
+                QuietModeState st = new QuietModeState();
+                st.ModeOn = true;
+                st.AutoSilentActive = true;          // 夜间链已经跑过
+                st.LastVerdict = "Ok";
+
+                Decision again = DecideAt(st, sc, new DateTime(2026, 11, 14, 1, 8, 0));
+                Eq(ControllerState.ManualQuiet, again.State);
+                Eq("none", again.Action);            // 只观测，不重跑
+                Eq(true, again.TargetNight);         // 相位仍是夜间，漂移判定按夜间算
+
+                // 上次有失败项 → 必须重跑
+                st.LastVerdict = "Failed";
+                st.LastDrift = "ActionableDrift";
+                Decision retry = DecideAt(st, sc, new DateTime(2026, 11, 14, 1, 18, 0));
+                Eq("night", retry.Action);
+
+                // 白天手动静音：还没生效时仍然要动作
+                QuietModeState fresh = new QuietModeState();
+                fresh.ModeOn = true;
+                Decision first = DecideAt(fresh, sc, new DateTime(2026, 11, 14, 14, 0, 0));
+                Eq(ControllerState.ManualQuiet, first.State);
+                Eq("night", first.Action);
+            });
+
+            Run("状态机：上次开机前的手动静音不在白天开机时恢复", delegate
+            {
+                // 2026-11-14 实况：00:49 手动静音 → 01:09 关机 → 12:35 开机。
+                // 静音标记原样恢复，12:36 把整条夜间链在中午跑了一遍。
+                ScheduleSettings sc = DefaultSchedule();
+                DateTime day = new DateTime(2026, 11, 14, 12, 36, 0);
+                WindowEvaluation dayWin = ScheduleWindow.Evaluate(sc, day, TimeSpan.FromMinutes(1));
+                Eq(TimeBand.Day, dayWin.Band);
+                DateTime bootUtc = day.ToUniversalTime().AddMinutes(-1);
+
+                // 开机前按下的 → 清除并给说明
+                QuietModeState stale = new QuietModeState();
+                stale.ModeOn = true;
+                stale.ModeOnSinceUtc = "2026-11-13T16:49:22Z";      // 00:49 本地
+                string note = StateMachine.ExpireStaleManualOverride(stale, dayWin, day.ToUniversalTime(), TimeSpan.FromMinutes(1));
+                Eq(false, stale.ModeOn);
+                Eq("", stale.ModeOnSinceUtc);
+                True(note.Contains("未在白天开机时恢复"), "应给出清除原因");
+
+                // 开机之后按下的 → 保留（哪怕是刚开机第一分钟）
+                QuietModeState fresh = new QuietModeState();
+                fresh.ModeOn = true;
+                fresh.ModeOnSinceUtc = bootUtc.AddSeconds(30).ToString("yyyy-MM-ddTHH:mm:ssZ");
+                Eq("", StateMachine.ExpireStaleManualOverride(fresh, dayWin, day.ToUniversalTime(), TimeSpan.FromMinutes(1)));
+                Eq(true, fresh.ModeOn);
+
+                // 夜间窗口一律保留：静音本来就是要的
+                WindowEvaluation nightWin = ScheduleWindow.Evaluate(sc, new DateTime(2026, 11, 14, 2, 0, 0), TimeSpan.FromMinutes(1));
+                Eq(TimeBand.Night, nightWin.Band);
+                QuietModeState atNight = new QuietModeState();
+                atNight.ModeOn = true;
+                atNight.ModeOnSinceUtc = "2026-11-13T16:49:22Z";
+                Eq("", StateMachine.ExpireStaleManualOverride(atNight, nightWin, new DateTime(2026, 11, 14, 2, 0, 0).ToUniversalTime(), TimeSpan.FromMinutes(1)));
+                Eq(true, atNight.ModeOn);
+
+                // 旧状态没有时间戳：只在刚开机那几次心跳里判定，别的时候不猜
+                QuietModeState legacy = new QuietModeState();
+                legacy.ModeOn = true;
+                Eq("", StateMachine.ExpireStaleManualOverride(legacy, dayWin, day.ToUniversalTime(), TimeSpan.FromMinutes(60)));
+                Eq(true, legacy.ModeOn);
+                True(StateMachine.ExpireStaleManualOverride(legacy, dayWin, day.ToUniversalTime(), TimeSpan.FromMinutes(3)).Length > 0, "刚开机应判定");
+                Eq(false, legacy.ModeOn);
+            });
+
             Run("状态机：旧版本的抑制标记按当前窗口迁移，不会永久粘住", delegate
             {
                 ScheduleSettings sc = DefaultSchedule();

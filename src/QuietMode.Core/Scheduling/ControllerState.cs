@@ -147,6 +147,52 @@ namespace QuietMode.Core.Scheduling
                    || string.Equals(d, "SafetyBlocked", StringComparison.OrdinalIgnoreCase);
         }
 
+        /// <summary>
+        /// 上次开机前留下的手动静音，不在白天开机时自动恢复。
+        ///
+        /// 手动静音是个持续覆盖（modeOn=true），它会跨关机活下来。夜里开启、第二天中午开机，
+        /// 系统就忠实地在中午把夜间链重跑一遍 —— 磁盘置离线、维护任务禁用、风扇静音。逻辑上
+        /// 没错（人确实按下过），但没有任何提示，看到的只是「中午盘掉线了」。
+        ///
+        /// 判定依据是 ModeOnSinceUtc 与本次开机时刻的比较，而不是「开机多久」：只看开机时长
+        /// 会误伤「刚开机就按下静音，一分钟后到点 reconcile」这种正常用法；反过来，如果开机
+        /// 那几次心跳没跑成，只看时长又会让守卫永远失效。
+        ///
+        /// 返回非空字符串表示已清除并给出说明，调用方把它塞进 Decision.Notes。
+        /// </summary>
+        public static string ExpireStaleManualOverride(QuietModeState st, WindowEvaluation w,
+                                                      DateTime nowUtc, TimeSpan? uptime)
+        {
+            if (st == null || !st.ModeOn) return "";
+            if (w == null || w.IsNight) return "";          // 夜里保留：静音本来就是要的
+
+            DateTime bootUtc = uptime.HasValue ? nowUtc - uptime.Value : DateTime.MinValue;
+
+            DateTime setUtc;
+            bool hasStamp = DateTime.TryParse(st.ModeOnSinceUtc ?? "",
+                                              System.Globalization.CultureInfo.InvariantCulture,
+                                              System.Globalization.DateTimeStyles.AdjustToUniversal
+                                              | System.Globalization.DateTimeStyles.AssumeUniversal,
+                                              out setUtc);
+            if (hasStamp)
+            {
+                // 留两分钟余量吸收时钟毛刺：本次开机之后按下的，一律保留。
+                if (setUtc >= bootUtc.AddMinutes(-2)) return "";
+            }
+            else
+            {
+                // 旧状态（schema ≤ 4）没有时间戳：只有「刚开机」那几次心跳敢判定，别的时候不猜。
+                if (!uptime.HasValue || uptime.Value.TotalMinutes > BootGuardMinutes) return "";
+            }
+
+            st.ModeOn = false;
+            st.ModeOnSinceUtc = "";
+            return "上次开机前开启的手动静音未在白天开机时恢复（需要静音请重新点一次）";
+        }
+
+        /// <summary>没有 ModeOnSinceUtc 可依据时，「刚开机」的判定阈值（分钟）。</summary>
+        private const int BootGuardMinutes = 10;
+
         public static Decision Decide(DecisionInput input)
         {
             Decision d = new Decision();
@@ -173,13 +219,32 @@ namespace QuietMode.Core.Scheduling
             }
 
             // 2. 用户手动覆盖。
+            //
+            // 手动静音过去无条件返回 action=night，于是每 10 分钟把整条夜间链重跑一遍：
+            // 磁盘反复置离线、维护任务反复禁用、风扇配置反复重载。2026-11-14 00:49 到手动静音
+            // 之后，00:49/00:58/01:08 各留下一条完整 5 步记录，就是这个原因。
+            // 和自动夜间一样处理：已经生效且上次没失败就返回 none，剩下的交给回读后的漂移判定，
+            // 真掉队了 RepairTarget 会强制重跑一次。
             if (st.ModeOn)
             {
                 d.State = ControllerState.ManualQuiet;
-                d.Action = "night";
                 d.TargetNight = true;
-                d.Reason = "用户手动开启静音";
                 if (!w.IsNight) d.Notes.Add("当前不在夜间窗口，但手动静音优先于时间调度");
+                if (!st.AutoSilentActive)
+                {
+                    d.Action = "night";
+                    d.Reason = "用户手动开启静音";
+                }
+                else if (input.LastRunFailed)
+                {
+                    d.Action = "night";
+                    d.Reason = "用户手动开启静音；上次执行有失败项，重试";
+                }
+                else
+                {
+                    d.Action = "none";
+                    d.Reason = "用户手动开启静音（已生效）";
+                }
                 return d;
             }
             if (w.IsNight && IsSuppressed(st, sc, input.Now))

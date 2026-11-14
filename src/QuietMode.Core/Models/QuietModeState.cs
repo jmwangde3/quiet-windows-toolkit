@@ -10,10 +10,19 @@ namespace QuietMode.Core.Models
     /// </summary>
     public sealed class QuietModeState
     {
-        public const int CurrentSchemaVersion = 4;
+        public const int CurrentSchemaVersion = 5;
 
         public int SchemaVersion = CurrentSchemaVersion;
         public bool ModeOn;
+        /// <summary>
+        /// 手动静音是从哪一刻开始的（UTC ISO）。用来回答一个只有跨重启才会暴露的问题：
+        /// 「这个手动静音是本次开机之前留下的，还是用户刚按下的？」
+        ///
+        /// 2026-11-14 实测踩到：00:49 手动静音 → 01:09 关机 → 12:35 开机，静音标记原样恢复，
+        /// 12:36 就把整条夜间链在中午重跑了一遍（两块盘置离线、8 个维护任务禁用、风扇静音）。
+        /// 没有这个时间戳只能靠「开机多久」猜，会误伤刚开机就按下按钮的人。
+        /// </summary>
+        public string ModeOnSinceUtc = "";
         public bool SchedulePaused;
         public bool AutoSilentActive;
         public bool AutoSilentSuppressed;
@@ -53,6 +62,7 @@ namespace QuietMode.Core.Models
             JsonObject o = new JsonObject();
             o.Set("schemaVersion", SchemaVersion);
             o.Set("modeOn", ModeOn);
+            o.Set("modeOnSinceUtc", ModeOnSinceUtc ?? "");
             o.Set("schedulePaused", SchedulePaused);
             o.Set("autoSilentActive", AutoSilentActive);
             o.Set("autoSilentSuppressed", AutoSilentSuppressed);
@@ -82,6 +92,7 @@ namespace QuietMode.Core.Models
             if (o == null) return s;
             s.SchemaVersion = o.GetInt("schemaVersion", 1);
             s.ModeOn = o.GetBool("modeOn", false);
+            s.ModeOnSinceUtc = o.GetString("modeOnSinceUtc", "");
             s.SchedulePaused = o.GetBool("schedulePaused", false);
             s.AutoSilentActive = o.GetBool("autoSilentActive", false);
             s.AutoSilentSuppressed = o.GetBool("autoSilentSuppressed", false);
