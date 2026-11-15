@@ -181,6 +181,10 @@ if (Test-Path -LiteralPath $reconcileLog) {
 }
 $badBeats = @($beats | Where-Object { $_.Verdict -ne 'Ok' })
 $nightBeats = @($beats | Where-Object { $_.Action -eq 'night' })
+# A21 只看自动调度的心跳：手动 / 演练(apply=0) / 安装触发的非 Ok 是操作产生的，不是「重复执行出错」
+$schedBeats = @($beats | Where-Object { $_.Trigger -eq 'schedule' })
+$badSched = @($schedBeats | Where-Object { $_.Verdict -ne 'Ok' })
+$badOther = @($badBeats | Where-Object { $_.Trigger -ne 'schedule' })
 
 # ------------------------------------------------------------------ 判定
 $now = Get-Date
@@ -237,9 +241,14 @@ $hitSys = $false
 if ($null -ne $sysDisk) { $hitSys = [bool](@($targets | Where-Object { $_.number -eq $sysDisk }).Count) }
 Add-Row 'A19' '不误操作系统盘' $(if ($hitSys) { 'FAIL' } else { 'PASS' }) ('系统盘 Disk #' + $sysDisk + ' 不在目标列表' )
 
-# A21 重复执行不出错
-$repOk = ($badBeats.Count -eq 0 -and $beats.Count -gt 0)
-Add-Row 'A21' '重复执行不报错（心跳全 Ok）' $(if ($repOk) { 'PASS' } elseif ($beats.Count -eq 0) { 'INFO' } else { 'FAIL' }) ($beats.Count.ToString() + ' 条心跳，非 Ok ' + $badBeats.Count + ' 条')
+# A21 重复执行不出错（口径 = 自动调度心跳；手动/演练触发的非 Ok 单列说明，不计入）
+# 手动 apply=0 的演练本来就会报 drift，手动 day 在夜间窗口被拒也是预期 —— 都不算心跳缺陷。
+$repOk = ($badSched.Count -eq 0 -and $schedBeats.Count -gt 0)
+$repNote = $schedBeats.Count.ToString() + ' 条调度心跳，非 Ok ' + $badSched.Count + ' 条'
+if ($badOther.Count -gt 0) {
+    $repNote += '；另有 ' + $badOther.Count + ' 条手动/演练触发非 Ok（不计入）'
+}
+Add-Row 'A21' '重复执行不报错（调度心跳全 Ok）' $(if ($repOk) { 'PASS' } elseif ($schedBeats.Count -eq 0) { 'INFO' } else { 'FAIL' }) $repNote
 
 # A22 调度未暂停
 Add-Row 'A22' '调度处于自动状态' $(if (-not $st.state.schedulePaused) { 'PASS' } else { 'FAIL' }) ('schedulePaused=' + $st.state.schedulePaused + ' modeOn=' + $st.state.modeOn)
@@ -250,48 +259,62 @@ $consistent = $true
 if ($st.controller.targetNight -or $st.controller.state -like '*Night*') { $consistent = $allOffline } else { $consistent = -not $allOffline }
 Add-Row 'A23' '状态显示与实机一致' $(if ($consistent) { 'PASS' } else { 'FAIL' }) ('controller=' + $st.controller.state + '(' + $claim + ') 实测离线 ' + $offlineCount + '/' + $targets.Count)
 
-# A24 CI：配置文件在 + 本机能跑通等价的 Pester（CI 的 Pester 步骤与这里同一批用例）
-$repoRoot = Split-Path $PSScriptRoot -Parent
-$ciYml = Join-Path $repoRoot '.github\workflows\ci.yml'
-$psTests = Join-Path $repoRoot 'tests\ps'
+# A24 CI：ci.yml 在位 + 本机能跑通等价的 Pester（CI 的 Pester 步骤与这里同一批用例）
+# 部署树只带 powershell/ 与二进制，不带 .github/ 与 tests/。所以仓库根是「探测」而不是
+# 假定 $PSScriptRoot 的上一级：在部署树里跑时往上找 _publish\quiet-windows-toolkit。
+# 两边都找不到只判 MANUAL —— 部署树缺 .github 是部署内容的一部分，不等于 CI 缺失。
+$repoRoot = $null
+$scriptParent = Split-Path $PSScriptRoot -Parent
+$probeRoots = New-Object System.Collections.ArrayList
+[void]$probeRoots.Add($scriptParent)
+$grandParent = Split-Path $scriptParent -Parent
+if ($grandParent) { [void]$probeRoots.Add((Join-Path $grandParent '_publish\quiet-windows-toolkit')) }
+[void]$probeRoots.Add((Join-Path $scriptParent '_publish\quiet-windows-toolkit'))
+foreach ($cand in $probeRoots) {
+    if (-not $cand) { continue }
+    if (Test-Path -LiteralPath (Join-Path $cand '.github\workflows\ci.yml')) { $repoRoot = $cand; break }
+}
+
 $ciState = 'MANUAL'
 $ciNote = '需要人工看 GitHub Actions 页面'
-if (-not (Test-Path -LiteralPath $ciYml)) {
-    $ciState = 'FAIL'
-    $ciNote = '缺少 .github/workflows/ci.yml'
-}
-elseif (-not (Test-Path -LiteralPath $psTests)) {
-    $ciNote = 'ci.yml 存在，但本机没有 tests\ps 目录'
+if (-not $repoRoot) {
+    $ciNote = '当前在部署树（只有 powershell/ 与二进制）；到源码树 _publish\quiet-windows-toolkit 下重跑本脚本即可判定 A24'
 }
 else {
-    $pester5 = Get-Module -ListAvailable Pester -ErrorAction SilentlyContinue |
-        Where-Object { $_.Version -ge [version]'5.7.0' } | Select-Object -First 1
-    if (-not $pester5) {
-        $ciNote = 'ci.yml 存在；本机无 Pester 5.7+，跳过等价验证'
+    $psTests = Join-Path $repoRoot 'tests\ps'
+    if (-not (Test-Path -LiteralPath $psTests)) {
+        $ciNote = 'ci.yml 存在，但本机没有 tests\ps 目录'
     }
     else {
-        try {
-            Import-Module Pester -MinimumVersion 5.7.0 -Force
-            $pcfg = New-PesterConfiguration
-            $pcfg.Run.Path = $psTests
-            $pcfg.Run.PassThru = $true
-            $pcfg.Output.Verbosity = 'None'
-            $pres = Invoke-Pester -Configuration $pcfg
-            if ($pres.TotalCount -eq 0) {
-                $ciState = 'FAIL'
-                $ciNote = 'Pester 没有执行任何测试'
-            }
-            elseif ($pres.FailedCount -gt 0) {
-                $ciState = 'FAIL'
-                $ciNote = "本机 Pester 失败 $($pres.FailedCount) 项（通过 $($pres.PassedCount)/$($pres.TotalCount)）"
-            }
-            else {
-                $ciState = 'PASS'
-                $ciNote = "ci.yml 在位；本机 Pester $($pres.PassedCount)/$($pres.TotalCount) 全绿（与 CI 同一批用例）"
-            }
+        $pester5 = Get-Module -ListAvailable Pester -ErrorAction SilentlyContinue |
+            Where-Object { $_.Version -ge [version]'5.7.0' } | Select-Object -First 1
+        if (-not $pester5) {
+            $ciNote = 'ci.yml 存在；本机无 Pester 5.7+，跳过等价验证'
         }
-        catch {
-            $ciNote = '本机无法执行 Pester：' + $_.Exception.Message
+        else {
+            try {
+                Import-Module Pester -MinimumVersion 5.7.0 -Force
+                $pcfg = New-PesterConfiguration
+                $pcfg.Run.Path = $psTests
+                $pcfg.Run.PassThru = $true
+                $pcfg.Output.Verbosity = 'None'
+                $pres = Invoke-Pester -Configuration $pcfg
+                if ($pres.TotalCount -eq 0) {
+                    $ciState = 'FAIL'
+                    $ciNote = 'Pester 没有执行任何测试'
+                }
+                elseif ($pres.FailedCount -gt 0) {
+                    $ciState = 'FAIL'
+                    $ciNote = "本机 Pester 失败 $($pres.FailedCount) 项（通过 $($pres.PassedCount)/$($pres.TotalCount)）"
+                }
+                else {
+                    $ciState = 'PASS'
+                    $ciNote = "ci.yml 在位；本机 Pester $($pres.PassedCount)/$($pres.TotalCount) 全绿（与 CI 同一批用例）"
+                }
+            }
+            catch {
+                $ciNote = '本机无法执行 Pester：' + $_.Exception.Message
+            }
         }
     }
 }
@@ -463,7 +486,7 @@ Write-Host ('  现在     : ' + $now.ToString('yyyy-MM-dd HH:mm:ss') + '  窗口
 Write-Host ('  配置     : 夜 ' + $st.schedule.nightStart + ' → 日 ' + $st.schedule.dayStart + '  夜间=' + $st.window.isNight)
 Write-Host ('  夜链     : ' + $(if ($night) { $night[0].At.ToString('MM-dd HH:mm:ss') } else { '-' }) + '  ' + $nightChk.Text + $(if ($nightSched) { '  [按点]' } else { '  [非按点]' }))
 Write-Host ('  日链     : ' + $(if ($day) { $day[0].At.ToString('MM-dd HH:mm:ss') } else { '-' }) + '  ' + $dayChk.Text + $(if ($daySched) { '  [按点]' } else { '  [非按点]' }))
-Write-Host ('  心跳     : 近 ' + $Hours + ' 小时 ' + $beats.Count + ' 条，其中夜间 ' + $nightBeats.Count + ' 条，非 Ok ' + $badBeats.Count + ' 条')
+Write-Host ('  心跳     : 近 ' + $Hours + ' 小时 ' + $beats.Count + ' 条（调度 ' + $schedBeats.Count + ' 条，其中夜间 ' + $nightBeats.Count + ' 条），调度心跳非 Ok ' + $badSched.Count + ' 条，手动/演练非 Ok ' + $badOther.Count + ' 条')
 Write-Host ''
 Write-Host ('  {0,-5} {1,-28} {2,-7} {3}' -f '编号', '验收项', '结论', '证据')
 Write-Host ('  ' + ('-' * 96))
