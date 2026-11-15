@@ -13,13 +13,19 @@
 |---|---|
 | 测试入口实现 | **完成** |
 | 生产保护（运行时断言） | **完成**，有反例测试 |
-| PowerShell 5.1 / 7.7.0 语法与静态契约 | **通过**（23 条） |
+| PowerShell 5.1 / 7.7.0 语法与静态契约 | **通过**（23 + 1 条，见 8 节） |
 | 本机 `-Preflight` | **执行了**：9 项 OK / 1 项 FAIL（未提权）/ 退出码 3 |
 | 本机 `-Apply` | **未执行** —— 当前会话非提权，标 `MANUAL_REQUIRED` |
-| CI 上真实 ACL 写入 | **已打开**（`QM_ALLOW_TASK_INTEGRATION=1`），随 PR 一并跑 |
+| CI 上真实 ACL 写入 | **已执行并通过**：两条 Windows 腿各真跑一遍写入 + 回读，`186 / 183 / 0 / 3`（8.2 节） |
 | 生产对象 | **未被触碰**：`\QuietMode\` 1 个任务、`\QuietHDD\` 2 个任务，快照在 4 节 |
 
-一句话：**工具做完并自证了，真实 Apply 还差一个管理员窗口。**
+一句话：**「7.7.0 下真实写任务 ACL 行不行」这个问题已经有实测答案（CI 两条腿都过，
+且回读验证）；本机 `-Apply` 仍差一个管理员窗口，用来验证五模式、生产比对与恢复通道。**
+
+顺带说一句过程：把 CI 的集成开关打开之后，前两轮各暴露一个「本机永远碰不到」的
+缺陷 —— 一个是 Pester 的 discovery 求值陷阱，一个是 `Grant-TaskRead.ps1` 里
+`$check` 撞上 `[switch]$Check` 导致写入路径根本走不完。两个都修了才拿到上面的绿。
+细节在 8.1。
 
 ---
 
@@ -283,12 +289,15 @@ ACL 写入最坏的失败形态不是「没加上」，是「加多了」—— 
 
 ## 8. 回归测试
 
+本机（非提权），双版本逐项对齐：
+
 | 项 | 结果 |
 |---|---|
-| PowerShell 5.1 全量 Pester | `Total=185 Passed=181 Failed=0 Skipped=4` |
-| PowerShell 7.7.0 全量 Pester | `Total=185 Passed=181 Failed=0 Skipped=4` |
+| PowerShell 5.1 全量 Pester | `Total=186 Passed=182 Failed=0 Skipped=4` |
+| PowerShell 7.7.0 全量 Pester | `Total=186 Passed=182 Failed=0 Skipped=4` |
 | 新增 `Test-QuietModeAclApply.Tests.ps1` | **23 条，双版本全过** |
-| 原有测试 | **一条没删**（从 162 增到 185，净增 23） |
+| 新增 switch 撞名守卫（见 8.2） | **1 条，附变异测试** |
+| 原有测试 | **一条没删**（从 162 增到 186，净增 24） |
 | C# 单测 | **123 / 123 通过** |
 | 双版本语法解析（全仓 PS1/PSM1） | 0 错误 |
 
@@ -304,6 +313,76 @@ ACL 写入最坏的失败形态不是「没加上」，是「加多了」—— 
 也就是说：真实 ACL 写入在 **PS 5.1 与 7.7.0 两条腿上各有一次自动化执行**，
 与 6 节的 `-Apply` 互补 —— 前者验证「授权链路」，后者验证「完整五模式 + 生产比对」。
 
+### 8.1 CI 第一次真跑就抓到两个缺陷
+
+把开关打开不是走过场 —— 前两轮 CI 各暴露一个「本机永远碰不到」的问题，两个都修了。
+
+**第一轮（`f00a1c5`，BeforeDiscovery 修复之前，`Total=185 Passed=178 Failed=0 Skipped=7`）：
+4 条集成用例一条都没执行。** 判据写在了 `BeforeAll` 里，而 `It ... -Skip:(expr)`
+的表达式在 **discovery 阶段**求值 —— 那时 `BeforeAll` 还没跑，变量恒 `$null`，
+`-not $null` 就是 `$true`，于是**任何环境都跳过**。修法是把判断搬进
+`BeforeDiscovery`（`79c4e6f`）。这类「本地跳过、CI 也跳过」的假绿最危险：
+数字看起来正常，覆盖面是零。
+
+**第二轮（`Total=185 Passed=180 Failed=2 Skipped=3`）：两条真实写入用例失败。**
+报错是
+
+```
+Grant-TaskRead.ps1 : Cannot convert value "System.String" to type
+"System.Management.Automation.SwitchParameter". ...
+```
+
+根因不在测试侧，在**生产脚本**里：`Grant-TaskRead.ps1` 声明了 `[switch]$Check`，
+而写入路径写着 `$check = Wait-SecurityDescriptor ...`。PowerShell 变量名不区分
+大小写，`$check` 就是 `$Check` —— 一个带类型约束的 switch 变量，往里塞 SDDL
+字符串会抛 `ArgumentTransformationMetadataException`，`-Apply` 在「写后回读」
+这一步直接终止（退出码 1）。
+
+为什么本机从未暴露：这条路径要求同时满足「已提权」**和**「目标文件夹还没有
+Users 读」。本机 DryRun 打的是 `\QuietHDD\`，走「已有 Users 读，跳过文件夹」
+分支，永远碰不到这几行。**这正是任务书那句「不能凭 Set-Acl 未抛异常判定成功」
+的镜像问题 —— 这次是「回读那一步自己崩了，于是连回读都没发生」。**
+
+修法（`cd4d060`）：两处变量改名 `$sdAfter`；另加一条 AST 守卫扫
+`powershell/` 下全部 `.ps1`/`.psm1`，任何脚本只要给与自己 `[switch]` 形参同名的
+变量赋**非布尔**值就失败。放行形态按本机实测确定 —— `[bool]` 强转与 `$true`/
+`$false` 字面量合法，**Int32 的 `1`/`0` 反而抛错**（参数绑定文案里那句
+「1 或 0」不适用于变量赋值）。守卫做过变异测试：把源码退回修复前，它精确报出
+那两行；退回修复后，全仓 28 个脚本 0 命中。
+
+### 8.2 CI 实测数字（最终）
+
+run [`43696988196`](https://github.com/jmwangde3/quiet-windows-toolkit/actions/runs/43696988196)，
+HEAD `cd4d060`，三条腿全绿：
+
+| 腿 | Pester |
+|---|---|
+| `windows / PowerShell 5.1 (Desktop)` | `Total=186 Passed=183 Failed=0 Skipped=3` |
+| `windows / PowerShell 7.7.0 (pwsh)` | `Total=186 Passed=183 Failed=0 Skipped=3` |
+| `linux / core compile only` | 编译通过 |
+
+上表不是从日志里抄一行就完事 —— NUnit XML 逐用例核过：186 条 = 183 `Success` +
+3 `Ignored`。3 条 `Ignored` 全部是「只在未提权时才成立」的用例，在提权 runner 上
+按设计跳过：
+
+- `Grant-TaskRead 脚本契约.未提权时 -Apply 必须返回 3，不能假装成功`
+- `Test-QuietModeAclApply…-Apply / -Rollback / -Cleanup 在未提权时都返回 3`
+- `Test-QuietModeAclApply…-Apply 未提权时输出里点明「未提权」，且不建立夹具`
+
+真实任务集成那 5 条**全部 `Success`**，包括上一轮挂掉的两条：
+
+- `临时对象名带唯一前缀，不会撞到生产任务`
+- `Apply 后文件夹 SDDL 含 Users 读 ACE，且原有 ACE 一条不少` ← 上一轮失败
+- `任务对象 Apply 后也含 Users 读 ACE` ← 上一轮失败
+- `重复执行不重复添加 ACE（第二次应报「已有 Users 读」）`
+- `Users 拿到的只是读权限，不含修改/删除/启停任务`
+
+结论：**PS 5.1 与 7.7.0 两条腿上，真实的 `SetSecurityDescriptor` 与 `Set-Acl`
+写入各被真跑过一遍，并通过回读验证「新增 ACE 在位 + 原有 ACE 没丢 + 权限没扩大 +
+重复执行不重复加」。** 这与 6 节本机 `-Apply`（仍是 `MANUAL_REQUIRED`）是两层
+不同的证据：CI 证明「授权链路在 7.7.0 上可写可回读」，本机 `-Apply` 要证明的是
+「五模式 + 生产比对 + 恢复通道在真实主机上成立」。前者不能替代后者。
+
 ---
 
 ## 9. 未完成事项
@@ -313,11 +392,15 @@ ACL 写入最坏的失败形态不是「没加上」，是「加多了」—— 
 | 1 | 本机 `-Apply` 真实写入 | 当前会话非提权 | 6 节的管理员命令，一条条跑 |
 | 2 | 本机 `-Check` / `-Rollback` / `-Cleanup` 实跑 | 依赖 1 的夹具 | 同上 |
 | 3 | `GetSecurityDescriptor(0xF)` 在提权会话下的实测输出 | 非提权读不到 SACL，只能走到退回分支 | Apply 时看是否出现「完整读取（含 SACL）」那行 |
-| 4 | CI 打开集成开关后的首次结果 | 随 PR 推送后才有 | 看两条 Windows 腿的 Pester 数字：应为 `185 / 182 / 0 / 3` |
 
-第 4 项的数字推算：4 条集成从跳过转为执行（+4 Passed），新增的 2 条「未提权」用例
-在提权 runner 上转跳过（−2 Passed，+2 Skipped），原本 1 条「未提权 `-Apply` 返回 3」
-仍是跳过。若实际数字与此不符，说明有别的用例在 runner 上走了不同分支，需要查。
+原本列在第 4 项的「CI 打开集成开关后的首次结果」已经补上，结果见 8.1 / 8.2。
+
+**一处推算失误，留档。** 上一版这里写过「4 条集成转执行、2 条未提权用例转跳过，
+应为 `185 / 182 / 0 / 3`」。实际第一轮是 `185 / 178 / 0 / 7`（多 3 条跳过），
+第二轮是 `185 / 180 / 2 / 3`。两个偏差各有原因：多出来的跳过是那个
+discovery 阶段的 `-Skip` 陷阱；而「2 条未提权用例转跳过」也猜错了 —— 真正会在提权
+环境转跳过的只有 1 条，另 2 条走的是运行期 `Set-ItResult -Skipped`，在提权 runner
+上照样执行并通过。教训：**跳过数是推断出来的，就该在 CI 上核对，而不是写进结论**。
 
 ---
 

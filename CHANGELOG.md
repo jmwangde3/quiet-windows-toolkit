@@ -123,8 +123,8 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 实测同一份输入连打两次 SHA256 完全一致：
 
 ```
-64da1b4005616e7fa5b1b5b317980e09f95e396c497e6ff9fa690e08d7ca7e91
-376,995 B / 51 个条目
+9fe5f08997eee05e97c7531756975714d80746f7b58005457a77cfb609aa373c
+379,414 B / 51 个条目
 ```
 
 包里含：`qmctl.exe`、`QuietMode.exe`、两个 DLL、两份 `.config`、`powershell\` 全树
@@ -136,7 +136,8 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 而它自己又在 zip 里 —— 一旦打进去就构成自指：包内那份记录的必然是上一代的哈希，
 每次重打都对不上，永远自洽不了。打包脚本为此加了一条硬断言，谁把它加回来就直接
 `exit 3`。验证方式也留了：改完 CHANGELOG 再打包，哈希必须保持不变
-（实测改前改后同为 `f7307683…`）。
+（本轮实测：把哈希改成本节的 `9fe5f089…` 之后复打，仍为
+`9fe5f089…`，字节数 379,414 不变）。
 
 脚本会断言三件事：契约文件齐全（含 C# 控制器按常量算出的三条脚本路径）、
 包根含 `powershell\Modules`（`qmctl` 的 RepoLocator 要求）、包里没有测试/临时产物。
@@ -175,14 +176,26 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 | 文件 | 用例数 | 内容 |
 |---|---|---|
 | `tests/ps/QuietMode.TaskState.Tests.ps1` | 38 | 路径拆分、不存在 6 例、无法确认 10 例、SDDL 判据 10 例、是否提权、真机只读 4 例 |
-| `tests/ps/Grant-TaskRead.Tests.ps1` | 20 | 内存 ACL 判据 9 例、SDDL 与 ACL 一致性 4 组、脚本契约 5 例（子进程取退出码）、真实任务集成 4 例（默认跳过） |
+| `tests/ps/Grant-TaskRead.Tests.ps1` | 21 | 内存 ACL 判据 9 例、SDDL 与 ACL 一致性 4 组、脚本契约 6 例（子进程取退出码 + switch 撞名 AST 守卫）、真实任务集成 4 例（默认跳过） |
 | `tests/ps/Test-QuietModeAclApply.Tests.ps1` | 23 | ACL 真机验收入口的静态契约（不自行加 ACE、生产保护、夹具形态、恢复根位置）、模式互斥与默认只读、非法 TestId 拦截、未提权三个写模式必须 `exit 3`、`-TaskNames` 精确限定 |
 | `tests/ps/Install-Contract.Tests.ps1` | 25 | 全目录 PS1/PSM1 双版本 Parser 语法、BOM/换行约定、版本号层次、安装器契约、DryRun 与回滚演练子进程验证；其中 7 条是 CI 工作流契约（双版本矩阵、无 `continue-on-error`、PS 7 走 zip 不走 msi、`--help` 不得接早停管道、tag 逐段判定、不自己打 tag、两个工作流钉同一个 Pester 版本） |
 
-原有 8 个测试文件 79 条**一条没删**。合计 **185 条**：
-PowerShell 5.1 `Total=185 Passed=181 Failed=0 Skipped=4`，
+原有 8 个测试文件 79 条**一条没删**。合计 **186 条**：
+PowerShell 5.1 `Total=186 Passed=182 Failed=0 Skipped=4`，
 PowerShell 7.7.0 同一组数字。4 条跳过的是需要提权的真实任务 ACL 集成用例
 （`QM_ALLOW_TASK_INTEGRATION=1` 才跑）。C# 单测 **123 项**全部通过。
+
+在 CI 上把 `QM_ALLOW_TASK_INTEGRATION=1` 打开之后，头两轮各抓到一个
+**本机永远碰不到**的缺陷，都修了：
+
+1. 集成用例的跳过判据写在 `BeforeAll` 里，而 `It ... -Skip:(expr)` 的表达式在
+   **discovery 阶段**求值 —— 那时变量还是 `$null`，于是任何环境都跳过，
+   数字看着正常、覆盖面是零。判据搬进 `BeforeDiscovery`。
+2. `Grant-TaskRead.ps1` 里 `$check` 撞上 `[switch]$Check`。PowerShell 变量名不区分
+   大小写，往带类型约束的 switch 变量里塞 SDDL 字符串会抛
+   `ArgumentTransformationMetadataException`，`-Apply` 在「写后回读」那一步就终止 ——
+   也就是说真实写入从来没有被回读验证过。变量改名 `$sdAfter`，并补一条 AST 守卫
+   扫全仓 `.ps1`/`.psm1`：给与自己 `[switch]` 形参同名的变量赋非布尔值即失败。
 
 ### 13. 其它
 
