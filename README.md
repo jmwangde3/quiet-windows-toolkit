@@ -1,117 +1,364 @@
 # quiet-windows-toolkit
 
-Windows 本机「深夜静音」工具集：让风扇降速、机械硬盘整盘脱机，白天自动恢复。
+Windows 本机「深夜静音」工具集：23:58 起把风扇切到静音曲线、机械硬盘整盘脱机、
+停掉会吵醒机器的维护任务；10:02 按安装时抓的 baseline 原样恢复。
 
-这套东西解决的是一个很具体的痛点：夜里机器还开着，14TB / 4TB 机械盘和风扇的噪音很烦，
-但又不希望白天起床后还得手动把盘联回来。于是拆成三层：
+不猜、不复述默认值：**白天恢复写的是安装那一刻实测到的原始状态**，不是代码里的默认值。
 
-| 层 | 做什么 | 关键文件 |
+---
+
+## 版本：v2 是正式版，v1 是历史兼容
+
+| | v2（当前正式版） | v1（历史兼容，冻结） |
 |---|---|---|
-| 风扇 | 通过 FanControl 的命名管道切换常态 / 静音配置 | `QuietMode/QuietMode.cs` |
-| 硬盘 | 整盘 `Set-Disk -IsOffline`，零 I/O；由计划任务 23:58 脱机、10:02 联机 | `quiet-hdd-offline.ps1` |
-| 系统 | 空闲停转 DISKIDLE、自动维护任务、开机补跑对账 | `quiet-hdd-*.ps1`、`diskgate` 闸门体 |
+| 版本 | **2.0.5** | 不再演进 |
+| 入口 | `qmctl.exe` | 仓库根 `quiet-hdd-*.ps1` |
+| 安装器 | `powershell\Install-QuietMode.ps1` | 各脚本自己注册任务 |
+| 调度 | 单一任务 `\QuietMode\QuietMode-Reconcile` | `\QuietHDD\` 两个闸门任务 |
+| 配置 | `C:\ProgramData\QuietMode\config.json` | `%APPDATA%\QuietMode\settings.ini` + `diskgate.conf` |
+| 认盘 | `uniqueId` + 序列号（编号永不参与） | 磁盘编号 `Disks=0,1` |
 
-`QuietMode.exe` 是托盘程序：右键看当前状态（静音 / 风扇档 / 两块盘脱机与否），
-一键开关静音、单独开关硬盘空闲停转、单独开关计划闸门、设置开机自启。
+**新用户只用 v2**，从下面的[快速开始](#快速开始)第 1 步走起。
 
-> 仓库内容已脱敏。所有本机账号名、用户目录、工作区路径、软件安装路径都替换成了
-> `<USER>` / `<FAN_ROOT>` / `<TOOLS>` / `<WORKSPACES>` 等占位符，部署时按你的机器改。
+v1 的脚本和文档保留下来，只因为两件事：一是已有 v1 安装的机器需要它作为**迁移来源**和**回滚目标**；
+二是 `docs/LEGACY_*.md` 这批审计资料引用了它。v1 的完整说明在 [`docs/LEGACY.md`](docs/LEGACY.md)。
 
-**装之前先读 [`SAFETY.md`](SAFETY.md)。** 它会改你的计划任务、`SysMain` 服务、自动维护注册表、
-`DISKIDLE` 电源设置、目标磁盘的联机状态和 FanControl 当前配置——这六类全部列出；
-同时明确写清了绝不动的东西（Windows Update / Defender / 防火墙 / BitLocker / 证书服务、
-系统盘 / 页面文件盘 / 存储池成员）、三条失败语义（默认演练、写后必回读、未提权不做一半）
-和五级退路（手动静音 → 修复 → 重建 baseline → 卸载 → 回滚）。
+> **v1 与 v2 不得同时作为独立调度器运行。**
+> 两套闸门都去动同一块盘时会互相打架：v1 到点联机、v2 到点脱机，来回跳。
+> 安装器在注册 v2 之后会停用 v1 闸门并**回读确认**；停不掉就把 v2 自己拆掉退回「只有 v1」，
+> 绝不留两套并行调度。`-KeepLegacy` 是给调试场景留的逃生门，生产机不要用。
+
+---
+
+## 装之前必须知道它会动什么
+
+[`SAFETY.md`](SAFETY.md) 列清了六类写面（计划任务 / `SysMain` 服务 / 自动维护注册表 /
+`DISKIDLE` 电源设置 / 目标磁盘联机状态 / FanControl 当前配置）、三条失败语义
+（默认演练、写后必回读、未提权不做一半）、五级退路和已知风险。
+**没读这页不要执行 Apply。**
+
+同时明确写死了绝不动的东西：Windows Update / Defender / 防火墙 / BitLocker / 证书服务，
+以及系统盘 / 启动盘 / 页面文件所在盘 / 存储池成员 —— 这几类盘即使写进配置也会被执行前的
+`DiskSafetyGuard` 硬拦。
+
+---
 
 ## 目录
 
 ```
-.gitattributes              统一 LF 换行
-SAFETY.md                   会动什么 / 绝不动什么 / 出问题怎么退  ← 装之前先读这页
-enable-utf8-console.ps1     PS 5.1 控制台 UTF-8 输出
-set-winx-pwsh.ps1           PowerShell 7 终端配置辅助
-run_ps.py                  中文路径 + 嵌套引号安全的 PowerShell 调用包装
-ide-terminal-settings.jsonc VS Code / Cursor / Trae 终端配置示例
-fix-rtss-scanlinesync.ps1   RTSS 扫描线同步修复
-quiet-hdd-*.ps1             v1 遗留闸门脚本（v2 起不再使用，保留供回滚与对照）
+SAFETY.md                   会动什么 / 绝不动什么 / 出问题怎么退   ← 先读这页
 QuietMode.sln               Core / Windows / Cli / 托盘 / 单测
 src/
   QuietMode.Core/           配置、校验、迁移、快照、状态机、计划器、验证器（无系统调用）
   QuietMode.Windows/        WMI / 任务 COM / 注册表 / 电源 / 磁盘 / 调度注册（唯一系统层）
-  QuietMode.Cli/            qmctl 命令行
-powershell/                 安装 / 卸载 / 回滚 / 修复 / 验收脚本 + 7 个 .psm1 模块
+  QuietMode.Cli/            qmctl 命令行（机器侧唯一入口）
+powershell/
+  Install-QuietMode.ps1     安装器：DryRun / Apply / Rollback
+  Uninstall-QuietMode.ps1   卸载（数据可访问性优先）
+  Repair-QuietMode.ps1      只诊断；-Apply 才做三件低风险修复
+  Reset-Baseline.ps1        重建 baseline
+  Verify-NightRun.ps1       A01–A24 验收表
+  Grant-TaskRead.ps1        任务可读性授权（文件夹 / 文件 / 任务对象三层）
+  Fix-TaskVisibility.ps1    任务可见性修复
+  Modules/                  8 个 .psm1（含 TaskState 判据模块）
+  Worker/                   计划任务的唯一执行器
+QuietMode/                  托盘：qmctl 的前端，不含任何系统调用
 tests/
   QuietMode.Core.Tests/     C# 单测（自建 runner，无外部依赖）
-  ps/                       Pester 5 测试（7 个模块的确定性逻辑）
-.github/workflows/ci.yml    windows-latest：build → C# 单测 → Pester
-QuietMode/
-  Program.cs                托盘入口（单实例 / --diag / --status / --selftest）
-  App/                      路径与日志、HKCU 自启、Win11 托盘常显
-  Core/                     qmctl 调用通道 + 只读 JSON 解析（与引擎跨进程只走 JSON）
-  Ui/                       托盘菜单 / 设置窗口 / 图标
-  Diag/                     自检输出
-  QuietMode.exe.config      运行时配置
-  build.cmd                 一键编译
-  build/QuietMode.csproj    SDK 风格工程文件
+  ps/                       Pester 5 测试
+build/
+  build.ps1                 编译整个解决方案并收集 qmctl 到 bin\
+  run-pester.ps1            在当前 PowerShell 里跑全部 Pester（5.1 / 7.x 共用）
+quiet-hdd-*.ps1             v1 遗留闸门脚本（历史兼容，勿与 v2 同时启用）
+config/default-policy.json  默认策略（与代码里的 DefaultPolicy 同一份内容，测试会比对）
+docs/                       架构 / 配置 / 调度 / 磁盘 / 维护 / 托盘 / v1 审计
 ```
+
+---
 
 ## 快速开始
 
-### 1. 编译
+下面 13 步全部在**仓库根目录**执行。除第 9 步外都不需要管理员。
 
-需要 .NET SDK（6.0 或更高）与 `Microsoft.NETFramework.ReferenceAssemblies` 包
-（首次构建会自动还原，需要网络）。
+### 1. 系统要求
 
-```
-dotnet build QuietMode.sln -c Release     # Core / Windows / qmctl / 托盘 / 单测
-QuietMode\build\build.cmd                # 只编托盘，产物复制到 QuietMode\QuietMode.exe
-```
+- Windows 10 1809+ 或 Windows 11，x64
+- PowerShell **5.1**（系统自带）或 **7.7.0** —— 两条都支持，安装器在两个版本下各跑过一遍完整验收
+- .NET Framework 4.8.1 运行时（`qmctl` 与托盘）
+- .NET SDK 8（只在编译时需要）
+- 管理员权限（Apply、磁盘脱机、计划任务、ACL 加固都要）
+- FanControl（可选，走命名管道，不需要管理员）
 
-v2 的托盘只是 `qmctl` 的前端，**部署时必须把 `qmctl.exe` 放在 `QuietMode.exe` 同目录**
-（或在 `%APPDATA%\QuietMode\tray.ini` 写 `QmctlPath=<完整路径>`）。
-找不到 qmctl 时托盘会把所有操作标成不可用，不会退回旧的自带逻辑。
-布局与契约见 [`docs/TRAY.md`](docs/TRAY.md)。
-
-### 2. 改配置
-
-`QuietMode.cs` 里 `Cfg` 的默认路径都是占位符，第一次运行后在托盘菜单「设置…」里
-填你的实际路径即可，配置保存在 `%APPDATA%\QuietMode\settings.ini`：
-
-- `<FAN_ROOT>` —— FanControl 安装目录与 `IpcCtl.exe` 所在目录
-- `<TOOLS>` —— HWiNFO 等开机自启工具的目录（不要放在准备夜间脱机的盘上）
-- `C:\ProgramData\QuietHDD\diskgate.conf` 里的 `Disks=` 填你的机械盘磁盘号
-
-### 3. 安装夜间闸门
-
-以管理员身份运行：
+### 2. 获取代码并编译
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-offline.ps1"
+git clone https://github.com/jmwangde3/quiet-windows-toolkit.git
+cd quiet-windows-toolkit
+dotnet build QuietMode.sln -c Release      # qmctl + Core + Windows + 托盘 + 单测
+QuietMode\build\build.cmd                  # 单独产出托盘 QuietMode\QuietMode.exe
 ```
 
-它会注册两个计划任务（23:58 脱机 / 10:02 联机 / 开机补跑），生成
-`C:\ProgramData\QuietHDD\diskgate.ps1` 与 `diskgate.conf`。
-常用参数：`-Status` 查看、`-TestNight` 试跑夜间逻辑、`-Restore` 回滚。
+用发布包的话（`build\pack-release.ps1` 产出的 `QuietMode-v2.0.5-win-x64.zip`）解压后目录结构
+已经满足 `qmctl` 的 `RepoLocator`（从自身目录向上找 `powershell\Modules`），不用再编译。
 
-改脱机磁盘号：
+检查产物在不在：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-setdisks.ps1" -Disks '0,1' -Force
+Test-Path .\src\QuietMode.Cli\bin\Release\net481\qmctl.exe   # 应为 True
+Test-Path .\QuietMode\QuietMode.exe                          # 应为 True
 ```
 
-今晚想用盘：
+### 3. 配置磁盘稳定身份
+
+先看本机磁盘。**`UNIQUEID` 这一列就是 v2 认盘用的身份**，磁盘编号只是给人看的：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Pause
-powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
+.\bin\qmctl.exe disks list                # 人眼速览
+.\bin\qmctl.exe --json disks list         # 要抄准确值就用这个
 ```
 
-### 4. 行为说明
+生成一份默认配置，然后编辑 `C:\ProgramData\QuietMode\config.json` 的 `disks.targets[]`：
 
-- 开机后 2 分钟的 AtStartup 闸门会按「开机时长 < 15 分钟则 06:00 起算白天」判定，
-  早上开机直接联机；00:00–05:59 的无人值守重启仍保持夜间脱机。
-- 静音模式与「硬盘空闲停转」是**两个独立开关**，互不绑定；停转分钟数可单独设置。
-- 关闭静音模式会做完整恢复：风扇常速、两块盘联机、6 项维护任务启用、闸门 RESUMED。
+```powershell
+.\bin\qmctl.exe config init
+notepad C:\ProgramData\QuietMode\config.json
+```
+
+```json
+"disks": {
+  "enabled": true,
+  "forceBusy": false,
+  "targets": [
+    {
+      "uniqueId": "<从 --json disks list 的输出里抄 uniqueId>",
+      "serialNumber": "<可选，抄 serialNumber>",
+      "friendlyName": "<可选，抄 friendlyName>",
+      "sizeBytes": 0,
+      "busType": "<可选，抄 busType>",
+      "enabled": true
+    }
+  ]
+}
+```
+
+要点：
+
+- `uniqueId` 与 `serialNumber` **至少填一个**，两个都空会被 `config validate` 直接判错；
+  两个都填时按 `uniqueId` 优先匹配，序列号兜底。
+- **磁盘编号（DISK 0 / DISK 1）永远不参与匹配**。换 SATA 口、加一块盘导致编号漂移，都不会脱错盘。
+- `config set` 的白名单里**没有** `disks.targets` —— 它是个数组，键值对表达不了，
+  只能改文件。改完必须重新跑第 6 步的校验。
+- `sizeBytes` 留 0 只是少一层核对，会给一条警告，不影响运行。
+- 不需要脱机就把 `"enabled"` 设成 `false`，别留个 `true` 加空数组，那会直接校验失败。
+
+### 4. 配置夜间和白天时间
+
+```powershell
+.\bin\qmctl.exe config set schedule.nightStart 23:58
+.\bin\qmctl.exe config set schedule.dayStart   10:02
+.\bin\qmctl.exe config set schedule.reconcileIntervalMinutes 10
+.\bin\qmctl.exe config set schedule.startupDayStart 06:00
+```
+
+开机补偿：开机时长小于 `schedule.startupGraceMinutes`（默认 15 分钟）且当前已过
+`startupDayStart`（06:00）时按白天处理 —— 早上开机直接联机，00:00–05:59 的无人值守重启
+仍保持夜间状态。
+
+`config set` 每次写完都会重新校验一遍，**校验不过就不落盘**。写完看一眼当前全貌：
+
+```powershell
+.\bin\qmctl.exe config show
+```
+
+### 5. 读一遍 SAFETY.md
+
+```powershell
+notepad .\SAFETY.md
+```
+
+重点看「写面清单」和「五级退路」两节。这一步不产生任何系统改动，但跳过它的代价是
+第 13 步出问题时不知道该往哪退。
+
+### 6. 校验配置
+
+```powershell
+.\bin\qmctl.exe config validate
+echo $LASTEXITCODE      # 必须是 0
+```
+
+常见不通过的原因：`disks.enabled=true` 但 `targets` 为空；`uniqueId` 与其他目标重复；
+`fan.enabled=true` 但 `ipcPath` / `silentProfile` 指向的文件不存在。
+
+### 7. 执行安装 DryRun
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\powershell\Install-QuietMode.ps1 -Mode DryRun
+```
+
+**这一步不需要管理员，且只读**：不建目录、不写日志、不动任何系统状态。
+它跑七段预检：环境 → 载体完整性（二进制 + 8 个模块 + Worker 逐个校验大小/版本/sha256）→
+现有安装 → 磁盘稳定身份 → 静音窗口与 FanControl 依赖 → baseline 可信度 → 完整安装计划。
+
+### 8. 检查 DryRun 结果
+
+退出码 0 才往下走。三个必须亲眼看的地方：
+
+- `[03] 现有安装`：确认它认出了你机器上真实存在的东西（v1 三份配置、v1 四条历史任务、v2 任务）。
+  `不存在` 是正常的。
+- `[05] 磁盘稳定身份`：目标盘必须是 `matched` 且有 `uniqueId`。任何一块盘 `ambiguous` 或
+  `notfound` 都先查清再装。
+- `[07] 安装计划`：这是它**准备做的事**的完整清单，逐条读完。
+
+有 FAIL 就停下改配置，别指望 Apply 阶段「也许能过」。
+
+### 9. 管理员执行 Apply
+
+右键「以管理员身份运行」Windows PowerShell，`cd` 到仓库根：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\powershell\Install-QuietMode.ps1 -Mode Apply
+```
+
+二十步：备份 → 部署 → 迁移 → 校验 → 抓 baseline → 权限加固 → 注册任务 → 停用 v1 →
+交回自动 → 对齐一次 → 起托盘 → 收尾复核。日志落在 `C:\ProgramData\QuietMode\logs\install-<时间戳>.log`。
+
+退出码含义：
+
+| 码 | 含义 |
+|---|---|
+| 0 | 成功 |
+| 2 | 有失败项（逐条看 `[FAIL]` 行） |
+| 3 | 预检或自检失败（含任务状态判据自检） |
+| 4 | 备份 / 配置 / 快照失败 |
+| 5 | 未提权 |
+| 6 | v2 任务没注册上 |
+| 7 | v1 停不掉，已把 v2 回滚掉 |
+
+### 10. 验证任务注册
+
+```powershell
+.\bin\qmctl.exe task status
+Get-ScheduledTask -TaskPath '\QuietMode\' | Format-Table TaskName, State
+```
+
+要看到的：`\QuietMode\QuietMode-Reconcile` 存在、`State = Ready`、
+`NextRunTime` 是下一个 23:58 或 10:02。
+
+> `LastTaskResult = 267011`（`0x41303`）意思是「**从未运行**」，不是错误。
+> 刚装完就是这个值，等第一次到点跑过才会变。
+
+### 11. 验证权限
+
+任务由 SYSTEM 注册，默认普通用户看不见 —— 托盘就永远显示「状态未知」。三层都要授权：
+
+```powershell
+# 只检查，不改（退出码 0=已就绪 / 2=有缺失 / 3=未提权没执行）
+powershell -ExecutionPolicy Bypass -File .\powershell\Grant-TaskRead.ps1 -Check
+
+# 任务可见性诊断（不加 -Apply 就是只读）
+powershell -ExecutionPolicy Bypass -File .\powershell\Fix-TaskVisibility.ps1
+```
+
+然后**开一个不提权的窗口**验证普通用户确实能读到：
+
+```powershell
+.\bin\qmctl.exe task status        # exists 应为 true，不是 null
+```
+
+判据在 `powershell\Modules\QuietMode.TaskState.psm1` 里，只看「有没有 BU 这条 ACE」是不够的 ——
+`(A;OICI;FW;;;BU)`（只写）也会被当成「有 ACE」，所以必须看权限位里有没有读。
+
+### 12. 验证夜间和白天行为
+
+```powershell
+.\bin\qmctl.exe status                       # 窗口 / 决策 / 风扇 / 磁盘 / 停转 / 任务一次看全
+.\bin\qmctl.exe reconcile auto               # 演练：只算不动
+.\bin\qmctl.exe reconcile auto --apply --trigger manual   # 真对齐一次（要管理员）
+```
+
+跑完整验收表（A01–A24，含夜间与白天两条链）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\powershell\Verify-NightRun.ps1 -Qmctl .\bin\qmctl.exe
+```
+
+`-Qmctl` 的默认值是作者本机的部署路径，**在源码仓库里跑必须显式传**。
+输出是 `PASS / FAIL / MANUAL` 三态表；`MANUAL` 是「得等到夜间或需要人看」的项，不是失败。
+
+等第一夜过去后复跑一次，A01–A24 应该只剩个别 `MANUAL`。
+
+### 13. 故障恢复
+
+按代价从小到大：
+
+| 级别 | 做什么 | 命令 |
+|---|---|---|
+| 1 | 手动开 / 关静音 | `qmctl apply manual-quiet --apply` / `manual-normal --apply` |
+| 2 | 今晚别自动开 | `qmctl apply manual-normal --apply`（抑制当前夜间窗口） |
+| 3 | 体检 | `Repair-QuietMode.ps1`（只诊断）/ 加 `-Apply` 做三件低风险修复 |
+| 4 | 重建 baseline | `Reset-Baseline.ps1 -Apply`（会重抓；夜间抓会留「原始状态未知」说明） |
+| 5 | 卸载 | `Uninstall-QuietMode.ps1 -Mode DryRun` → `-Mode Apply` |
+| 6 | 退回 v1 | `Install-QuietMode.ps1 -Mode Rollback -DryRun` → 去掉 `-DryRun` |
+
+`Uninstall-QuietMode.ps1` **不删** `baseline` / `recovery` / `logs` —— 那是失败时唯一的退路。
+`-DeployDir` 默认值指向仓库里的 `QuietMode\`，部署到别处时必须显式传。
+
+---
+
+## 日常操作
+
+```powershell
+qmctl status                      # 一次调用给出全部事实
+qmctl state show                  # 只读状态机
+qmctl spin show                   # DISKIDLE 当前值
+qmctl disks verify                # 目标盘联机状态与身份复核
+qmctl task status                 # 任务 + 最后一条心跳 + 距今分钟数
+qmctl maint status                # 维护任务与 SysMain 观测
+```
+
+静音与「硬盘空闲停转」是**两个独立开关**，互不绑定：`spin.enabled=false` 时整个
+`spindown` 步骤标 `skipped`，一个字节都不写。
+
+调度暂停与手动静音都只是**记状态**，真正的动作永远由下一次 reconcile 完成 ——
+「谁决定」和「谁执行」不分裂成两套逻辑。
+
+---
+
+## 兼容性
+
+| 项 | 值 |
+|---|---|
+| PowerShell 5.1 (Desktop) | 通过 |
+| PowerShell 7.7.0 (pwsh) | 通过 |
+| Windows 10 / 11 x64 | 通过 |
+| .NET Framework 4.8.1 | 必需 |
+
+CI 矩阵：`windows × PowerShell 5.1`、`windows × PowerShell 7.7.0`（MSI 精确安装，不用 runner
+预装的 pwsh，也不用 `latest`）、`ubuntu × Core 编译`。任何一条腿失败都不会被 `continue-on-error`
+放行。
+
+测试规模：C# 单测 **123** 项；Pester **155** 条（151 通过 / 4 跳过 —— 跳过的是需要提权的
+真实任务 ACL 集成用例，设 `QM_ALLOW_TASK_INTEGRATION=1` 并在管理员窗口里才跑）。
+
+---
+
+## 开发
+
+```powershell
+.\build\build.ps1                                  # 编译 + 收集 qmctl 到 bin\
+.\build\run-pester.ps1                             # 当前 PowerShell 里跑全部 Pester
+.\build\run-pester.ps1 -NUnitXml testResults.xml    # 顺带出 NUnit XML（CI 用）
+.\powershell\Test-QuietMode.ps1                     # 只读自检
+```
+
+Pester 5 的 session state 会复制变量：`SecurityIdentifier` **对象**传进 `It` 之后会失效，
+`AddAccessRule` 静默失败、`Access.Count` 变成 0。写 ACL 测试时一律在函数内部现取 SID，
+断言用 SDDL 字符串，别断言 `Access.Count`。
+
+含 `exit` 的脚本被 `& script.ps1` 直接调用会把宿主一起结束，测试里必须走子进程
+（`(Get-Process -Id $PID).Path -File`）。
+
+---
 
 ## Windows 中文编码约定
 
@@ -121,100 +368,26 @@ powershell -ExecutionPolicy Bypass -File ".\quiet-hdd-pause.ps1" -Resume -ReArm
   `$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)`。
 - 读文件用 `Get-Content -Raw -Encoding UTF8`；写文件用
   `[System.IO.File]::WriteAllText($p,$s,(New-Object System.Text.UTF8Encoding($false)))`。
-- 含中文的 `.ps1` 存 UTF-8 带 BOM；`.bat/.cmd` 存 GBK(936) 无 BOM；Python 显式 `encoding="utf-8"`。
-- 中文路径一律加引号并用 `-LiteralPath`；命令同时含中文路径与嵌套引号时走 `run_ps.py`。
+- 含中文的 `.ps1` 存 **UTF-8 带 BOM**（不带 BOM 时 PS 5.1 按 936 解码，中文和正则一起坏）；
+  `.bat/.cmd` 存 GBK(936) **无** BOM。`tests/ps/Install-Contract.Tests.ps1` 会检查这两条。
+- 中文路径一律加引号并用 `-LiteralPath`。
 
-## 环境要求
+---
 
-- Windows 10 / 11，PowerShell 5.1
-- .NET Framework 4.8.1 运行时（托盘 / qmctl）+ .NET SDK（编译）
-- 脱机 / 联机磁盘、启停计划任务需要管理员权限（托盘程序会按需弹 UAC）
-- FanControl（风扇曲线切换，用户态命名管道，无需管理员）
+## 文档
 
-## v2.0 重构（已完成）
-
-完整规格见 [`docs/V2_SPEC.md`](docs/V2_SPEC.md)。Phase 0–7 逐段推进，每一段都在真机上跑过再进下一段，不一次性重写全部代码。
-
-**当前版本 `2.0.0`**：C# 单测 118 项、Pester 79 条断言、CI 在 `windows-latest` 上全绿、首夜实测 18 PASS / 0 FAIL、Rollback 与 Uninstall 均已在真机走过一遍并装回。
-
-- **Phase 0 代码审计与行为基线 — 已完成**
-  - `docs/LEGACY_AUDIT.md`：全部脚本入口、计划任务、注册表 / 服务 / 电源 / 磁盘 / 进程 / FanControl IPC 修改点，依赖图，缺口清单；未识别的系统修改 = 0。
-  - `docs/LEGACY_BEHAVIOR.md`：夜间 / 白天 / 开机补跑 / Pause-ReArm / DISKIDLE / 自动静音的实测行为基线，含 2026-11-10 夜间实测异常。
-  - `docs/ARCHITECTURE.md`：现状架构、v2 目标映射、Phase 0–7 路线与迁移安全要点。
-- **Phase 1 统一配置与快照 — 已完成**
-  - 新增 `src/QuietMode.Core`（配置模型、校验、迁移、原子写、快照模型、维护任务唯一清单）与 `src/QuietMode.Windows`（WMI / 任务 COM / 注册表 / 电源只读探测 + `SnapshotManager`）。
-  - `qmctl` 命令行：`config show|validate|init|migrate`、`snapshot create|verify|show`、`state show`、`disks list`。
-  - `C:\ProgramData\QuietMode\{config.json, state.json, baseline.json}`；`config.backup.json` 为 last-known-good，损坏自动回退。
-  - 21 项单测（`tests/QuietMode.Core.Tests`）+ `powershell\Test-QuietMode.ps1` 一键自检，全部通过。
-  - 实机演练：v1 `settings.ini` 迁移为 v2，磁盘 #0/#1 由编号解析为 `uniqueId`+`serialNumber`（非编号匹配）；baseline 采集 10 项任务 / SysMain / MaintenanceBoundary / DISKIDLE 1200s / 5 块磁盘。
-  - 详见 [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)。本阶段所有代码路径均只读，不改系统状态。
-- **Phase 2 磁盘管理重构 — 已完成**
-  - `DiskIdentityResolver`：UniqueId 优先、序列号兜底、容量/总线复核；**磁盘编号永不参与匹配**，无身份或多命中一律拒绝执行。
-  - `DiskSafetyGuard`：系统盘、启动盘、页面文件所在盘、存储池成员、状态未知 —— 硬阻断；`--force` 只能越过「占用」一项。
-  - `Invoke-DiskOperation.ps1`（唯一写入口）在落盘前**用同一身份再复检一次**，执行 `Set-Disk -InputObject`，随后回读 `IsOffline` 验证；未提权返回 `ELEVATION_REQUIRED`，绝不假装成功。
-  - 占用诊断：物理磁盘 I/O 计数器 + 进程路径/命令行线索（handle.exe 为可选增强，不是硬依赖）。
-  - 新增 `ProcessRunner`（并行读 stdout/stderr、真超时、超时杀进程树），所有外部调用统一走它。
-  - `qmctl disks resolve|inspect|offline|online|verify`，默认演练，`--apply` 才动手。
-  - 单测 43 项 + `powershell\Test-DiskSafety.ps1` 只读集成测试（系统盘必须被拦住），全部通过。
-  - 详见 [`docs/DISK_MANAGEMENT.md`](docs/DISK_MANAGEMENT.md)。
-- **Phase 3 Windows 维护管理重构 — 已完成**
-  - 唯一维护清单（`MaintenanceCatalog`）+ 禁改范围自检：Windows Update / Defender / Firewall / BitLocker 等路径写进清单也会被拦下。
-  - 补齐 v1 漏掉的 `Data Integrity Scan for Crash Recovery`；`Regular Maintenance` 按 `NotPresent` 处理（本机确实不存在）。
-  - `MaintenancePlanner` 把夜间顺序固化为步骤：StopTask → DisableTask → SysMain → MaintenanceBoundary / WakeUp；白天严格按 baseline 恢复，baseline 没记录的值一律不写。
-  - `MaintenanceVerifier` 三态结论：`Ok` / `Degraded`（任务仍 Running、读取失败）/ `Failed`（仍未禁用、注册表没写进去）。
-  - 每个写动作 `-ErrorAction Stop` + 写后复读；C# 再独立复观测一次才下结论。未提权 `--apply` 步骤标 `[未执行]`，退出码 2。
-  - 单测 60 项 + `powershell\Test-MaintenanceSafety.ps1` 只读集成测试，全部通过。
-  - 详见 [`docs/MAINTENANCE.md`](docs/MAINTENANCE.md)。
-- **Phase 4 统一 Worker 与调度 — 已完成**
-  - 只保留一个计划任务 `\QuietMode\QuietMode-Reconcile`：23:58 / 10:02 / 开机+2min / 睡眠恢复 / 解锁 / 登录，夜间每 10 分钟校验一次；SYSTEM + Highest、`WakeToRun=false`、忽略并发、10 分钟执行上限。
-  - `StateMachine` 是唯一决策点（10 个状态，优先级：恢复 → 手动 → 暂停 → 时间 → 默认白天），`StateMachine.ApplyRun` 是唯一状态写回点。
-  - `ScheduleWindow` 用完整 `HH:mm` 判跨午夜窗口，开机补偿显式配置（默认开机 15 分钟内、06:00 之后算白天）。
-  - `ReconcilePlanner` 固定顺序：夜间 维护→磁盘→停转→风扇→验证，白天 磁盘→维护→停转→风扇→验证。
-  - `Invoke-QuietModeWorker.ps1` 是唯一执行器：接收请求 JSON，只按步骤做事，不做判断；未提权时全部步骤标 `notrun`，绝不做一半。
-  - 风扇改用 `IpcCtl.exe list` 的 `current=` 回读真实配置（v1 注释里「FanControl 不暴露当前配置名」不成立）。
-  - `qmctl reconcile [auto|night|day|restore|verify] [--trigger X] [--apply]`、`qmctl task status|print|install|uninstall|disable-legacy`、`qmctl state pause|resume|rearm|manual-quiet|manual-normal|auto`。
-  - 单测 76 项 + `powershell\Test-SchedulingSafety.ps1` 只读集成测试（任务 XML 唯一性、演练不改状态、未提权必失败），全部通过。
-  - 漂移修复：自动决策为「无需动作」但回读 `Failed` 时，按当前相位强制重跑一次（`ReconcileVerifier.RepairTarget`），把「以为到位」变成「真的到位」。
-  - 心跳日志 `logs/reconcile.log`：每次 reconcile 都留一行（含无事可做），`qmctl task status` 直接显示最后一条与距今分钟数 —— 调度没跑和跑了没事，终于是两件事。
-  - 详见 [`docs/SCHEDULING.md`](docs/SCHEDULING.md)。
-- **Phase 5 C# 托盘重构 — 已完成**
-  - 2424 行单文件拆成 `Program` + `App`（路径/日志/自启）+ `Core`（qmctl 契约 + 只读 JSON）+ `Ui`（托盘/设置/图标）+ `Diag`。
-  - 删除 `Apply()` 与 `CheckAutoSilent()`：托盘不再自己算窗口、不再拼提权脚本、不再直接碰 WMI / 注册表 / 电源方案。
-  - 新增 `qmctl status`（一次调用给出窗口/决策/风扇/磁盘/停转/任务的完整事实）、`qmctl apply <intent>`（一次用户动作 = 一次提权 = 一次 reconcile）、`qmctl config set`、`qmctl spin show|set`。
-  - 新增 `SpinDownController`：DISKIDLE 独立开关，`powercfg` 写入后独立回读，不一致即 `VERIFY_MISMATCH`。
-  - **2026-11-12 修正**：`spinDown.enabled=true` 时 DISKIDLE 进入 reconcile 链（`spindown` 步骤，night/day 都跑），由 `Invoke-QmSpinDown` 写入、C# 复观测校验 AC/DC；`enabled=false` 时整步 `skipped`、一个字节都不写。起因：配置写 20 分钟、系统实测仍是 300 秒，reconcile 从没管过它。
-  - 修正 `Environment.TickCount & 0x7FFFFFFF` 在开机 24.9 天后回绕成“刚开机几分钟”、导致 06:00–10:02 夜间窗口被误判成白天的问题（改用 `GetTickCount64`）。
-  - 界面只显示观测值：`offline`/`exists` 读不到时序列化为 `null`，显示“状态未知”而不是“正常”；计划任务未注册、v1 闸门仍启用都会常驻警告。
-  - 单测 81 项（新增 5 项托盘契约）+ `Test-QuietMode.ps1` 新增“托盘契约：status 字段齐全（只读）”，全部通过。
-  - 详见 [`docs/TRAY.md`](docs/TRAY.md)。
-- **Phase 6 安装 / 迁移 / 回滚 — 已完成（RC2-01/02）**
-  - `Install-QuietMode.ps1 -Mode DryRun|Apply|Rollback`（在 `powershell/` 下）默认 DryRun，预检分七段，任一 FAIL 都不动系统：环境（PS 5.1 / .NET 4.8 / 管理员）→ 载体完整性（二进制 + 7 个模块 + Worker，逐个大小/版本/sha256）→ 现有安装（config / baseline / v1 三份配置 / v1 四条历史任务 / v2 任务）→ 磁盘稳定身份（必须 `matched` 且有 `uniqueId`）→ 静音窗口与 FanControl 依赖 → baseline 四态可信度 → 完整安装计划。之后：备份 → 部署 → 迁移 → 校验 → 抓 baseline → 权限加固 → 注册任务 → 停用 v1 → 交回自动 → 对齐一次 → 起托盘 → 收尾复核。
-  - **单调度不变量**：v2 注册后回读不到就退出（不动 v1）；v1 停不掉就回滚 v2（回到「只有 v1」）；收尾再复核一次没有并行调度。
-  - 改动前备份 `config.json` / `state.json` / `baseline.json` / v1 三份配置 / 旧任务 XML，并写 `migration-before.txt` 记录迁移前的观测值（明确标注「观测值 ≠ 原始值」）。
-  - 默认 DryRun 只读；Apply 需管理员；Rollback 删 v2 任务、恢复 v1 闸门与安装前的二进制，配置与 baseline 保留便于复诊。
-- **Phase 6 恢复 / 卸载 / 体检 — 已完成（RC2-03/04）**
-  - `Uninstall-QuietMode.ps1`：停调度 → 确认已停 → 磁盘联机 → 维护任务 → SysMain/注册表 → 电源 → 风扇 → 托盘，顺序按「数据可访问性优先」，每步回读；不删 baseline/recovery/logs（那是失败时唯一的退路）；幂等，可重跑续做。
-  - `Repair-QuietMode.ps1`：只诊断，`-Apply` 才做三件低风险修复（重注册任务 / 对齐一次 / 加固权限）；不动磁盘、不动维护任务、不重建 baseline。
-  - `Test-Privilege.ps1`：配置根 ACL 只读体检 + 临时目录里的攻击自测（junction 识别、`..\` 逃逸、绝对路径、盘符、演练模式不改权限）。
-  - 特权路径纪律（`PrivilegedIo`）：请求/结果文件名带随机 nonce、写请求 `FileMode.CreateNew` 绝不跟随预置文件、目录或结果文件是重解析点直接拒绝。
-- **Phase 7 测试与 CI 收尾 — 已完成**
-  - C# 单测 **118 项**（`tests/QuietMode.Core.Tests`，自建 runner，无 xUnit / NUnit 依赖，`dotnet build` 后直接跑 exe）。
-  - Pester 5 测试 **79 条断言**（`tests/ps`，7 个模块），选点优先钉死历史故障而不是追覆盖率：`ConvertFrom-QmTaskHResult` 的 `267011`（从未运行）不得判成 NotPresent、`Resolve-QmSafeChild` 必须拒绝 `..`/盘符/ADS、`Get-QmDiskIdleSeconds` 的 AC/DC 顺序、`Format-QmSize` 的进位边界、维护任务启用位读不到时不得当「已停用」。
-  - CI `.github/workflows/ci.yml`（`windows-latest`）：全解决方案 `dotnet build` → C# 单测 → `qmctl --help` 产物校验 → 装 Pester 5.7 → `tests/ps` → 上传 NUnit XML。不需要 Visual Studio，SDK 风格 csproj + `Microsoft.NETFramework.ReferenceAssemblies` 足以构建 net481。
-  - `powershell/Verify-NightRun.ps1` 把规格 §12 的 A01–A24 变成可复跑的验收表，A24 不再人工，改读「ci.yml 在位 + 本机同批 Pester 全绿」。首夜实测 18 PASS / 0 FAIL / 5 待 10:02 日链。
-  - 基线记录见 [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md)。
-
-```powershell
-# 编译 + 自检（不改系统状态）
-.\build\build.ps1
-.\powershell\Test-QuietMode.ps1
-
-# 查看当前配置 / 磁盘身份
-.\bin\qmctl.exe config validate
-.\bin\qmctl.exe disks list
-```
-
-审计结论：v1 存在两套并行闸门、维护任务清单在 6 处重复定义且不一致、白天恢复用硬编码默认值而非原始快照、磁盘身份只用磁盘编号、Worker 只报 `*_REQUESTED` 不回读验证等 10 项结构性缺陷。系统盘 / 页面文件保护与 DISKIDLE 独立性两项已满足，重构时不得回退。
+| 文档 | 内容 |
+|---|---|
+| [`SAFETY.md`](SAFETY.md) | 写面清单 / 禁改范围 / 失败语义 / 五级退路 / 已知风险 |
+| [`docs/LEGACY.md`](docs/LEGACY.md) | v1 历史实现与迁移说明 |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 分层与数据流 |
+| [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | 配置模型与迁移 |
+| [`docs/SCHEDULING.md`](docs/SCHEDULING.md) | 状态机、窗口、reconcile 链 |
+| [`docs/DISK_MANAGEMENT.md`](docs/DISK_MANAGEMENT.md) | 磁盘身份与安全闸 |
+| [`docs/MAINTENANCE.md`](docs/MAINTENANCE.md) | 维护任务清单与恢复 |
+| [`docs/TRAY.md`](docs/TRAY.md) | 托盘与 qmctl 的契约 |
+| [`docs/RC_BASELINE.md`](docs/RC_BASELINE.md) | 验收基线 |
+| [`CHANGELOG.md`](CHANGELOG.md) | 变更记录 |
 
 ## 许可
 
