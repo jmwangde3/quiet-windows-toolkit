@@ -1,0 +1,212 @@
+name: release
+
+# 只响应正式版本 tag（v1.2.3）。预发布 tag（v1.2.3-rc.1）会被 preflight 判掉，
+# 不会走到发布步骤 —— 让工作流在预发布 tag 上「安静跳过」，而不是「红着失败」。
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: preflight / tag gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      is_release: ${{ steps.gate.outputs.is_release }}
+      version: ${{ steps.gate.outputs.version }}
+    steps:
+      - name: Validate tag shape
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          echo "tag=${tag}"
+          if [[ "${tag}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "is_release=true"  >> "$GITHUB_OUTPUT"
+            echo "version=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}" >> "$GITHUB_OUTPUT"
+            echo "正式 tag：${tag}"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "不是正式版本 tag（${tag}），跳过发布。预发布请手工处理。"
+          fi
+
+  publish:
+    name: publish / build + gate + release
+    needs: preflight
+    if: needs.preflight.outputs.is_release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    env:
+      QM_VERSION: ${{ needs.preflight.outputs.version }}
+      QM_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          dotnet --version
+          $PSVersionTable.PSVersion.ToString()
+
+      - name: Build solution
+        # 托盘工程 QuietMode\build\QuietMode.csproj 在解决方案里，这一条就把
+        # qmctl / 两个 DLL / 托盘全编出来了。不再单独跑 QuietMode\build\build.cmd ——
+        # 那个 .cmd 结尾有 pause，在无人值守的 runner 上只会白等或直接失败。
+        run: dotnet build QuietMode.sln -c Release -v minimal --nologo
+
+      - name: C# unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $PWD 'tests\QuietMode.Core.Tests\bin\Release\net481\QuietMode.Core.Tests.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "未找到测试可执行文件：$exe" }
+          & $exe
+          if ($LASTEXITCODE -ne 0) { throw "单测失败，退出码 $LASTEXITCODE" }
+
+      - name: Install Pester 5.7+
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
+          Install-Module Pester -MinimumVersion 5.7.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Import-Module Pester -MinimumVersion 5.7.0 -Force
+          (Get-Module Pester).Version.ToString()
+
+      - name: Pester (release gate)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File 'build\run-pester.ps1' -NUnitXml 'testResults.xml'
+          if ($LASTEXITCODE -ne 0) { throw "Pester 未通过（退出码 $LASTEXITCODE），不发版" }
+
+      - name: Pack release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & 'build\pack-release.ps1'
+          if ($LASTEXITCODE -ne 0) { throw "打包失败，退出码 $LASTEXITCODE" }
+
+      - name: Verify package matches tag
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "dist\QuietMode-v$env:QM_VERSION-win-x64.zip"
+          if (-not (Test-Path -LiteralPath $zip)) { throw "找不到发布包：$zip" }
+
+          # 1. 包名里的版本必须等于 tag
+          $expect = "QuietMode-v$env:QM_VERSION-win-x64.zip"
+          if ((Split-Path -Leaf $zip) -ne $expect) { throw "包名与 tag 不一致：$zip" }
+
+          # 2. 包内 qmctl 自报的版本必须等于 tag
+          $probe = Join-Path $env:RUNNER_TEMP 'pkgprobe'
+          Expand-Archive -LiteralPath $zip -DestinationPath $probe -Force
+          $exe = Join-Path $probe "QuietMode-v$env:QM_VERSION-win-x64\qmctl.exe"
+          $first = (& $exe --help | Select-Object -First 1)
+          if ("$first" -notmatch "qmctl\s+$([regex]::Escape($env:QM_VERSION))\s*$") {
+            throw "包内 qmctl 版本与 tag 不一致：$first（期望 $env:QM_VERSION）"
+          }
+          Write-Host "包内版本一致：$first"
+
+          # 3. SHA256SUMS.txt 必须逐条对得上（自己校验自己，防止打包时漏文件）
+          $sums = Join-Path $probe "QuietMode-v$env:QM_VERSION-win-x64\SHA256SUMS.txt"
+          if (-not (Test-Path -LiteralPath $sums)) { throw '包内缺少 SHA256SUMS.txt' }
+          $bad = 0
+          $n = 0
+          foreach ($line in (Get-Content -LiteralPath $sums)) {
+            if (-not $line.Trim()) { continue }
+            if ($line -notmatch '^([0-9a-f]{64})\s\s(.+)$') { throw "无法解析校验和行：$line" }
+            $want = $Matches[1]
+            $rel = $Matches[2]
+            $abs = Join-Path (Join-Path $probe "QuietMode-v$env:QM_VERSION-win-x64") ($rel -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $abs)) { throw "校验和里的文件不在包里：$rel" }
+            $got = (Get-FileHash -LiteralPath $abs -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($got -ne $want) { Write-Host "MISMATCH $rel"; $bad++ }
+            $n++
+          }
+          Write-Host "SHA256SUMS 校验 $n 个文件，不一致 $bad 个"
+          if ($bad -gt 0) { throw "发布包自校验失败（$bad 个文件）" }
+
+          # 4. 测试与临时产物不得进包
+          $junk = @(Get-ChildItem -LiteralPath (Join-Path $probe "QuietMode-v$env:QM_VERSION-win-x64") -Recurse -File |
+            Where-Object { $_.FullName -match '\\(tests|obj|\.git)\\' -or $_.Extension -eq '.pdb' })
+          if ($junk.Count -gt 0) { throw "发布包混进了测试/临时产物：$($junk[0].FullName)" }
+          Write-Host '发布包校验通过'
+
+      - name: Upload Pester result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-pester-result
+          path: testResults.xml
+          if-no-files-found: ignore
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuietMode-v${{ env.QM_VERSION }}-win-x64
+          path: |
+            dist/QuietMode-v${{ env.QM_VERSION }}-win-x64.zip
+            dist/QuietMode-v${{ env.QM_VERSION }}-win-x64.zip.sha256
+          if-no-files-found: error
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sums = Get-Content -LiteralPath "dist\QuietMode-v$env:QM_VERSION-win-x64.zip.sha256" -Raw
+          $lines = @(
+            "QuietMode v$env:QM_VERSION —— 变更内容见 CHANGELOG.md 的 ``## $env:QM_VERSION`` 一节。",
+            "",
+            "## 校验",
+            "",
+            '```',
+            $sums.Trim(),
+            '```',
+            "",
+            "## 安装",
+            "",
+            "解压后目录已满足 ``qmctl`` 的 RepoLocator（包根含 ``powershell/Modules``），不需要编译。",
+            "装之前先读 ``SAFETY.md``，然后按 ``README.md`` 的快速开始走：",
+            "",
+            '```powershell',
+            '.\powershell\Install-QuietMode.ps1 -Mode DryRun',
+            '# 管理员窗口',
+            '.\powershell\Install-QuietMode.ps1 -Mode Apply',
+            '```'
+          )
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD 'release-notes.md'),
+            (($lines -join "`n") + "`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${QM_TAG}" \
+            --title "QuietMode v${QM_VERSION}" \
+            --notes-file release-notes.md \
+            --verify-tag \
+            "dist/QuietMode-v${QM_VERSION}-win-x64.zip" \
+            "dist/QuietMode-v${QM_VERSION}-win-x64.zip.sha256"

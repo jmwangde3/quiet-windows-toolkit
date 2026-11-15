@@ -8,5 +8,6 @@ node_modules/
 _publish/
 bin/
 obj/
+dist/
 .workbuddy/
 .trae/
