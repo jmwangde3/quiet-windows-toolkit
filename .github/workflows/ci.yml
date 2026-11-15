@@ -162,13 +162,28 @@ jobs:
           Write-Host "first = $first"
           if ($first -notmatch '^qmctl\s+\d+\.\d+\.\d+') { throw "qmctl --help 首行不是版本行：$first" }
 
-      - name: Install Pester 5.7+
+      - name: Install Pester (pinned)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $boot = "Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue; Install-Module Pester -MinimumVersion 5.7.0 -Force -SkipPublisherCheck -Scope CurrentUser"
+          # 版本必须钉死。用 -MinimumVersion 5.7.0 时 runner 装到的是 6.2.0，
+          # 而开发机上是 5.7.1 —— 两边 Pester 大版本不同，一边绿一边红就没法
+          # 互相印证，等于白跑一遍矩阵。
+          $want = '5.7.1'
+          $boot = "Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue; Install-Module Pester -RequiredVersion $want -Force -SkipPublisherCheck -Scope CurrentUser"
           & $env:QM_PWSH -NoProfile -ExecutionPolicy Bypass -Command $boot
           if ($LASTEXITCODE -ne 0) { throw "Pester 安装失败，退出码 $LASTEXITCODE" }
+
+          # 装完自证：run-pester.ps1 用 -MinimumVersion 解析模块，
+          # 机器上若还有更高版本，它可能选到别的版本。
+          $probe = 'Import-Module Pester -MinimumVersion 5.7.0 -Force; (Get-Module Pester).Version.ToString()'
+          $out = & $env:QM_PWSH -NoProfile -ExecutionPolicy Bypass -Command $probe
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "取 Pester 版本失败，退出码 $code" }
+          $lines = @(@($out) | Where-Object { $_ })
+          $actual = "$($lines[$lines.Count - 1])".Trim()
+          Write-Host "Pester = $actual"
+          if ($actual -ne $want) { throw "Pester 版本不符：期望 $want，实际 $actual" }
 
       - name: Pester (all tests + NUnit XML)
         shell: pwsh

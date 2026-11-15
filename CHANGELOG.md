@@ -88,7 +88,7 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 锁版本这件事必须能自证，否则 runner 镜像一换就静默失去覆盖。
 `fail-fast: false` 只是为了让两条腿都跑完方便对比，**没有任何 `continue-on-error`**。
 
-首跑两条腿都红了，两个原因都不在代码而在工作流自己，已修：
+首跑两条腿都红了。修完前两个又红了一次，第三个才是真问题。四件事：
 
 1. **7.7.0 腿下载 msi 拿到 404。** v7.7.0 的发布资产里只有
    `PowerShell-7.7.0-win-x64.zip` / `.msixbundle`，没有 `.msi`。
@@ -99,6 +99,17 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
    早停管道会掐断原生进程，退出码再也不会被记录：pwsh 7 下是 `$null`，
    PS 5.1 下是被杀进程的非零残值，两条路都撞上 `-ne 0`。
    改成先收全部输出、再看退出码、最后取首行。`release.yml` 的同款写法一并改掉。
+3. **一条测试写死了开发者机器。** `TaskState` 的真机用例断言
+   「`\QuietMode\QuietMode-Reconcile` 若存在必须读到 `Exists=true`」，
+   而 runner 上根本没装 v2 —— `false` 才是正确答案，两条腿都红在它上面。
+   改成拿「枚举任务后按路径+名字找」当参照物：只回答在不在，不碰异常文本，
+   所以不会跟被测判据同源出错。三种情况各断言一条：
+   探针看得到 → 不许判 `false`；提权且探针看不到 → 必须确定为 `false`；
+   未提权 → 必须 `null`（看不见 ≠ 不存在）。
+4. **Pester 版本漂移。** `-MinimumVersion 5.7.0` 在 runner 上装到了 **6.2.0**，
+   开发机是 **5.7.1**。测试框架大版本不同，一边绿一边红就没法互相印证，
+   等于白跑一遍矩阵。改成 `-RequiredVersion 5.7.1` 精确安装，装完回读断言；
+   `release.yml` 用同一个字面量，并用契约测试强制两边一致。
 
 ### 8. 可复现发布包
 
@@ -154,10 +165,10 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 |---|---|---|
 | `tests/ps/QuietMode.TaskState.Tests.ps1` | 38 | 路径拆分、不存在 6 例、无法确认 10 例、SDDL 判据 10 例、是否提权、真机只读 4 例 |
 | `tests/ps/Grant-TaskRead.Tests.ps1` | 20 | 内存 ACL 判据 9 例、SDDL 与 ACL 一致性 4 组、脚本契约 5 例（子进程取退出码）、真实任务集成 4 例（默认跳过） |
-| `tests/ps/Install-Contract.Tests.ps1` | 24 | 全目录 PS1/PSM1 双版本 Parser 语法、BOM/换行约定、版本号层次、安装器契约、DryRun 与回滚演练子进程验证；其中 6 条是 CI 工作流契约（双版本矩阵、无 `continue-on-error`、PS 7 走 zip 不走 msi、`--help` 不得接早停管道、tag 逐段判定、不自己打 tag） |
+| `tests/ps/Install-Contract.Tests.ps1` | 25 | 全目录 PS1/PSM1 双版本 Parser 语法、BOM/换行约定、版本号层次、安装器契约、DryRun 与回滚演练子进程验证；其中 7 条是 CI 工作流契约（双版本矩阵、无 `continue-on-error`、PS 7 走 zip 不走 msi、`--help` 不得接早停管道、tag 逐段判定、不自己打 tag、两个工作流钉同一个 Pester 版本） |
 
-原有 8 个测试文件 79 条**一条没删**。合计 **161 条**：
-PowerShell 5.1 `Total=161 Passed=157 Failed=0 Skipped=4`，
+原有 8 个测试文件 79 条**一条没删**。合计 **162 条**：
+PowerShell 5.1 `Total=162 Passed=158 Failed=0 Skipped=4`，
 PowerShell 7.7.0 同一组数字。4 条跳过的是需要提权的真实任务 ACL 集成用例
 （`QM_ALLOW_TASK_INTEGRATION=1` 才跑）。C# 单测 **123 项**全部通过。
 

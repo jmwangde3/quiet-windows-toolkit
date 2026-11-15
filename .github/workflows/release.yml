@@ -82,14 +82,19 @@ jobs:
           & $exe
           if ($LASTEXITCODE -ne 0) { throw "单测失败，退出码 $LASTEXITCODE" }
 
-      - name: Install Pester 5.7+
+      - name: Install Pester (pinned)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # 与 ci.yml 同一个版本：发版门禁跑的测试必须和日常 CI 跑的是同一套，
+          # 否则「CI 绿但发版红」永远说不清是代码还是测试框架版本。
+          $want = '5.7.1'
           Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
-          Install-Module Pester -MinimumVersion 5.7.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Install-Module Pester -RequiredVersion $want -Force -SkipPublisherCheck -Scope CurrentUser
           Import-Module Pester -MinimumVersion 5.7.0 -Force
-          (Get-Module Pester).Version.ToString()
+          $actual = (Get-Module Pester).Version.ToString()
+          Write-Host "Pester = $actual"
+          if ($actual -ne $want) { throw "Pester 版本不符：期望 $want，实际 $actual" }
 
       - name: Pester (release gate)
         shell: pwsh

@@ -229,14 +229,48 @@ Describe 'Get-QmTaskState — 真机只读' {
         $r.Reason | Should -Be 'Unconfirmed:BadName'
     }
 
-    It '已注册的 v2 任务若存在必须读到 Exists=true —— 读不到只允许 null，不允许 false' {
-        $r = Get-QmTaskState -FullName '\QuietMode\QuietMode-Reconcile'
-        if ($null -eq $r.Exists) {
-            $r.Exists | Should -BeNullOrEmpty          # 无法确认，可接受
+    It '真机结论必须与独立探针一致：读得到不许判 false，判 false 必须真不存在' {
+        # 这条用例原先写死了「已注册的 v2 任务 → 必须 Exists=true」。
+        # 那是开发者机器的假设：CI runner 上根本没装 v2，false 才是正确答案，
+        # 于是两条腿都红在同一条断言上。
+        # 现在改用「枚举后按路径+名字找」当参照物：它只回答在不在，
+        # 不碰任何异常文本，所以不会跟被测的判据同源出错。
+        $name = '\QuietMode\QuietMode-Reconcile'
+
+        $probeErr = $null
+        $all = $null
+        try { $all = @(Get-ScheduledTask -ErrorAction Stop) } catch { $probeErr = $_ }
+        if ($probeErr) {
+            Set-ItResult -Skipped -Because ('独立探针枚举不了任务：' + $probeErr.Exception.Message)
+            return
+        }
+        $probeExists = @($all | Where-Object {
+                $_.TaskPath -eq '\QuietMode\' -and $_.TaskName -eq 'QuietMode-Reconcile'
+            }).Count -gt 0
+        $isAdmin = Test-QmAdmin
+
+        $r = Get-QmTaskState -FullName $name
+
+        if ($probeExists) {
+            # 探针读到了：不允许判「不存在」。true 可以，null 也可以（本进程读不全）。
+            $r.Exists | Should -Not -BeFalse -Because "枚举能看到 $name"
+            if ($r.Exists -eq $true) {
+                $r.Enabled | Should -BeOfType [bool]
+            }
+            return
+        }
+
+        if ($isAdmin) {
+            # 提权 + 探针也看不到 = 这个任务真的不存在，false 是唯一正确答案。
+            # 注意 Exists 可能是 $null，而 $null -eq $false 求值为 $false，
+            # 所以必须显式比对 $false，别用 -BeFalse（它对 $null 也会过）。
+            ($r.Exists -eq $false) | Should -BeTrue -Because '提权且探针看不到，必须给出确定的「不存在」'
+            $r.Reason | Should -Be 'NotFound'
+        }
+        else {
+            # 未提权：文件夹 ACL 的访问检查发生在任务对象之前，看不见 ≠ 不存在
+            $r.Exists | Should -BeNullOrEmpty
             $r.Reason | Should -Match '^Unconfirmed:'
-        } else {
-            $r.Exists | Should -BeTrue
-            $r.Enabled | Should -BeOfType [bool]
         }
     }
 }

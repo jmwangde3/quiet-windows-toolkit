@@ -310,4 +310,19 @@ Describe 'CI 工作流契约：矩阵、版本锁定与退出码判据' {
         }
         $bad -join ' | ' | Should -BeNullOrEmpty -Because 'tag 由人决定，工作流只消费'
     }
+
+    It '两个工作流钉同一个 Pester 版本，且不用 -MinimumVersion 安装' {
+        # -MinimumVersion 5.7.0 在 runner 上装到了 6.2.0，开发机是 5.7.1。
+        # 测试框架大版本不同，一边绿一边红就没法互相印证 —— 钉死并互相校验。
+        $verCi  = [regex]::Match($script:CiText,  '\$want\s*=\s*''([0-9]+\.[0-9]+\.[0-9]+)''').Groups[1].Value
+        $verRel = [regex]::Match($script:RelText, '\$want\s*=\s*''([0-9]+\.[0-9]+\.[0-9]+)''').Groups[1].Value
+        $verCi  | Should -Not -BeNullOrEmpty -Because 'ci.yml 里应有 $want = ''x.y.z'''
+        $verRel | Should -Not -BeNullOrEmpty -Because 'release.yml 里应有 $want = ''x.y.z'''
+        $verRel | Should -Be $verCi -Because '发版门禁与日常 CI 必须跑同一套测试框架'
+
+        foreach ($t in @($script:CiText, $script:RelText)) {
+            $t | Should -Match 'Install-Module Pester -RequiredVersion'
+            $t | Should -Not -Match 'Install-Module Pester -MinimumVersion'
+        }
+    }
 }
