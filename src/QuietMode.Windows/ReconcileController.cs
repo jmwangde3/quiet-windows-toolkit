@@ -430,7 +430,7 @@ namespace QuietMode.Windows
                     : new List<string>(run.Verification.Problems.Count > 20
                         ? run.Verification.Problems.GetRange(0, 20)
                         : run.Verification.Problems);
-                StateMachine.ApplyRun(state, run.Action, verdict, run.Error, DateTime.UtcNow, nightOk);
+                StateMachine.ApplyRun(state, run.Action, verdict, run.Error, DateTime.UtcNow, nightOk, run.Trigger);
                 // 写「跑完之后停在哪」，不是「跑之前打算进哪」：照抄决策值会让 state.json
                 // 整夜停在 EnteringNight、整个白天停在 EnteringDay，与实机相位差一格。
                 if (run.Decision != null)

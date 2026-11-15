@@ -413,9 +413,11 @@ namespace QuietMode.Core.Scheduling
         /// <summary>
         /// 把一次执行结果写回状态。集中放在这里，避免各模块各写各的。
         /// verdict: Ok | Degraded | Failed | NotRun
+        /// trigger: boot | resume | unlock | schedule | timer | manual | install | uninstall | cli
+        ///          —— 只用来记「开机补跑确实发生过」，不参与任何决策。
         /// </summary>
         public static void ApplyRun(QuietModeState st, string action, string verdict, string errorCode,
-                                    DateTime utcNow, bool nightSucceeded)
+                                    DateTime utcNow, bool nightSucceeded, string trigger = null)
         {
             if (st == null) return;
             string stamp = utcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture);
@@ -423,6 +425,13 @@ namespace QuietMode.Core.Scheduling
             st.LastVerdict = verdict ?? "";
             st.LastErrorCode = errorCode ?? "";
             st.LastReconcileAction = action ?? "";
+
+            // 开机补跑的唯一凭据。A09 只能证明任务 XML 里有 BootTrigger，证明不了它真跑过；
+            // 这个字段落盘之后，重启一次就能从 state.json 直接读出「几点几分补跑了什么」。
+            if (string.Equals(trigger, "boot", StringComparison.OrdinalIgnoreCase))
+            {
+                st.LastBootReconcileUtc = stamp;
+            }
 
             bool ok = string.Equals(verdict, "Ok", StringComparison.OrdinalIgnoreCase);
             st.ConsecutiveFailures = ok ? 0 : st.ConsecutiveFailures + 1;

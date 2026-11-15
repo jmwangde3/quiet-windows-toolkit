@@ -319,6 +319,32 @@ namespace QuietMode.Core.Tests
                 Eq("DISK_STUCK", st.LastErrorCode);
             });
 
+            Run("状态机：只有 boot 触发才记开机补跑时间", delegate
+            {
+                QuietModeState st = new QuietModeState();
+                Eq("", st.LastBootReconcileUtc);                            // 新状态必须为空
+
+                // 调度心跳不许写这个字段 —— 否则 A09 就没法区分「开机补跑」和「例行心跳」
+                StateMachine.ApplyRun(st, "night", "Ok", "",
+                                      new DateTime(2026, 11, 15, 1, 0, 0, DateTimeKind.Utc), true, "schedule");
+                Eq("", st.LastBootReconcileUtc);
+
+                // 开机补跑才写，格式与其它时间戳一致
+                StateMachine.ApplyRun(st, "night", "Ok", "",
+                                      new DateTime(2026, 11, 15, 2, 0, 0, DateTimeKind.Utc), true, "boot");
+                Eq("2026-11-15T02:00:00Z", st.LastBootReconcileUtc);
+
+                // 之后的心跳不能把它冲掉：它记录的是「最近一次开机补跑」，不是心跳时间
+                StateMachine.ApplyRun(st, "none", "Ok", "",
+                                      new DateTime(2026, 11, 15, 3, 0, 0, DateTimeKind.Utc), false, "schedule");
+                Eq("2026-11-15T02:00:00Z", st.LastBootReconcileUtc);
+
+                // 大小写不敏感，触发名统一来自任务命令行
+                StateMachine.ApplyRun(st, "day", "Ok", "",
+                                      new DateTime(2026, 11, 16, 9, 0, 0, DateTimeKind.Utc), false, "Boot");
+                Eq("2026-11-16T09:00:00Z", st.LastBootReconcileUtc);
+            });
+
             Run("计划：夜间顺序 = 维护 → 磁盘 → 停转 → 风扇 → 验证", delegate
             {
                 ReconcilePlan p = ReconcilePlanner.Build("night", "timer", "", FullConfig(), NightMaintenance());

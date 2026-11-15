@@ -1,5 +1,34 @@
 # 变更记录
 
+## 2.0.3 — 2026-11-15
+
+### 修复：`lastBootReconcileUtc` 是死字段，开机补跑无法自证
+
+`QuietModeState` 里这个字段从 schema 5 起就存在 —— 声明了、序列化了、读取了，
+**但全代码库没有一处写入**。后果是 `state.json` 里它恒为 `""`：任务带着
+`<BootTrigger>`，重启后到底补跑没补跑，从状态文件里看不出来。
+
+验收项 A09 因此只能给到「任务 XML 含 BootTrigger（需真重启验证）」这种半吊子结论 ——
+它证明的是「任务被配置成开机跑」，不是「开机真的跑了」。
+
+改法：`StateMachine.ApplyRun` 增加 `trigger` 参数（默认 `null`，不破坏既有调用），
+只有 `trigger=boot` 才落盘这个时间戳：
+
+```csharp
+if (string.Equals(trigger, "boot", StringComparison.OrdinalIgnoreCase))
+{
+    st.LastBootReconcileUtc = stamp;
+}
+```
+
+刻意**不**让 `schedule` 心跳覆盖它 —— 这个字段的语义是「最近一次开机补跑发生在何时」，
+不是「最近一次心跳」。被心跳冲掉就失去意义了。
+
+`ReconcileController` 把 `run.Trigger` 传进去，触发名来自任务命令行 `--trigger boot`。
+
+单测 122 → **123**（4 个断言：新状态为空、调度不写、boot 写入、后续心跳不覆盖、
+大小写不敏感）。Pester 79/79 仍全绿。
+
 ## 2.0.2 — 2026-11-15
 
 ### 修复：验收脚本把「机器状态正确」误判成 FAIL
