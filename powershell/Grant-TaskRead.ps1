@@ -321,30 +321,33 @@ foreach ($raw in $Folders) {
         continue
     }
 
-    $check = Wait-SecurityDescriptor -Fetch { $svc.GetFolder($path) } -Flags $DaclOnly
-    if (-not $check) {
+    # 变量名别叫 $check：本脚本有 [switch]$Check 形参，PowerShell 变量名不区分大小写，
+    # 给同名变量赋字符串会抛 ArgumentTransformationMetadataException（-Apply 写入路径
+    # 直接死在回读这一步，而 -Check 只读分支永远走不到，所以本地 DryRun 抓不到）。
+    $sdAfter = Wait-SecurityDescriptor -Fetch { $svc.GetFolder($path) } -Flags $DaclOnly
+    if (-not $sdAfter) {
         Write-Host '  FAIL 写入后回读不到安全描述符' -ForegroundColor Red
         $failed++
         continue
     }
-    if (-not (Test-UsersReadAce $check)) {
+    if (-not (Test-UsersReadAce $sdAfter)) {
         Write-Host '  FAIL 写入后回读不到 Users ACE' -ForegroundColor Red
-        Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+        Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
         $failed++
         continue
     }
     # 原有 ACE 一条都不能少（防止 SetSecurityDescriptor 把 DACL 覆盖成只剩新 ACE）
     $lost = 0
     foreach ($m in [regex]::Matches($before, '\([AD];[^()]*\)')) {
-        if ($check.IndexOf($m.Value) -lt 0) { $lost++ }
+        if ($sdAfter.IndexOf($m.Value) -lt 0) { $lost++ }
     }
     if ($lost -gt 0) {
         Write-Host ("  FAIL 写回后丢了 " + $lost + " 条原有 ACE") -ForegroundColor Red
-        Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+        Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
         $failed++
         continue
     }
-    Write-Host ("  DONE 已追加 : " + $check) -ForegroundColor Green
+    Write-Host ("  DONE 已追加 : " + $sdAfter) -ForegroundColor Green
 
     $r = Grant-TaskFileRead -FolderPath $path -OnlyNames $TaskNames
     Write-Host ("  任务文件 : 共 " + $r.Total + " 个，补授权 " + $r.Added + " 个")
@@ -438,29 +441,29 @@ if ($IncludeTasks) {
                 $bad++; continue
             }
 
-            $check = Wait-SecurityDescriptor -Fetch { $folder.GetTask($name) } -Flags $DaclOnly
-            if (-not $check) {
+            $sdAfter = Wait-SecurityDescriptor -Fetch { $folder.GetTask($name) } -Flags $DaclOnly
+            if (-not $sdAfter) {
                 Write-Host ("  FAIL " + $name + " 写入后回读不到 SD（重新取对象重试 8 次全空）") -ForegroundColor Red
                 Write-Host ("       原值已备份：" + $bak) -ForegroundColor Yellow
                 Write-Host ("       兜底：Fix-TaskVisibility.ps1 -Apply -Targets '" + $fullName + "'") -ForegroundColor Yellow
                 $bad++; continue
             }
-            if (-not (Test-UsersReadAce -Sddl $check)) {
+            if (-not (Test-UsersReadAce -Sddl $sdAfter)) {
                 Write-Host ("  FAIL " + $name + " 回读仍没有 Users 读") -ForegroundColor Red
-                Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+                Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
                 $bad++; continue
             }
             $lost = 0
             foreach ($m in [regex]::Matches($before, '\([AD];[^()]*\)')) {
-                if ($check.IndexOf($m.Value) -lt 0) { $lost++ }
+                if ($sdAfter.IndexOf($m.Value) -lt 0) { $lost++ }
             }
             if ($lost -gt 0) {
                 Write-Host ("  FAIL " + $name + " 写回后丢了 " + $lost + " 条原有 ACE") -ForegroundColor Red
-                Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+                Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
                 $bad++; continue
             }
             Write-Host ("  DONE " + $name) -ForegroundColor Green
-            Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+            Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
             $done++
         }
 

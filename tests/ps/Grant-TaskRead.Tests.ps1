@@ -164,6 +164,66 @@ Describe 'Grant-TaskRead 脚本契约' {
             $names | Should -Contain $n
         }
     }
+
+    It '不得给 [switch] 形参的同名变量赋非布尔值 —— $check 撞 [switch]$Check，写入路径当场崩' {
+        # 事故现场（2026-11-15，CI 第一次真跑真实 ACL 写入，本机 DryRun 抓不到）：
+        #   Grant-TaskRead.ps1 : Cannot convert value "System.String" to type
+        #   "System.Management.Automation.SwitchParameter". ...
+        # PowerShell 变量名不区分大小写，[switch]$Check 是个带类型约束的变量，
+        # `$check = Wait-SecurityDescriptor ...` 往它里面塞 SDDL 字符串就抛
+        # ArgumentTransformationMetadataException，-Apply 直接死在「写后回读」那一步。
+        # 为什么本地一直没暴露：写入路径要求「已提权 + 目标文件夹还没有 Users 读」，
+        # 本机 DryRun 走的是「已有 Users 读，跳过文件夹」分支，永远碰不到这几行。
+        #
+        # 判据（本机 5.1 实测过的取值面）：赋值给 switch 变量只有布尔形态合法 ——
+        #   [bool]$x / $true / $false  → OK
+        #   'D:...' / 1                → 抛错（注意 Int32 也抛，尽管参数绑定文案里写着「1 或 0」）
+        # 所以这里只放行 [bool] 强转与 $true/$false 字面量，其余一律算撞名。
+        $psRoot = Join-Path $PSScriptRoot '..\..\powershell'
+        # 显式按扩展名过滤：-Include 与 -LiteralPath 一起用不过滤（实测会连 .cmd 一起返回）
+        $files = @(Get-ChildItem -LiteralPath $psRoot -Recurse -File |
+                   Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.psm1' })
+        # 下限防止过滤条件写坏后「零文件 → 零命中 → 假绿」
+        $files.Count | Should -BeGreaterThan 20
+
+        $boolCast = '^\s*\[(bool|Boolean|switch|SwitchParameter|System\.Boolean|System\.Management\.Automation\.SwitchParameter)\]'
+        $boolLiteral = '^\s*\$(true|false)\s*$'
+        $clash = New-Object System.Collections.ArrayList
+
+        foreach ($f in $files) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+
+            $switches = @(
+                $ast.FindAll({
+                    param($n)
+                    $n -is [System.Management.Automation.Language.ParameterAst] -and
+                    $null -ne $n.StaticType -and $n.StaticType -eq [switch]
+                }, $true) | ForEach-Object { $_.Name.VariablePath.UserPath }
+            )
+            if ($switches.Count -eq 0) { continue }
+
+            $assignments = $ast.FindAll({
+                param($n)
+                $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                $n.Left -is [System.Management.Automation.Language.VariableExpressionAst]
+            }, $true)
+
+            foreach ($a in $assignments) {
+                $name = $a.Left.VariablePath.UserPath
+                if (@($switches | Where-Object { $_ -ieq $name }).Count -eq 0) { continue }
+
+                # 右值是 PipelineAst（哪怕只包了一个表达式），所以按 extent 文本判断，
+                # 不按 AST 类型判断 —— `$x = [bool]$y` 的 Right 并不是 ConvertExpressionAst。
+                $rhsText = $a.Right.Extent.Text
+                if ($rhsText -match $boolCast) { continue }
+                if ($rhsText -match $boolLiteral) { continue }
+
+                [void]$clash.Add($f.Name + ' : $' + $name + ' = ' + $rhsText)
+            }
+        }
+
+        $clash | Should -BeNullOrEmpty -Because ('以下赋值往 [switch] 变量里塞非布尔值，运行期会抛 ArgumentTransformationMetadataException：' + (@($clash) -join ' / '))
+    }
 }
 
 Describe 'Grant-TaskRead 真实任务集成（临时文件夹，需要提权 + 显式开关）' {
