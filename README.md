@@ -333,12 +333,15 @@ qmctl maint status                # 维护任务与 SysMain 观测
 | Windows 10 / 11 x64 | 通过 |
 | .NET Framework 4.8.1 | 必需 |
 
-CI 矩阵：`windows × PowerShell 5.1`、`windows × PowerShell 7.7.0`（MSI 精确安装，不用 runner
+CI 矩阵：`windows × PowerShell 5.1`、`windows × PowerShell 7.7.0`（官方 zip 精确安装，不用 runner
 预装的 pwsh，也不用 `latest`）、`ubuntu × Core 编译`。任何一条腿失败都不会被 `continue-on-error`
-放行。
+放行。Pester 版本也钉死（`-RequiredVersion 5.7.1`）—— 测试框架版本漂移会让「一边绿一边红」
+变成无法解释的事。
 
-测试规模：C# 单测 **123** 项；Pester **155** 条（151 通过 / 4 跳过 —— 跳过的是需要提权的
-真实任务 ACL 集成用例，设 `QM_ALLOW_TASK_INTEGRATION=1` 并在管理员窗口里才跑）。
+测试规模：C# 单测 **123** 项；Pester **162** 条（本机 158 通过 / 4 跳过，CI runner 上
+157 通过 / 5 跳过）。跳过的是需要真实任务 ACL 写入的集成用例（设 `QM_ALLOW_TASK_INTEGRATION=1`
+并在管理员窗口里才跑），以及那条「未提权时 `-Apply` 必须返回 3」—— 它只在非提权会话里执行，
+而 CI runner 本身是提权的。
 
 ---
 

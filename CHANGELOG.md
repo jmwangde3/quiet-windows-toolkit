@@ -118,8 +118,8 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 实测同一份输入连打两次 SHA256 完全一致：
 
 ```
-477c038b960df48076ddad7fba7af31f4a42766507e902596da31453e747dbc2
-371,853 B / 50 个条目
+7c31f676eeb3a1e06b176f18a6f49a732003c645e3d5f14ef79bc6baef90f271
+373,011 B / 50 个条目
 ```
 
 包里含：`qmctl.exe`、`QuietMode.exe`、两个 DLL、两份 `.config`、`powershell\` 全树
