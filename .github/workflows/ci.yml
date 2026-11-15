@@ -15,9 +15,10 @@ concurrency:
 
 # 测试矩阵的硬约定：
 #   1. 每条 Windows 腿都必须真跑一遍现有全部测试（C# 单测 + 全部 Pester），不按版本裁剪。
-#   2. PowerShell 版本必须锁死：5.1 是系统自带，7.7.0 用 MSI 精确安装。
+#   2. PowerShell 版本必须锁死：5.1 是系统自带，7.7.0 从官方 zip 取精确版本。
 #      不用 `latest`，也不用 runner 预装的 pwsh —— 预装版本会随镜像漂移，
 #      「昨天绿今天红」就没法判断是代码变了还是环境变了。
+#      注意：v7.7.0 的发布资产里没有 .msi，只有 win-x64.zip / msixbundle。
 #   3. 任何一条腿失败都不得用 continue-on-error 掩盖；fail-fast 关掉只是为了让
 #      两条腿都把结果跑完，方便一次看到 5.1 与 7.x 的差异，不是为了放行失败。
 
@@ -31,17 +32,13 @@ jobs:
       matrix:
         ps:
           - label: '5.1 (Desktop)'
-            interpreter: 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+            kind: system
             expect: '5.1.*'
             artifact: pester-result-ps51
           - label: '7.7.0 (pwsh)'
-            interpreter: 'C:\Program Files\PowerShell\7\pwsh.exe'
+            kind: zip
             expect: '7.7.0'
             artifact: pester-result-ps770
-
-    env:
-      # 所有 PowerShell 代码都显式走这个解释器，不依赖 PATH 上的 pwsh。
-      QM_PWSH: ${{ matrix.ps.interpreter }}
 
     steps:
       - name: Checkout
@@ -52,27 +49,82 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Install PowerShell 7.7.0 (pinned)
-        if: matrix.ps.expect == '7.7.0'
+      # 解释器路径由这一步解析并写进 GITHUB_ENV，后续所有步骤只认 $env:QM_PWSH。
+      # 不依赖 PATH 上的 pwsh：runner 预装的是哪个版本我们不管，也不想知道。
+      - name: Resolve interpreter (${{ matrix.ps.kind }})
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $msi = Join-Path $env:RUNNER_TEMP 'PowerShell-7.7.0-win-x64.msi'
-          $url = 'https://github.com/PowerShell/PowerShell/releases/download/v7.7.0/PowerShell-7.7.0-win-x64.msi'
-          Write-Host "download $url"
-          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
-          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/quiet', '/norestart', 'ADD_PATH=1') -Wait -PassThru
-          if ($p.ExitCode -ne 0) { throw "msiexec 退出码 $($p.ExitCode)" }
-          if (-not (Test-Path -LiteralPath "$env:QM_PWSH")) { throw "安装后仍找不到 $env:QM_PWSH" }
+
+          if ('${{ matrix.ps.kind }}' -eq 'system') {
+            $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            if (-not (Test-Path -LiteralPath $exe)) { throw "找不到系统 PowerShell：$exe" }
+          }
+          else {
+            # v7.7.0 没有 msi 资产，只有 zip。取官方 zip 解压到临时目录，
+            # 版本由目录名固定，不写 latest 也不走包管理器。
+            $ver = '7.7.0'
+            $zip = Join-Path $env:RUNNER_TEMP "PowerShell-$ver-win-x64.zip"
+            $dir = Join-Path $env:RUNNER_TEMP "pwsh-$ver"
+            $url = "https://github.com/PowerShell/PowerShell/releases/download/v$ver/PowerShell-$ver-win-x64.zip"
+
+            Write-Host "download $url"
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+            $size = (Get-Item -LiteralPath $zip).Length
+            Write-Host "downloaded $size bytes"
+            if ($size -lt 20MB) { throw "下载体积异常（$size 字节），多半拿到的是错误页面" }
+
+            # 只读探测：先确认这是个真 zip，而不是 GitHub 的 404 页面。
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            try {
+              $probe = [System.IO.Compression.ZipFile]::OpenRead($zip)
+              $names = $probe.Entries | ForEach-Object { $_.FullName }
+              $probe.Dispose()
+            }
+            catch { throw "下载到的不是合法 zip：$($_.Exception.Message)" }
+            if (-not (@($names | Where-Object { $_ -like '*pwsh.exe' }).Count)) {
+              throw "zip 里没有 pwsh.exe，条目数 $($names.Count)"
+            }
+
+            if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -Confirm:$false }
+            Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+
+            # 不假设 pwsh.exe 一定在解压根目录：官方包目前是这样，但布局不由我们决定。
+            $exe = Join-Path $dir 'pwsh.exe'
+            if (-not (Test-Path -LiteralPath $exe)) {
+              $found = Get-ChildItem -LiteralPath $dir -Recurse -File -Filter 'pwsh.exe' |
+                Select-Object -First 1
+              if (-not $found) { throw "解压后在 $dir 下找不到 pwsh.exe" }
+              $exe = $found.FullName
+            }
+            Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "QM_PWSH = $exe"
+          # GITHUB_ENV 用无 BOM UTF-8 追加，避免 PS 5.1 的 Out-File 把 BOM 写进变量名。
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_ENV,
+            "QM_PWSH=$exe`n",
+            (New-Object System.Text.UTF8Encoding($false)))
 
       - name: Assert interpreter version
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          if (-not $env:QM_PWSH) { throw 'QM_PWSH 未设置，上一步没写进 GITHUB_ENV' }
           if (-not (Test-Path -LiteralPath $env:QM_PWSH)) { throw "找不到解释器：$env:QM_PWSH" }
-          $actual = (& $env:QM_PWSH -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')
-          if ($LASTEXITCODE -ne 0) { throw "取版本失败，退出码 $LASTEXITCODE" }
-          $actual = "$actual".Trim()
+
+          # 注意：这里不能用 `| Select-Object -First 1` 之类的早停管道。
+          # 下游一停止接收，原生进程被掐断，$LASTEXITCODE 会变成 $null，
+          # 于是 `$null -ne 0` 成立、把一次成功的调用判成失败（本仓库踩过）。
+          $out = & $env:QM_PWSH -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "取版本失败，退出码 $code" }
+          # 先包成数组再取下标：单元素时管道返回标量，标量上 [-1] 取的是最后一个字符。
+          $lines = @(@($out) | Where-Object { $_ })
+          if ($lines.Count -eq 0) { throw '取版本没有任何输出' }
+          $actual = "$($lines[$lines.Count - 1])".Trim()
+
           Write-Host "interpreter = $env:QM_PWSH"
           Write-Host "version     = $actual"
           if ($actual -notlike '${{ matrix.ps.expect }}') {
@@ -97,10 +149,18 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tool = Join-Path $PWD 'src\QuietMode.Cli\bin\Release\net481\qmctl.exe'
           if (-not (Test-Path -LiteralPath $tool)) { throw "构建产物缺失：$tool" }
-          $first = (& $tool --help | Select-Object -First 1)
-          Write-Host $first
-          if ($LASTEXITCODE -ne 0) { throw "qmctl --help 退出码 $LASTEXITCODE" }
-          if ("$first" -notmatch '^\s*qmctl\s+\d+\.\d+\.\d+') { throw "qmctl --help 首行不是版本行：$first" }
+
+          # 先把全部输出收进变量，再看退出码，最后才取首行。
+          # 顺序反了就会重演上一行的坑：早停管道吞掉 $LASTEXITCODE。
+          $out = & $tool --help
+          $code = $LASTEXITCODE
+          Write-Host "exit = $code"
+          if ($code -ne 0) { throw "qmctl --help 退出码 $code" }
+          $lines = @(@($out) | Where-Object { $_ })
+          if ($lines.Count -eq 0) { throw 'qmctl --help 没有任何输出' }
+          $first = "$($lines[0])".Trim()
+          Write-Host "first = $first"
+          if ($first -notmatch '^qmctl\s+\d+\.\d+\.\d+') { throw "qmctl --help 首行不是版本行：$first" }
 
       - name: Install Pester 5.7+
         shell: pwsh

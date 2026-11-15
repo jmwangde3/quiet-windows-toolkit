@@ -227,3 +227,87 @@ Describe '安装器 DryRun（只读契约）' {
         $out | Should -Match '演练完成：系统状态未改变'
     }
 }
+
+Describe 'CI 工作流契约：矩阵、版本锁定与退出码判据' {
+
+    BeforeAll {
+        $script:WfRoot = Join-Path $script:RepoRoot '.github\workflows'
+        $script:Ci     = Join-Path $script:WfRoot 'ci.yml'
+        $script:Rel    = Join-Path $script:WfRoot 'release.yml'
+        # -Encoding UTF8 在两个引擎下都能正确解 UTF-8（含或不含 BOM 都一样）
+        $script:CiText  = (Get-Content -LiteralPath $script:Ci  -Encoding UTF8) -join "`n"
+        $script:RelText = (Get-Content -LiteralPath $script:Rel -Encoding UTF8) -join "`n"
+    }
+
+    It 'ci.yml 同时覆盖 PowerShell 5.1 与 7.7.0，且两条腿都断言解释器版本' {
+        $script:CiText | Should -Match '5\.1'
+        $script:CiText | Should -Match '7\.7\.0'
+        $script:CiText | Should -Match 'QM_PWSH'
+        # 「锁版本」必须能自证：脚本要拿实际版本去比对期望值，否则 runner 镜像
+        # 一换就静默失去覆盖，绿得毫无意义。
+        $script:CiText | Should -Match 'notlike'
+    }
+
+    It 'ci.yml 没有 continue-on-error 键' {
+        # 允许在注释里讨论这个词，但不得出现在 YAML 的键位置
+        $hits = @()
+        foreach ($line in ($script:CiText -split "`n")) {
+            if ($line -match '^\s*continue-on-error\s*:') { $hits += $line.Trim() }
+        }
+        $hits -join ' | ' | Should -BeNullOrEmpty -Because '关键失败不得被掩盖'
+    }
+
+    It 'PowerShell 7 走官方 zip 而不是 msi' {
+        # v7.7.0 的发布资产里根本没有 .msi，只有 win-x64.zip / msixbundle。
+        # 写死一个 msi 地址的后果是 CI 直接 404 —— 已经发生过一次。
+        $script:CiText | Should -Match 'PowerShell-\$ver-win-x64\.zip'
+        $bad = @()
+        $n = 0
+        foreach ($line in ($script:CiText -split "`n")) {
+            $n++
+            if ($line -match '^\s*#') { continue }
+            if ($line -match '\.msi') { $bad += ('ci.yml:' + $n + ' ' + $line.Trim()) }
+        }
+        $bad -join ' | ' | Should -BeNullOrEmpty
+    }
+
+    It '不把 --help 的输出接进早停管道' {
+        # `(& $exe --help | Select-Object -First 1)` 会让下游停止接收、原生进程被掐断，
+        # $LASTEXITCODE 于是变成 $null（pwsh 7）或被杀进程的残值（5.1），
+        # 后面任何 `-ne 0` 判断都会把一次成功的调用判成失败。CI 因此红过一次。
+        $bad = @()
+        foreach ($name in 'ci.yml', 'release.yml') {
+            $text = if ($name -eq 'ci.yml') { $script:CiText } else { $script:RelText }
+            $n = 0
+            foreach ($line in ($text -split "`n")) {
+                $n++
+                if ($line -match '^\s*#') { continue }
+                if ($line -match '--help' -and $line -match 'Select-Object\s+-First') {
+                    $bad += ('{0}:{1} {2}' -f $name, $n, $line.Trim())
+                }
+            }
+        }
+        $bad -join "`n" | Should -BeNullOrEmpty -Because '先收输出、再看退出码、最后取首行'
+    }
+
+    It 'release.yml 严格判正式 tag，预发布 tag 走跳过分支' {
+        $script:RelText | Should -Match 'is_release=true'
+        $script:RelText | Should -Match 'is_release=false'
+        $script:RelText | Should -Match 'needs\.preflight\.outputs\.is_release'
+        # 三段数字要逐段抓出来再拼，而不是只看前缀 —— 前缀检查会把 v1.2.3-rc1 放进来
+        $script:RelText | Should -Match 'BASH_REMATCH'
+    }
+
+    It 'release.yml 不自己打 tag，也不强制推送' {
+        $bad = @()
+        $n = 0
+        foreach ($line in ($script:RelText -split "`n")) {
+            $n++
+            if ($line -match '^\s*#') { continue }
+            if ($line -match 'git\s+tag\s' -or $line -match 'push\s+--force' -or $line -match 'push\s+-f\b') {
+                $bad += ('release.yml:' + $n + ' ' + $line.Trim())
+            }
+        }
+        $bad -join ' | ' | Should -BeNullOrEmpty -Because 'tag 由人决定，工作流只消费'
+    }
+}
