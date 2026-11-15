@@ -1,5 +1,84 @@
 # 变更记录
 
+## 2.0.4 — 2026-11-15
+
+### 严重：PowerShell 7 下 Apply 会把自己装的 v2 回滚掉
+
+真机事故。用 **PowerShell 7.7.0** 跑 `-Mode Apply`，20 步走到第 16 步突然回滚：
+
+```
+有 2 个 v1 闸门停不掉：\QuietHDD_NightGate, \QuietHDD_DiskGate
+为避免两套调度器同时控制磁盘，回滚刚注册的 v2 任务。
+     OK   v2 任务已移除，回到只有 v1 的状态
+```
+
+结果：v2 任务被删，机器上**没有任何调度器**，当晚不会自动进夜。
+
+### 根因：一句话的差别让判据静默失效
+
+`Get-TaskState` 靠异常文本区分「任务不存在」和「读不到」：
+
+```powershell
+if ($msg -match 'No MSFT_ScheduledTask|找不到任何匹配|找不到|does not exist|不存在') {
+```
+
+两个 shell 的措辞差一个字：
+
+| 环境 | 异常文本 | 旧正则 |
+|---|---|---|
+| Windows PowerShell 5.1 | **找不到任何匹配**的 MSFT_ScheduledTask 对象 | 命中 |
+| PowerShell 7.7.0 | **未找到匹配**的 MSFT_ScheduledTask 对象 | **漏** |
+
+PS 7 下匹配不上 → `Exists` 落到 `$null`（无法确认）→ 第 7 步把它算进
+`$legacyStillOn` → 触发不变量回滚。
+
+触发点是 `$script:LegacyTasks` 里的**历史兼容条目**：v1 装过两种路径（带 `\QuietHDD\`
+文件夹的、直接挂根下的），所以四个都查。根路径那两条本来就该「不存在」，在 PS 5.1 下
+安静跳过，在 PS 7 下被误判成「停不掉」。
+
+而真正在用的那两个 `\QuietHDD\` 任务，第 16 步明明已经 `OK 已禁用` 了。
+
+### 三处修法
+
+**1. 判据加 FQID，文本只兜底**
+
+`CmdletizationQuery_NotFound` 这个 FQID 在 PS 5.1 和 7 下**完全一致**，靠它比靠措辞可靠：
+
+```powershell
+$notFound = [bool]($_.FullyQualifiedErrorId -match 'CmdletizationQuery_NotFound')
+if (-not $notFound) { $notFound = ($msg -match '...|未找到匹配|找不到任何匹配|...') }
+```
+
+**2. 第 3 步加常驻自检，判错就退出而不是毁安装**
+
+Apply 之前先探一次不存在的任务（`\__QuietModeSelfCheck__\__NoSuchTask__`），
+`Exists` 不是 `$false` 就直接 `exit 3` 并提示换 5.1。这个自检是运行时真实验证，
+比单测更能拦住环境差异。
+
+**3. `Grant-TaskRead.ps1` 的 PS 7 兼容**
+
+`$fileInfo.GetAccessControl()` / `SetAccessControl()` 在 .NET Core 里被挪进了静态类
+`FileSystemAclExtensions`，实例上根本没有 —— 第 15 步因此刷了一屏
+`[System.IO.FileInfo] 不包含名为 'GetAccessControl' 的方法`。改用 `Get-Acl` / `Set-Acl`，
+两个版本语义一致。顺带把 `结果：N 个文件夹失败` 改成 `N 处授权失败（文件夹或任务文件）`。
+
+### 实测证据
+
+PowerShell 7.7.0 探针：
+
+```
+FQID=CmdletizationQuery_NotFound,Get-ScheduledTask
+MSG=... 未找到匹配的 MSFT_ScheduledTask 对象 ...
+MATCH_FQID=True     ← 新判据命中
+MATCH_NEW=True      ← 补全文本命中
+MATCH_OLD=False     ← 旧判据漏，这就是 bug
+```
+
+Windows PowerShell 5.1 同一探针：`MATCH_OLD=True`、`MATCH_FQID=True` —— 老环境不受影响。
+
+修复后在 PS 7 下跑 DryRun，第 3 步 `OK 任务查询语义自检通过`，原先那两条
+`WARN v1 任务 \QuietHDD_NightGate 无法确认` 消失。
+
 ## 2.0.3 — 2026-11-15
 
 ### 修复：`lastBootReconcileUtc` 是死字段，开机补跑无法自证

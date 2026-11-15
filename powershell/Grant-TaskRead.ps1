@@ -132,8 +132,12 @@ function Grant-TaskFileRead {
     foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
         $stat.Total++
         try {
-            $fi = New-Object System.IO.FileInfo($file.FullName)
-            $sec = $fi.GetAccessControl()
+            # PS 5.1（.NET Framework）上 FileInfo 有实例方法 GetAccessControl / SetAccessControl；
+            # PS 7（.NET Core）把这两个挪进了静态类 FileSystemAclExtensions，实例上根本没有 ——
+            # 直接调会抛「[System.IO.FileInfo] 不包含名为 'GetAccessControl' 的方法」，
+            # 补授权静默失败，WARN 只说要失败不说为什么。Get-Acl / Set-Acl 两个版本都有
+            # 且语义一致，用它们绕开这层差异。
+            $sec = Get-Acl -LiteralPath $file.FullName
             $has = $false
             foreach ($r in @($sec.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
                 if ($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -eq $UsersSid) { $has = $true; break }
@@ -148,7 +152,7 @@ function Grant-TaskFileRead {
                 [System.Security.AccessControl.PropagationFlags]::None,
                 [System.Security.AccessControl.AccessControlType]::Allow)
             $sec.AddAccessRule($ace) | Out-Null
-            $fi.SetAccessControl($sec)
+            Set-Acl -LiteralPath $file.FullName -AclObject $sec
             $stat.Added++
         } catch {
             Write-Host ("      WARN 任务文件补授权失败：" + $file.Name + " -> " + $_.Exception.Message) -ForegroundColor Yellow
@@ -418,7 +422,7 @@ if ($IncludeTasks) {
 
 Write-Host ''
 if ($failed -gt 0) {
-    Write-Host ("结果：" + $failed + " 个文件夹失败") -ForegroundColor Red
+    Write-Host ("结果：" + $failed + " 处授权失败（文件夹或任务文件）") -ForegroundColor Red
     exit 2
 }
 if (-not $Apply) {

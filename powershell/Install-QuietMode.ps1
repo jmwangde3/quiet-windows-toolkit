@@ -245,7 +245,19 @@ function Get-TaskState {
         return [pscustomobject]@{ Exists = $true; Enabled = ($t.State -ne 'Disabled'); State = [string]$t.State; Error = '' }
     } catch {
         $msg = $_.Exception.Message
-        if ($msg -match 'No MSFT_ScheduledTask|找不到任何匹配|找不到|does not exist|不存在') {
+        # 「查不到这个任务」必须认成「不存在」。认成「无法确认」的代价不是一句 WARN：
+        # 第 7 步会把它算进 $legacyStillOn，触发不变量回滚，把刚装好的 v2 整个拆掉。
+        # 2026-11-15 用 PowerShell 7 跑 Apply 就这么中招 —— v2 任务被删，机器裸奔。
+        #
+        # 别只靠异常文本：PS 5.1 说「找不到任何匹配的 MSFT_ScheduledTask 对象」，
+        # PS 7 说「未找到匹配的 MSFT_ScheduledTask 对象」。措辞一换，正则静默失效。
+        # CmdletizationQuery_NotFound 这个 FQID 两个版本一致，优先用它；文本只兜底。
+        $notFound = $false
+        try { $notFound = [bool]($_.FullyQualifiedErrorId -match 'CmdletizationQuery_NotFound') } catch { }
+        if (-not $notFound) {
+            $notFound = ($msg -match 'No MSFT_ScheduledTask|未找到匹配|找不到任何匹配|找不到|does not exist|不存在')
+        }
+        if ($notFound) {
             # \QuietHDD\ 的 ACL 对普通用户不可读：CIM 会报"找不到"，但那是看不见，不是不存在
             if ($tp.Path -eq '\QuietHDD\' -and -not (Test-Admin)) {
                 return [pscustomobject]@{ Exists = $null; Enabled = $null; State = ''; Error = '未提权，\QuietHDD\ 下的任务不可见（读不到 ≠ 不存在）' }
@@ -503,6 +515,22 @@ if ($script:Failures.Count -gt 0) {
 
 # ================================================================ 3 现有安装
 Write-Step '现有安装'
+
+# ---------------------------------------------------------------- 自检：不存在 ≠ 无法确认
+# 这两个结论在后面的流程里走完全相反的路径：不存在 → 跳过；无法确认 → 算作「v1 停不掉」
+# → 不变量回滚，把 v2 删掉。判错的代价是整台机器失去调度器，所以先探一次。
+# 探针用两层文件夹，确保不会撞上任何真实任务。
+$probe = Get-TaskState -FullName '\__QuietModeSelfCheck__\__NoSuchTask__'
+if ($probe.Exists -ne $false) {
+    Write-Bad '自检失败：查询不存在的任务没有返回「不存在」'
+    Write-Log ('     Exists=' + $probe.Exists + '   Error=' + $probe.Error) 'DarkGray'
+    Write-Log '     这个判错会让「停用 v1 闸门」误判成无法确认，从而回滚整个 v2 安装。' 'Yellow'
+    Write-Log ('     当前 shell：PowerShell ' + $PSVersionTable.PSVersion.ToString()) 'Yellow'
+    Write-Log '     改用 Windows PowerShell 5.1 重新运行，或先把 Get-TaskState 修好。' 'Yellow'
+    if ($script:LogPath) { Write-Log ("日志：" + $script:LogPath) 'Yellow' }
+    exit 3
+}
+Write-Ok '任务查询语义自检通过（不存在的任务判为不存在）'
 
 $hasConfig = Test-Path -LiteralPath (Join-Path $Root 'config.json')
 $hasBaseline = Test-Path -LiteralPath (Join-Path $Root 'baseline.json')
