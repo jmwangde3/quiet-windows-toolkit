@@ -79,24 +79,25 @@
 ## 4. 生产基线（Apply 前快照）
 
 脚本 `-Preflight` 会把 `\QuietMode` 与 `\QuietHDD` 下每个任务的**任务对象 SDDL**
-与**任务文件 ACL** 各取一份，只用于「事后逐字节比对」。本机实测 6 项：
+与**任务文件 ACL** 各取一份，只用于「事后逐字节比对」。本机实测 6 项。
 
-```
-\QuietMode\QuietMode-Reconcile
-  D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;BU)(A;ID;FR;;;BU)(A;ID;0x1f019f;;;BA)
-    (A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)(A;;FR;;;SY)
-\QuietMode\QuietMode-Reconcile [file]
-  D:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)(A;ID;FR;;;BU)(A;ID;0x1f019f;;;BA)
-      (A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)
-\QuietHDD\QuietHDD_DiskGate
-  D:AI(A;;FR;;;BU)(A;;FR;;;SY)(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)
-\QuietHDD\QuietHDD_DiskGate [file]
-  D:AI(A;;FR;;;SY)(A;;FR;;;BU)(A;ID;FR;;;BU)(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)
-\QuietHDD\QuietHDD_NightGate
-  D:AI(A;;FR;;;BU)(A;;FR;;;SY)(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)
-\QuietHDD\QuietHDD_NightGate [file]
-  D:AI(A;;FR;;;SY)(A;;FR;;;BU)(A;ID;FR;;;BU)(A;ID;0x1f019f;;;BA)(A;ID;0x1f019f;;;SY)(A;ID;FA;;;BA)
-```
+**这里只记结构，不记原文。** 本仓库是公开的，真实主机上生产任务的 DACL 属于本机
+配置细节 —— 把 SDDL 原文贴出来，等于对外公布「这台机器的计划任务给哪些组开了什么
+权限」。原文只留在本机（`-Preflight` 在本机打印，`-Apply` / `-Cleanup` 拿它做前后
+比对），文档里只留足以判断「有没有被改动」的结构摘要：
+
+| 对象 | 形态 | Allow ACE 数 | 结构摘要 |
+|---|---|---|---|
+| `\QuietMode\QuietMode-Reconcile` | 任务对象 | 7 | BA / SY 各有 FA；BU 有 FR（含一条 `ID` 继承项）；另有 BA / SY 的 `ID` 继承项 |
+| 同上 | 任务文件 | 7 | `D:AI` 自动继承；BA / SY 为 FA，BU 为 FR，另有 `ID` 继承项 |
+| `\QuietHDD\QuietHDD_DiskGate` | 任务对象 | 5 | `D:AI`；BU / SY 为 FR，BA 自身只有 `ID` 继承项 |
+| 同上 | 任务文件 | 6 | `D:AI`；SY / BU 为 FR，另有 `ID` 继承项 |
+| `\QuietHDD\QuietHDD_NightGate` | 任务对象 | 5 | 与 DiskGate 同形 |
+| 同上 | 任务文件 | 6 | 与 DiskGate 同形 |
+
+要点是前两行里的 `BU` + `FR` —— **生产任务本来就已经给 Users 读了**（早先补授权的
+产物）。所以 `Grant-TaskRead.ps1 -Apply` 在生产文件夹上通常直接走「已有 Users 读，
+跳过文件夹」分支；这正是 `$check` 那个缺陷在本机怎么跑都碰不到的原因（8.1）。
 
 这份快照在 `-Apply` / `-Cleanup` 里于**动作前后各取一次**并逐键比对，
 差异会以 `FAIL 生产对象被改动：<路径>` 的形式报出来。这是「没碰生产」的证据本身，
