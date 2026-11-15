@@ -142,6 +142,21 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 脚本会断言三件事：契约文件齐全（含 C# 控制器按常量算出的三条脚本路径）、
 包根含 `powershell\Modules`（`qmctl` 的 RepoLocator 要求）、包里没有测试/临时产物。
 
+**可复现的边界：同机确定，跨机不确定。** 脚本能固定的是容器 —— 清单、条目顺序、
+时间戳常量；四个二进制是编译器的产物，MVID 每次编译重新生成，PE 头里还有编译时间
+与嵌入路径。同一份 tree 在 GitHub runner 上重打，实测（解包逐条比 CRC）：
+
+- 条目数 51 → 51，条目名逐条一致；
+- `powershell\` 全树 + `docs\*.md` + `config/default-policy.json` + `README/SAFETY/LICENSE`
+  共 46 项，CRC 逐条相同 —— 源码层是真正可复现的；
+- 不同的只有 4 个二进制和记录它们哈希的 `SHA256SUMS.txt`：
+  `qmctl.exe` 59,392 → 58,880，`QuietMode.exe` 60,416 → 60,928，
+  `QuietMode.Core.dll` / `QuietMode.Windows.dll` 大小相同、哈希不同；
+- zip 整体 385,186 B → 392,960 B，`80d85339…` → `efc62acc…`。
+
+所以**发布以 CI 产物为准**：Release 附件里的 `.sha256` 是该 zip 的权威哈希，
+本节上面那个 `80d85339…` 只是本机对照值，不是下载校验目标。
+
 ### 9. Release 工作流
 
 新增 `.github/workflows/release.yml`，只响应 `v*.*.*` tag。`preflight` job 用严格正则
@@ -152,7 +167,10 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 包内 `qmctl --help` 版本与 tag 一致 → `SHA256SUMS.txt` 逐条自校验 → 包内无测试产物。
 任何一步不过都不发版。
 
-**本版只验证工作流，不建 tag、不发 Release。**
+**本版发布即验证这条工作流。** `v2.0.5` tag 推上去后两个 job 全绿
+（`preflight / tag gate` 3 s、`publish / build + gate + release` 2 m 18 s），
+Release 资产由 CI 现场编译、现场自校验后上传，正文里的哈希取自它自己刚打的
+`.sha256`。
 
 ### 10. 版本号统一 2.0.5
 
