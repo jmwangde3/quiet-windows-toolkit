@@ -42,19 +42,30 @@
          它只有 Id/Index/SD，于是筛出来 0 个（日志里「任务对象 : 共 0 个」）。
          用 GetTasks(1) 枚举，服务自己知道哪些是任务。
 
+    2026-11-15 追加 -TaskNames：
+      -IncludeTasks 原本会把文件夹下的任务**全部**枚举出来逐个处理。正式安装要的
+      就是这个行为，但 ACL 真机验收（Test-QuietModeAclApply.ps1）要求「只碰明确
+      指定的那一个对象」，枚举结果一律不许当作用户意图。
+      加一个 -TaskNames 白名单：给了就只处理列出的名字，没给保持原来的全枚举。
+      默认目标范围一个字节都没变 —— 安装器调用的还是不带 -TaskNames 的形态。
+
     用法：
       .\Grant-TaskRead.ps1                 # 演练：只说要改什么
       .\Grant-TaskRead.ps1 -Apply          # 真改（需要管理员）
       .\Grant-TaskRead.ps1 -Check          # 只读自检：当前身份能枚举到几个任务
       .\Grant-TaskRead.ps1 -Apply -IncludeTasks              # 连任务对象一起处理
       .\Grant-TaskRead.ps1 -Apply -Folders '\QuietMode\','\QuietHDD\'
+      # 只处理点名的那一个任务对象（ACL 验收用，不枚举）
+      .\Grant-TaskRead.ps1 -Apply -Folders '\QuietMode-ACL-Test-<guid>\' -IncludeTasks -TaskNames 'QuietMode-ACL-Probe'
 #>
 [CmdletBinding()]
 param(
     [string[]]$Folders = @('\QuietMode\', '\QuietHDD\'),
     [switch]$Apply,
     [switch]$Check,
-    [switch]$IncludeTasks
+    [switch]$IncludeTasks,
+    # 只处理这些任务名；留空 = 枚举文件夹下全部任务（原行为）
+    [string[]]$TaskNames = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -138,7 +149,7 @@ function Wait-SecurityDescriptor {
 }
 
 function Grant-TaskFileRead {
-    param([string]$FolderPath)
+    param([string]$FolderPath, [string[]]$OnlyNames = @())
 
     $stat = [pscustomobject]@{ Total = 0; Added = 0; Failed = 0 }
     $leaf = $FolderPath.TrimStart('\')
@@ -146,7 +157,14 @@ function Grant-TaskFileRead {
     $dir = Join-Path $TaskRoot $leaf
     if (-not (Test-Path -LiteralPath $dir)) { return $stat }
 
-    foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
+    # 点名模式只碰列出的文件；没点名就是原来的全目录行为。
+    # 名字比对不区分大小写（Windows 文件系统语义），但只做等值比较，不做通配。
+    $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)
+    if ($OnlyNames -and $OnlyNames.Count -gt 0) {
+        $files = @($files | Where-Object { $n = $_.Name; @($OnlyNames | Where-Object { $_ -ieq $n }).Count -gt 0 })
+    }
+
+    foreach ($file in $files) {
         $stat.Total++
         try {
             # PS 5.1（.NET Framework）上 FileInfo 有实例方法 GetAccessControl / SetAccessControl；
@@ -273,7 +291,7 @@ foreach ($raw in $Folders) {
     if (Test-UsersReadAce $before) {
         Write-Host '  OK   已有 Users 读权限，跳过文件夹' -ForegroundColor Green
         if ($Apply -and $elevated) {
-            $r0 = Grant-TaskFileRead -FolderPath $path
+            $r0 = Grant-TaskFileRead -FolderPath $path -OnlyNames $TaskNames
             Write-Host ("  任务文件 : 共 " + $r0.Total + " 个，补授权 " + $r0.Added + " 个")
             if ($r0.Failed -gt 0) { $failed++ }
         }
@@ -328,7 +346,7 @@ foreach ($raw in $Folders) {
     }
     Write-Host ("  DONE 已追加 : " + $check) -ForegroundColor Green
 
-    $r = Grant-TaskFileRead -FolderPath $path
+    $r = Grant-TaskFileRead -FolderPath $path -OnlyNames $TaskNames
     Write-Host ("  任务文件 : 共 " + $r.Total + " 个，补授权 " + $r.Added + " 个")
     if ($r.Failed -gt 0) { $failed++ }
 
@@ -360,9 +378,21 @@ if ($IncludeTasks) {
         }
 
         $tasks = @()
-        try { $tasks = @($folder.GetTasks(1)) } catch { }
+        if ($TaskNames -and $TaskNames.Count -gt 0) {
+            # 点名模式：逐个 GetTask，不枚举。名字错了就报出来，绝不退回全枚举 ——
+            # 「意图是这一个」与「碰巧枚举到一批」在 ACL 写入里是两件事。
+            foreach ($n in $TaskNames) {
+                try { $tasks += $folder.GetTask($n) }
+                catch {
+                    Write-Host ("  FAIL 点名任务不存在或读不到：" + $n + " -> " + $_.Exception.Message) -ForegroundColor Red
+                    $failed++
+                }
+            }
+        } else {
+            try { $tasks = @($folder.GetTasks(1)) } catch { }
+        }
         if ($tasks.Count -eq 0) {
-            Write-Host '  （枚举不到任务）' -ForegroundColor DarkGray
+            Write-Host '  （没有可处理的任务）' -ForegroundColor DarkGray
             try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($svc) } catch { }
             continue
         }
