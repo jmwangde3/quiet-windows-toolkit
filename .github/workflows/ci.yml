@@ -13,11 +13,35 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# 测试矩阵的硬约定：
+#   1. 每条 Windows 腿都必须真跑一遍现有全部测试（C# 单测 + 全部 Pester），不按版本裁剪。
+#   2. PowerShell 版本必须锁死：5.1 是系统自带，7.7.0 用 MSI 精确安装。
+#      不用 `latest`，也不用 runner 预装的 pwsh —— 预装版本会随镜像漂移，
+#      「昨天绿今天红」就没法判断是代码变了还是环境变了。
+#   3. 任何一条腿失败都不得用 continue-on-error 掩盖；fail-fast 关掉只是为了让
+#      两条腿都把结果跑完，方便一次看到 5.1 与 7.x 的差异，不是为了放行失败。
+
 jobs:
-  verify:
-    name: build + unit + pester
+  windows-pester:
+    name: windows / PowerShell ${{ matrix.ps.label }}
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ps:
+          - label: '5.1 (Desktop)'
+            interpreter: 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe'
+            expect: '5.1.*'
+            artifact: pester-result-ps51
+          - label: '7.7.0 (pwsh)'
+            interpreter: 'C:\Program Files\PowerShell\7\pwsh.exe'
+            expect: '7.7.0'
+            artifact: pester-result-ps770
+
+    env:
+      # 所有 PowerShell 代码都显式走这个解释器，不依赖 PATH 上的 pwsh。
+      QM_PWSH: ${{ matrix.ps.interpreter }}
 
     steps:
       - name: Checkout
@@ -28,11 +52,32 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Show toolchain
+      - name: Install PowerShell 7.7.0 (pinned)
+        if: matrix.ps.expect == '7.7.0'
         shell: pwsh
         run: |
-          dotnet --version
-          $PSVersionTable.PSVersion.ToString()
+          $ErrorActionPreference = 'Stop'
+          $msi = Join-Path $env:RUNNER_TEMP 'PowerShell-7.7.0-win-x64.msi'
+          $url = 'https://github.com/PowerShell/PowerShell/releases/download/v7.7.0/PowerShell-7.7.0-win-x64.msi'
+          Write-Host "download $url"
+          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+          $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$msi`"", '/quiet', '/norestart', 'ADD_PATH=1') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec 退出码 $($p.ExitCode)" }
+          if (-not (Test-Path -LiteralPath "$env:QM_PWSH")) { throw "安装后仍找不到 $env:QM_PWSH" }
+
+      - name: Assert interpreter version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:QM_PWSH)) { throw "找不到解释器：$env:QM_PWSH" }
+          $actual = (& $env:QM_PWSH -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')
+          if ($LASTEXITCODE -ne 0) { throw "取版本失败，退出码 $LASTEXITCODE" }
+          $actual = "$actual".Trim()
+          Write-Host "interpreter = $env:QM_PWSH"
+          Write-Host "version     = $actual"
+          if ($actual -notlike '${{ matrix.ps.expect }}') {
+            throw "PowerShell 版本不符：期望 ${{ matrix.ps.expect }}，实际 $actual"
+          }
 
       - name: Build solution
         run: dotnet build QuietMode.sln -c Release -v minimal --nologo
@@ -40,6 +85,7 @@ jobs:
       - name: C# unit tests
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $exe = Join-Path $PWD 'tests\QuietMode.Core.Tests\bin\Release\net481\QuietMode.Core.Tests.exe'
           if (-not (Test-Path -LiteralPath $exe)) { throw "未找到测试可执行文件：$exe" }
           & $exe
@@ -48,46 +94,53 @@ jobs:
       - name: Verify qmctl artifact
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $tool = Join-Path $PWD 'src\QuietMode.Cli\bin\Release\net481\qmctl.exe'
           if (-not (Test-Path -LiteralPath $tool)) { throw "构建产物缺失：$tool" }
-          & $tool --help
+          $first = (& $tool --help | Select-Object -First 1)
+          Write-Host $first
           if ($LASTEXITCODE -ne 0) { throw "qmctl --help 退出码 $LASTEXITCODE" }
+          if ("$first" -notmatch '^\s*qmctl\s+\d+\.\d+\.\d+') { throw "qmctl --help 首行不是版本行：$first" }
 
-      - name: Install Pester
+      - name: Install Pester 5.7+
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Get-Module -ListAvailable Pester | Select-Object Name, Version | Format-Table -AutoSize
-          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.7.0' })) {
-            Set-PSRepository PSGallery -InstallationPolicy Trusted
-            Install-Module Pester -MinimumVersion 5.7.0 -Force -SkipPublisherCheck -Scope CurrentUser
-          }
+          $boot = "Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue; Install-Module Pester -MinimumVersion 5.7.0 -Force -SkipPublisherCheck -Scope CurrentUser"
+          & $env:QM_PWSH -NoProfile -ExecutionPolicy Bypass -Command $boot
+          if ($LASTEXITCODE -ne 0) { throw "Pester 安装失败，退出码 $LASTEXITCODE" }
 
-      - name: Pester
+      - name: Pester (all tests + NUnit XML)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Import-Module Pester -MinimumVersion 5.7.0 -Force
-
-          $cfg = New-PesterConfiguration
-          $cfg.Run.Path = 'tests\ps'
-          $cfg.Run.PassThru = $true
-          $cfg.Output.Verbosity = 'Normal'
-          $cfg.TestResult.Enabled = $true
-          $cfg.TestResult.OutputPath = 'testResults.xml'
-          $cfg.TestResult.OutputFormat = 'NUnitXml'
-
-          $result = Invoke-Pester -Configuration $cfg
-          Write-Host ("Total={0} Passed={1} Failed={2} Skipped={3}" -f `
-            $result.TotalCount, $result.PassedCount, $result.FailedCount, $result.SkippedCount)
-
-          if ($result.TotalCount -eq 0) { throw 'Pester 没有执行任何测试' }
-          if ($result.FailedCount -gt 0) { throw "Pester 失败 $($result.FailedCount) 项" }
+          & $env:QM_PWSH -NoProfile -ExecutionPolicy Bypass -File 'build\run-pester.ps1' -NUnitXml 'testResults.xml'
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "Pester 失败（run-pester.ps1 退出码 $code）" }
 
       - name: Upload Pester result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pester-result
+          name: ${{ matrix.ps.artifact }}
           path: testResults.xml
           if-no-files-found: ignore
+
+  linux-core-compile:
+    # 纯 Core 程序集按设计不含任何系统调用，这一腿只证明它能在 Linux 上编译通过。
+    # 不跑任何测试：Pester 与 C# 单测都依赖 Windows（WMI / 计划任务 / ACL），
+    # 在 Linux 上它们要么编不过要么只能跳过，跑出来的绿是假绿。
+    name: linux / core compile only
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build QuietMode.Core
+        run: dotnet build src/QuietMode.Core/QuietMode.Core.csproj -c Release -v minimal --nologo
