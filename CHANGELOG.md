@@ -81,12 +81,24 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 | 腿 | 跑什么 |
 |---|---|
 | `windows-latest` × PowerShell **5.1** | 编译 + C# 单测 + 全部 Pester |
-| `windows-latest` × PowerShell **7.7.0** | 同上（MSI 精确安装，不用 runner 预装的 pwsh，不用 `latest`） |
+| `windows-latest` × PowerShell **7.7.0** | 同上（官方 zip 精确安装，不用 runner 预装的 pwsh，不用 `latest`） |
 | `ubuntu-latest` × Core 编译 | 只编 `QuietMode.Core`（按设计无系统调用），不跑测试 |
 
 每条腿都先断言解释器版本（5.1 用 `5.1.*` 前缀，7.7.0 用精确匹配），版本不符直接失败 ——
 锁版本这件事必须能自证，否则 runner 镜像一换就静默失去覆盖。
 `fail-fast: false` 只是为了让两条腿都跑完方便对比，**没有任何 `continue-on-error`**。
+
+首跑两条腿都红了，两个原因都不在代码而在工作流自己，已修：
+
+1. **7.7.0 腿下载 msi 拿到 404。** v7.7.0 的发布资产里只有
+   `PowerShell-7.7.0-win-x64.zip` / `.msixbundle`，没有 `.msi`。
+   改成取官方 zip，先按体积（< 20MB 判为错误页）和 zip 条目（必须含 `pwsh.exe`）
+   两道探测确认是真包，再解压、再找 `pwsh.exe`（不假设它在根目录）。
+2. **5.1 腿把一次成功的调用判成失败。** `Verify qmctl artifact` 里写的是
+   `$first = (& $tool --help | Select-Object -First 1)` 然后看 `$LASTEXITCODE`。
+   早停管道会掐断原生进程，退出码再也不会被记录：pwsh 7 下是 `$null`，
+   PS 5.1 下是被杀进程的非零残值，两条路都撞上 `-ne 0`。
+   改成先收全部输出、再看退出码、最后取首行。`release.yml` 的同款写法一并改掉。
 
 ### 8. 可复现发布包
 
@@ -142,10 +154,10 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 |---|---|---|
 | `tests/ps/QuietMode.TaskState.Tests.ps1` | 38 | 路径拆分、不存在 6 例、无法确认 10 例、SDDL 判据 10 例、是否提权、真机只读 4 例 |
 | `tests/ps/Grant-TaskRead.Tests.ps1` | 20 | 内存 ACL 判据 9 例、SDDL 与 ACL 一致性 4 组、脚本契约 5 例（子进程取退出码）、真实任务集成 4 例（默认跳过） |
-| `tests/ps/Install-Contract.Tests.ps1` | 18 | 全目录 PS1/PSM1 双版本 Parser 语法、BOM/换行约定、版本号层次、安装器契约、DryRun 与回滚演练子进程验证 |
+| `tests/ps/Install-Contract.Tests.ps1` | 24 | 全目录 PS1/PSM1 双版本 Parser 语法、BOM/换行约定、版本号层次、安装器契约、DryRun 与回滚演练子进程验证；其中 6 条是 CI 工作流契约（双版本矩阵、无 `continue-on-error`、PS 7 走 zip 不走 msi、`--help` 不得接早停管道、tag 逐段判定、不自己打 tag） |
 
-原有 8 个测试文件 79 条**一条没删**。合计 **155 条**：
-PowerShell 5.1 `Total=155 Passed=151 Failed=0 Skipped=4`，
+原有 8 个测试文件 79 条**一条没删**。合计 **161 条**：
+PowerShell 5.1 `Total=161 Passed=157 Failed=0 Skipped=4`，
 PowerShell 7.7.0 同一组数字。4 条跳过的是需要提权的真实任务 ACL 集成用例
 （`QM_ALLOW_TASK_INTEGRATION=1` 才跑）。C# 单测 **123 项**全部通过。
 
