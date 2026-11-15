@@ -65,6 +65,17 @@ $UsersReadAce = '(A;OICI;FR;;;BU)'       # Users 只读，含子对象继承
 $UsersSid     = 'S-1-5-32-545'           # BUILTIN\Users
 $TaskRoot     = Join-Path $env:SystemRoot 'System32\Tasks'
 
+# ACL 判据只留一份，住在 Modules\QuietMode.TaskState.psm1 里（那里有 PS 5.1 / 7.7
+# 两个版本实测过的表）。以前这里有一份自己的正则，三处实现各写各的，
+# 「Users 只有写权限」被当成「已有读」直接跳过，安装器还报 OK。
+$taskStateModule = Join-Path $PSScriptRoot 'Modules\QuietMode.TaskState.psm1'
+if (-not (Test-Path -LiteralPath $taskStateModule)) {
+    Write-Host ('缺少模块：' + $taskStateModule) -ForegroundColor Red
+    Write-Host '没有它无法判断「已有权限」与「权限不足」，拒绝在猜的基础上改 ACL。' -ForegroundColor Red
+    exit 3
+}
+Import-Module $taskStateModule -Force -ErrorAction Stop
+
 $elevated = $false
 try {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -82,10 +93,16 @@ function ConvertTo-TaskFolderPath {
     return $p
 }
 
+# 判据住在模块里，这里只做同名转发 —— 三个脚本（本脚本 / Fix-TaskVisibility /
+# Install-QuietMode）共用一份实现，不会再出现「某处正则只认有 BU 不认权限位」。
 function Test-UsersReadAce {
     param([string]$Sddl)
-    if ([string]::IsNullOrEmpty($Sddl)) { return $false }
-    return [bool]($Sddl -match '\(A;[^()]*;;;BU\)')
+    return Test-QmUsersReadAce -Sddl $Sddl
+}
+
+function Test-FileHasUsersRead {
+    param($Acl)
+    return Test-QmFileHasUsersRead -Acl $Acl
 }
 
 function Add-DaclAce {
@@ -138,11 +155,7 @@ function Grant-TaskFileRead {
             # 补授权静默失败，WARN 只说要失败不说为什么。Get-Acl / Set-Acl 两个版本都有
             # 且语义一致，用它们绕开这层差异。
             $sec = Get-Acl -LiteralPath $file.FullName
-            $has = $false
-            foreach ($r in @($sec.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
-                if ($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -eq $UsersSid) { $has = $true; break }
-            }
-            if ($has) { continue }
+            if (Test-FileHasUsersRead -Acl $sec) { continue }
 
             $sidObj = New-Object System.Security.Principal.SecurityIdentifier($UsersSid)
             $ace = New-Object System.Security.AccessControl.FileSystemAccessRule(
@@ -153,6 +166,13 @@ function Grant-TaskFileRead {
                 [System.Security.AccessControl.AccessControlType]::Allow)
             $sec.AddAccessRule($ace) | Out-Null
             Set-Acl -LiteralPath $file.FullName -AclObject $sec
+
+            # 写后必须回读：Set-Acl 不抛异常不等于 ACE 落到了文件上。
+            # 旧实现在这里直接 Added++，于是「调用没报错」被当成「授权成功」。
+            $after = Get-Acl -LiteralPath $file.FullName
+            if (-not (Test-FileHasUsersRead -Acl $after)) {
+                throw '写入后回读不到 Users 读权限'
+            }
             $stat.Added++
         } catch {
             Write-Host ("      WARN 任务文件补授权失败：" + $file.Name + " -> " + $_.Exception.Message) -ForegroundColor Yellow
@@ -215,7 +235,10 @@ Write-Host ''
 
 if ($Apply -and -not $elevated) {
     Write-Host '  需要管理员：改任务计划器的安全描述符要提权。' -ForegroundColor Yellow
+    Write-Host '  退出码 3：本次没有做任何修改。' -ForegroundColor Yellow
+    Write-Host '  （旧版这里返回 0，调用方会以为授权已经做完。）' -ForegroundColor DarkGray
     Write-Host ''
+    exit 3
 }
 
 $failed = 0
@@ -356,7 +379,7 @@ if ($IncludeTasks) {
                 Write-Host ("  FAIL 读不到 " + $name + " 的安全描述符：" + $_.Exception.Message) -ForegroundColor Red
                 $bad++; continue
             }
-            if ($before -match '\(A;[^()]*;;;BU\)') {
+            if (Test-UsersReadAce -Sddl $before) {
                 Write-Host ("  OK   " + $name + " 已有 Users 读") -ForegroundColor Green
                 continue
             }
@@ -392,7 +415,7 @@ if ($IncludeTasks) {
                 Write-Host ("       兜底：Fix-TaskVisibility.ps1 -Apply -Targets '" + $fullName + "'") -ForegroundColor Yellow
                 $bad++; continue
             }
-            if ($check -notmatch '\(A;[^()]*;;;BU\)') {
+            if (-not (Test-UsersReadAce -Sddl $check)) {
                 Write-Host ("  FAIL " + $name + " 回读仍没有 Users 读") -ForegroundColor Red
                 Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
                 $bad++; continue

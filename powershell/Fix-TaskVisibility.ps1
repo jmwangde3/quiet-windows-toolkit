@@ -47,6 +47,15 @@ try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } 
 $RecoveryRoot = Join-Path $env:ProgramData 'QuietMode\recovery'
 $stateName    = @('Unknown', 'Disabled', 'Queued', 'Ready', 'Running')
 
+# ACL 判据只留一份，住在 Modules\QuietMode.TaskState.psm1 里
+$taskStateModule = Join-Path $PSScriptRoot 'Modules\QuietMode.TaskState.psm1'
+if (-not (Test-Path -LiteralPath $taskStateModule)) {
+    Write-Host ('缺少模块：' + $taskStateModule) -ForegroundColor Red
+    Write-Host '没有它无法判断「已有权限」与「权限不足」，拒绝在猜的基础上重注册任务。' -ForegroundColor Red
+    exit 3
+}
+Import-Module $taskStateModule -Force -ErrorAction Stop
+
 function ConvertTo-TaskFolderPath {
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return '\' }
@@ -66,9 +75,12 @@ function Split-TaskFullName {
 }
 
 function Test-HasUserAce {
+    <#
+        转发到模块的 Test-QmUsersReadAce。旧实现在这里只比对「有没有 BU」，
+        于是「Users 只有写权限」被当成已有读，重新注册被跳过。
+    #>
     param([string]$Value)
-    if ([string]::IsNullOrEmpty($Value)) { return $false }
-    return [bool]($Value -match '\(A;[^()]*;;;BU\)')
+    return Test-QmUsersReadAce -Sddl $Value
 }
 
 function Get-TaskSd {
