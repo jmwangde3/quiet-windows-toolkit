@@ -362,6 +362,10 @@ HEAD `cd4d060`，三条腿全绿：
 | `windows / PowerShell 7.7.0 (pwsh)` | `Total=186 Passed=183 Failed=0 Skipped=3` |
 | `linux / core compile only` | 编译通过 |
 
+同一组数字在后续两个「只改文档」的提交（`09e64c0`、`61aa8c3`）上各复跑一次，
+仍然全绿 —— 说明这次绿不是某个提交的偶然。本机双版本在最终 HEAD 上是
+`Total=186 Passed=182 Failed=0 Skipped=4`（差的 1 条是提权才成立的那个用例）。
+
 上表不是从日志里抄一行就完事 —— NUnit XML 逐用例核过：186 条 = 183 `Success` +
 3 `Ignored`。3 条 `Ignored` 全部是「只在未提权时才成立」的用例，在提权 runner 上
 按设计跳过：
