@@ -168,6 +168,24 @@ Describe 'Grant-TaskRead 脚本契约' {
 
 Describe 'Grant-TaskRead 真实任务集成（临时文件夹，需要提权 + 显式开关）' {
 
+    BeforeDiscovery {
+        # `It ... -Skip:(expr)` 的表达式在 **discovery 阶段**求值，那时本 Describe 的
+        # BeforeAll 还没跑 —— 把判断写在 BeforeAll 里，$script:runIntegration 在
+        # discovery 时恒为 $null，而 `-not $null` 是 $true，于是这 4 条用例
+        # **在任何环境下都被跳过**，包括已经打开开关的提权 CI runner。
+        #
+        # 这不是推测：CI 设了 QM_ALLOW_TASK_INTEGRATION=1、runner 本身提权，
+        # Pester 数字仍是 Total=185 Passed=178 Skipped=7（= 4 条集成 + 3 条
+        # 「未提权」用例），多出来的 4 条就是它们。判断必须搬到 BeforeDiscovery。
+        $adminNow = $false
+        try {
+            $adminNow = (New-Object Security.Principal.WindowsPrincipal(
+                [Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+                [Security.Principal.WindowsBuiltInRole]::Administrator)
+        } catch { $adminNow = $false }
+        $script:runIntegration = ([bool]$adminNow -and $env:QM_ALLOW_TASK_INTEGRATION -eq '1')
+    }
+
     BeforeAll {
         $script:admin = try {
             (New-Object Security.Principal.WindowsPrincipal(
