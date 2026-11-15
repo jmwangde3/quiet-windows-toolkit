@@ -1,5 +1,8 @@
 # LEGACY BEHAVIOR — v1 行为基线（Phase 0）
 
+> **历史资料。** 本文是 v2 重构前的 v1 行为基线，描述的是**已冻结的 v1**，不是当前安装指引。
+> 安装请看 [`../README.md`](../README.md)；v1 的历史实现与迁移见 [`LEGACY.md`](LEGACY.md)。
+>
 > 本文记录 v1 **实际可观测行为**，作为 v2 重构不得无意改变的对照基线。
 > 证据来源：本机 `diskgate.log` / `gate.log` / `QuietMode.log` / `worker_result.txt` / `settings.ini` / `state.ini` / `diskgate.conf`，截至 2026-11-11 02:00。
 > 本文已脱敏：账号、工作区、软件路径、磁盘序列号、PID 均以占位符表示。

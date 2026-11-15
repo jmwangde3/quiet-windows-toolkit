@@ -13,11 +13,32 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# 测试矩阵的硬约定：
+#   1. 每条 Windows 腿都必须真跑一遍现有全部测试（C# 单测 + 全部 Pester），不按版本裁剪。
+#   2. PowerShell 版本必须锁死：5.1 是系统自带，7.7.0 从官方 zip 取精确版本。
+#      不用 `latest`，也不用 runner 预装的 pwsh —— 预装版本会随镜像漂移，
+#      「昨天绿今天红」就没法判断是代码变了还是环境变了。
+#      注意：v7.7.0 的发布资产里没有 .msi，只有 win-x64.zip / msixbundle。
+#   3. 任何一条腿失败都不得用 continue-on-error 掩盖；fail-fast 关掉只是为了让
+#      两条腿都把结果跑完，方便一次看到 5.1 与 7.x 的差异，不是为了放行失败。
+
 jobs:
-  verify:
-    name: build + unit + pester
+  windows-pester:
+    name: windows / PowerShell ${{ matrix.ps.label }}
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ps:
+          - label: '5.1 (Desktop)'
+            kind: system
+            expect: '5.1.*'
+            artifact: pester-result-ps51
+          - label: '7.7.0 (pwsh)'
+            kind: zip
+            expect: '7.7.0'
+            artifact: pester-result-ps770
 
     steps:
       - name: Checkout
@@ -28,11 +49,87 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Show toolchain
+      # 解释器路径由这一步解析并写进 GITHUB_ENV，后续所有步骤只认 $env:QM_PWSH。
+      # 不依赖 PATH 上的 pwsh：runner 预装的是哪个版本我们不管，也不想知道。
+      - name: Resolve interpreter (${{ matrix.ps.kind }})
         shell: pwsh
         run: |
-          dotnet --version
-          $PSVersionTable.PSVersion.ToString()
+          $ErrorActionPreference = 'Stop'
+
+          if ('${{ matrix.ps.kind }}' -eq 'system') {
+            $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+            if (-not (Test-Path -LiteralPath $exe)) { throw "找不到系统 PowerShell：$exe" }
+          }
+          else {
+            # v7.7.0 没有 msi 资产，只有 zip。取官方 zip 解压到临时目录，
+            # 版本由目录名固定，不写 latest 也不走包管理器。
+            $ver = '7.7.0'
+            $zip = Join-Path $env:RUNNER_TEMP "PowerShell-$ver-win-x64.zip"
+            $dir = Join-Path $env:RUNNER_TEMP "pwsh-$ver"
+            $url = "https://github.com/PowerShell/PowerShell/releases/download/v$ver/PowerShell-$ver-win-x64.zip"
+
+            Write-Host "download $url"
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+            $size = (Get-Item -LiteralPath $zip).Length
+            Write-Host "downloaded $size bytes"
+            if ($size -lt 20MB) { throw "下载体积异常（$size 字节），多半拿到的是错误页面" }
+
+            # 只读探测：先确认这是个真 zip，而不是 GitHub 的 404 页面。
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            try {
+              $probe = [System.IO.Compression.ZipFile]::OpenRead($zip)
+              $names = $probe.Entries | ForEach-Object { $_.FullName }
+              $probe.Dispose()
+            }
+            catch { throw "下载到的不是合法 zip：$($_.Exception.Message)" }
+            if (-not (@($names | Where-Object { $_ -like '*pwsh.exe' }).Count)) {
+              throw "zip 里没有 pwsh.exe，条目数 $($names.Count)"
+            }
+
+            if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force -Confirm:$false }
+            Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+
+            # 不假设 pwsh.exe 一定在解压根目录：官方包目前是这样，但布局不由我们决定。
+            $exe = Join-Path $dir 'pwsh.exe'
+            if (-not (Test-Path -LiteralPath $exe)) {
+              $found = Get-ChildItem -LiteralPath $dir -Recurse -File -Filter 'pwsh.exe' |
+                Select-Object -First 1
+              if (-not $found) { throw "解压后在 $dir 下找不到 pwsh.exe" }
+              $exe = $found.FullName
+            }
+            Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "QM_PWSH = $exe"
+          # GITHUB_ENV 用无 BOM UTF-8 追加，避免 PS 5.1 的 Out-File 把 BOM 写进变量名。
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_ENV,
+            "QM_PWSH=$exe`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Assert interpreter version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:QM_PWSH) { throw 'QM_PWSH 未设置，上一步没写进 GITHUB_ENV' }
+          if (-not (Test-Path -LiteralPath $env:QM_PWSH)) { throw "找不到解释器：$env:QM_PWSH" }
+
+          # 注意：这里不能用 `| Select-Object -First 1` 之类的早停管道。
+          # 下游一停止接收，原生进程被掐断，$LASTEXITCODE 会变成 $null，
+          # 于是 `$null -ne 0` 成立、把一次成功的调用判成失败（本仓库踩过）。
+          $out = & $env:QM_PWSH -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "取版本失败，退出码 $code" }
+          # 先包成数组再取下标：单元素时管道返回标量，标量上 [-1] 取的是最后一个字符。
+          $lines = @(@($out) | Where-Object { $_ })
+          if ($lines.Count -eq 0) { throw '取版本没有任何输出' }
+          $actual = "$($lines[$lines.Count - 1])".Trim()
+
+          Write-Host "interpreter = $env:QM_PWSH"
+          Write-Host "version     = $actual"
+          if ($actual -notlike '${{ matrix.ps.expect }}') {
+            throw "PowerShell 版本不符：期望 ${{ matrix.ps.expect }}，实际 $actual"
+          }
 
       - name: Build solution
         run: dotnet build QuietMode.sln -c Release -v minimal --nologo
@@ -40,6 +137,7 @@ jobs:
       - name: C# unit tests
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $exe = Join-Path $PWD 'tests\QuietMode.Core.Tests\bin\Release\net481\QuietMode.Core.Tests.exe'
           if (-not (Test-Path -LiteralPath $exe)) { throw "未找到测试可执行文件：$exe" }
           & $exe
@@ -48,46 +146,83 @@ jobs:
       - name: Verify qmctl artifact
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $tool = Join-Path $PWD 'src\QuietMode.Cli\bin\Release\net481\qmctl.exe'
           if (-not (Test-Path -LiteralPath $tool)) { throw "构建产物缺失：$tool" }
-          & $tool --help
-          if ($LASTEXITCODE -ne 0) { throw "qmctl --help 退出码 $LASTEXITCODE" }
 
-      - name: Install Pester
+          # 先把全部输出收进变量，再看退出码，最后才取首行。
+          # 顺序反了就会重演上一行的坑：早停管道吞掉 $LASTEXITCODE。
+          $out = & $tool --help
+          $code = $LASTEXITCODE
+          Write-Host "exit = $code"
+          if ($code -ne 0) { throw "qmctl --help 退出码 $code" }
+          $lines = @(@($out) | Where-Object { $_ })
+          if ($lines.Count -eq 0) { throw 'qmctl --help 没有任何输出' }
+          $first = "$($lines[0])".Trim()
+          Write-Host "first = $first"
+          if ($first -notmatch '^qmctl\s+\d+\.\d+\.\d+') { throw "qmctl --help 首行不是版本行：$first" }
+
+      - name: Install Pester (pinned)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Get-Module -ListAvailable Pester | Select-Object Name, Version | Format-Table -AutoSize
-          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.7.0' })) {
-            Set-PSRepository PSGallery -InstallationPolicy Trusted
-            Install-Module Pester -MinimumVersion 5.7.0 -Force -SkipPublisherCheck -Scope CurrentUser
-          }
+          # 版本必须钉死。用 -MinimumVersion 5.7.0 时 runner 装到的是 6.2.0，
+          # 而开发机上是 5.7.1 —— 两边 Pester 大版本不同，一边绿一边红就没法
+          # 互相印证，等于白跑一遍矩阵。
+          $want = '5.7.1'
+          $boot = "Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue; Install-Module Pester -RequiredVersion $want -Force -SkipPublisherCheck -Scope CurrentUser"
+          & $env:QM_PWSH -NoProfile -ExecutionPolicy Bypass -Command $boot
+          if ($LASTEXITCODE -ne 0) { throw "Pester 安装失败，退出码 $LASTEXITCODE" }
 
-      - name: Pester
+          # 装完自证：run-pester.ps1 用 -MinimumVersion 解析模块，
+          # 机器上若还有更高版本，它可能选到别的版本。
+          $probe = 'Import-Module Pester -MinimumVersion 5.7.0 -Force; (Get-Module Pester).Version.ToString()'
+          $out = & $env:QM_PWSH -NoProfile -ExecutionPolicy Bypass -Command $probe
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "取 Pester 版本失败，退出码 $code" }
+          $lines = @(@($out) | Where-Object { $_ })
+          $actual = "$($lines[$lines.Count - 1])".Trim()
+          Write-Host "Pester = $actual"
+          if ($actual -ne $want) { throw "Pester 版本不符：期望 $want，实际 $actual" }
+
+      - name: Pester (all tests + NUnit XML)
         shell: pwsh
+        # QM_ALLOW_TASK_INTEGRATION=1 打开 Grant-TaskRead.Tests.ps1 里那 4 条真实 ACL 集成用例：
+        # 在 runner 上建唯一前缀的临时任务文件夹、真的调 SetSecurityDescriptor / Set-Acl、
+        # 回读验证 ACE 在位且权限没扩大，最后清理。windows-latest runner 默认提权，
+        # 这层覆盖本来就拿得到 —— 之前不设这个开关，等于把「真实写入」永远留在未验证状态。
+        # 用例带 AfterAll 清理，且对象名是 \QuietMode-Test-<guid>\，不碰 runner 上任何既有任务。
+        env:
+          QM_ALLOW_TASK_INTEGRATION: '1'
         run: |
           $ErrorActionPreference = 'Stop'
-          Import-Module Pester -MinimumVersion 5.7.0 -Force
-
-          $cfg = New-PesterConfiguration
-          $cfg.Run.Path = 'tests\ps'
-          $cfg.Run.PassThru = $true
-          $cfg.Output.Verbosity = 'Normal'
-          $cfg.TestResult.Enabled = $true
-          $cfg.TestResult.OutputPath = 'testResults.xml'
-          $cfg.TestResult.OutputFormat = 'NUnitXml'
-
-          $result = Invoke-Pester -Configuration $cfg
-          Write-Host ("Total={0} Passed={1} Failed={2} Skipped={3}" -f `
-            $result.TotalCount, $result.PassedCount, $result.FailedCount, $result.SkippedCount)
-
-          if ($result.TotalCount -eq 0) { throw 'Pester 没有执行任何测试' }
-          if ($result.FailedCount -gt 0) { throw "Pester 失败 $($result.FailedCount) 项" }
+          & $env:QM_PWSH -NoProfile -ExecutionPolicy Bypass -File 'build\run-pester.ps1' -NUnitXml 'testResults.xml'
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "Pester 失败（run-pester.ps1 退出码 $code）" }
 
       - name: Upload Pester result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pester-result
+          name: ${{ matrix.ps.artifact }}
           path: testResults.xml
           if-no-files-found: ignore
+
+  linux-core-compile:
+    # 纯 Core 程序集按设计不含任何系统调用，这一腿只证明它能在 Linux 上编译通过。
+    # 不跑任何测试：Pester 与 C# 单测都依赖 Windows（WMI / 计划任务 / ACL），
+    # 在 Linux 上它们要么编不过要么只能跳过，跑出来的绿是假绿。
+    name: linux / core compile only
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build QuietMode.Core
+        run: dotnet build src/QuietMode.Core/QuietMode.Core.csproj -c Release -v minimal --nologo

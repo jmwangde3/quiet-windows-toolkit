@@ -1,5 +1,254 @@
 # 变更记录
 
+## 2.0.5 — 2026-11-15
+
+主题：**安装器跨版本兼容性与发布工程加固。核心行为零改动** —— 夜间静音、维护任务禁用、
+`SysMain` 夜间策略、整盘 Offline、FanControl 静音、白天按 baseline 恢复、单一 v2 调度器、
+状态机与 10 分钟对账、安全边界与回滚不变量，全部保持原样。本版没有新增静音模式、没有新调度功能、
+没有扩大禁用任务范围。
+
+### 1. 任务状态判据抽成模块，一份实现三个脚本共用
+
+新增 `powershell/Modules/QuietMode.TaskState.psm1`。导出 `Split-QmTaskPath`、`Test-QmAdmin`、
+`Test-QmUsersReadAce`、`Test-QmFileHasUsersRead`、`Resolve-QmTaskQueryOutcome`、`Get-QmTaskState`。
+`Install-QuietMode.ps1` / `Grant-TaskRead.ps1` / `Fix-TaskVisibility.ps1` 改为薄包装，调用点未动。
+
+判据收紧成三态：
+
+- `Exists = $true` —— 确实读到了任务；
+- `Exists = $false` —— **只有明确证明任务不存在**（FQID `CmdletizationQuery_NotFound`，或命中文末的 not-found 白名单文本）；
+- `Exists = $null` —— 其余一律「无法确认」：拒绝访问、RPC 不可用、服务未启动、名称非法、未知异常。
+
+**未提权时即使命中了 not-found 文本，也只返回 `$null`** —— 文件夹 ACL 的访问检查发生在任务对象之前，
+「看不见」不等于「不存在」。2.0.4 遗留的 `-match '找不到|不存在'` 宽泛正则因此被彻底移除：
+`Access Denied`、`RPC 服务器不可用` 只要带上这几个字就会被误判成「任务不存在」，
+而在单调度不变量里，误判的代价是整台机器失去调度器。
+
+### 2. 安装器自检从一层变两层
+
+`[03] 现有安装` 原先只做环境自检（探一个不存在的任务）。现在先跑**纯判据自检**：
+
+- 喂 PS 5.1 措辞、PS 7.7.0 措辞、英文措辞三种 not-found → 必须判 `$false`；
+- 喂 PermissionDenied / ResourceUnavailable / 找不到网络路径 / 未知异常 → 必须判 `$null`；
+- 喂 `FW`（只写）SDDL → 必须判「没有 Users 读权限」。
+
+任一条不符直接 `exit 3`，不进入任何写操作。再跑环境自检（提权下必须 `$false`，未提权下必须 `$null`）。
+
+这层自检不是装饰：开发过程中我自己写的 not-found 正则英文分支少写了一次对象名，
+就是被它当场抓出来的（`FAIL 自检失败：任务状态判据与预期不符 / not-found 措辞没判成 false`）。
+
+### 3. 授权段补上退出码判据
+
+`[15]` 原先只看 `Grant-TaskRead.ps1` 的输出文本里有没有失败汇总行。现在先看退出码：
+
+```
+$grantCode = $LASTEXITCODE
+if ($grantCode -ne 0) { Write-Bad ('授权脚本退出码 ' + $grantCode + '（2=有授权失败，3=未提权未执行）') }
+elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退出码 0 但输出里有失败汇总行' }
+```
+
+### 4. `Grant-TaskRead.ps1` 三处缺陷
+
+| 缺陷 | 后果 | 修法 |
+|---|---|---|
+| `Test-UsersReadAce` 只看「有没有 BU 这条 ACE」 | `(A;OICI;FW;;;BU)`（只写）被当成已有读，直接 `continue` 跳过 | 看权限位：别名 `FR/FA/GR/GRGX/GA` 含读，`FW/FX/SD/WD` 不含；十六进制查 `FILE_READ_DATA(0x1)` 与 `GENERIC_READ(0x80000000)` |
+| `Grant-TaskFileRead` 写后不回读 | `Set-Acl` 不抛异常就 `Added++`，实际可能没写进去 | `Set-Acl` 后重新 `Get-Acl` 并复判，读不到就 `throw` |
+| 未提权跑 `-Apply` 返回 `exit 0` | 调用方以为授权已经做完 | 改 `exit 3` |
+
+任务对象授权那两处 `-match '\(A;[^()]*;;;BU\)'` 一并换成 `Test-UsersReadAce -Sddl`。
+
+另加 `-TaskNames` 白名单：给了就只对点名的任务调用 `GetTask`，**不枚举**；没给保持原来的
+全枚举。安装器调用的仍然是不带该参数的形态，正式安装的默认目标范围一个字节都没变。
+这条参数是给下面的 ACL 真机验收用的 —— 「只碰我点的那一个对象」和「碰巧枚举到一批」
+在 ACL 写入里是两件不同的事。
+
+### 5. 安装器支持发布包扁平布局
+
+`$cliBin` / `$trayBin` 改为按候选列表探测：源码编译产物优先，找不到再回退到包根
+（`qmctl.exe` 与 `powershell\` 同级）。**仓库里编译过的情况下路径一个字都不变**；
+解析结果打印在头部 `二进制` / `托盘` 两行，出问题一眼能看出用的是哪份载体。
+
+这条不做的话，解压出来的发布包跑 Apply 会死在载体完整性检查上，报错还是「先 dotnet build」——
+对着一份没有源码的包说这句话没有意义。
+
+### 6. 非提权回滚演练重新可用
+
+`-Mode Rollback -DryRun` 原先被权限门拦下（非提权一律 `exit 5`）。回滚演练只打印动作、
+不删任务、不动闸门、不还原二进制，没有理由要求提权。权限门因此放行这一个组合。
+
+回滚段 `$s.Exists -eq $null` 由 `Write-Bad`（进失败清单）改为 `Write-Warn2` ——
+「读不到」不等于「删不掉」，不该让一次无法确认把整次回滚判成失败。
+
+### 7. CI 矩阵
+
+`.github/workflows/ci.yml` 从单 job 扩成三条腿：
+
+| 腿 | 跑什么 |
+|---|---|
+| `windows-latest` × PowerShell **5.1** | 编译 + C# 单测 + 全部 Pester |
+| `windows-latest` × PowerShell **7.7.0** | 同上（官方 zip 精确安装，不用 runner 预装的 pwsh，不用 `latest`） |
+| `ubuntu-latest` × Core 编译 | 只编 `QuietMode.Core`（按设计无系统调用），不跑测试 |
+
+每条腿都先断言解释器版本（5.1 用 `5.1.*` 前缀，7.7.0 用精确匹配），版本不符直接失败 ——
+锁版本这件事必须能自证，否则 runner 镜像一换就静默失去覆盖。
+`fail-fast: false` 只是为了让两条腿都跑完方便对比，**没有任何 `continue-on-error`**。
+
+首跑两条腿都红了。修完前两个又红了一次，第三个才是真问题。四件事：
+
+1. **7.7.0 腿下载 msi 拿到 404。** v7.7.0 的发布资产里只有
+   `PowerShell-7.7.0-win-x64.zip` / `.msixbundle`，没有 `.msi`。
+   改成取官方 zip，先按体积（< 20MB 判为错误页）和 zip 条目（必须含 `pwsh.exe`）
+   两道探测确认是真包，再解压、再找 `pwsh.exe`（不假设它在根目录）。
+2. **5.1 腿把一次成功的调用判成失败。** `Verify qmctl artifact` 里写的是
+   `$first = (& $tool --help | Select-Object -First 1)` 然后看 `$LASTEXITCODE`。
+   早停管道会掐断原生进程，退出码再也不会被记录：pwsh 7 下是 `$null`，
+   PS 5.1 下是被杀进程的非零残值，两条路都撞上 `-ne 0`。
+   改成先收全部输出、再看退出码、最后取首行。`release.yml` 的同款写法一并改掉。
+3. **一条测试写死了开发者机器。** `TaskState` 的真机用例断言
+   「`\QuietMode\QuietMode-Reconcile` 若存在必须读到 `Exists=true`」，
+   而 runner 上根本没装 v2 —— `false` 才是正确答案，两条腿都红在它上面。
+   改成拿「枚举任务后按路径+名字找」当参照物：只回答在不在，不碰异常文本，
+   所以不会跟被测判据同源出错。三种情况各断言一条：
+   探针看得到 → 不许判 `false`；提权且探针看不到 → 必须确定为 `false`；
+   未提权 → 必须 `null`（看不见 ≠ 不存在）。
+4. **Pester 版本漂移。** `-MinimumVersion 5.7.0` 在 runner 上装到了 **6.2.0**，
+   开发机是 **5.7.1**。测试框架大版本不同，一边绿一边红就没法互相印证，
+   等于白跑一遍矩阵。改成 `-RequiredVersion 5.7.1` 精确安装，装完回读断言；
+   `release.yml` 用同一个字面量，并用契约测试强制两边一致。
+
+### 8. 可复现发布包
+
+新增 `build/pack-release.ps1` → `QuietMode-v2.0.5-win-x64.zip` + `SHA256SUMS.txt`。
+「可复现」= 内容清单固定 + 条目顺序固定（按相对路径序数排序）+ 条目时间戳固定（常量 `2000-01-01`）。
+实测同一份输入连打两次 SHA256 完全一致：
+
+```
+80d85339e6648fb1be6008f9fdca56a392ec0cebdbde4e03e223f9aa7bd3f327
+385,186 B / 51 个条目
+```
+
+包里含：`qmctl.exe`、`QuietMode.exe`、两个 DLL、两份 `.config`、`powershell\` 全树
+（17 个脚本 + 8 个模块 + Worker + 2 个 `.cmd`）、`config/default-policy.json`、
+`README.md`、`SAFETY.md`、`LICENSE`、`docs\*.md`、`SHA256SUMS.txt`。
+不含 `tests\`、`obj\`、`.git\`、`*.pdb`。
+
+**`CHANGELOG.md` 故意不进包。** 它在 2.0.5 这一节里记着这个 zip 的 SHA256，
+而它自己又在 zip 里 —— 一旦打进去就构成自指：包内那份记录的必然是上一代的哈希，
+每次重打都对不上，永远自洽不了。打包脚本为此加了一条硬断言，谁把它加回来就直接
+`exit 3`。验证方式也留了：改完 CHANGELOG 再打包，哈希必须保持不变
+（本轮实测：把哈希改成本节的 `80d85339…` 之后复打，仍为
+`80d85339…`，字节数 385,186 不变）。
+
+脚本会断言三件事：契约文件齐全（含 C# 控制器按常量算出的三条脚本路径）、
+包根含 `powershell\Modules`（`qmctl` 的 RepoLocator 要求）、包里没有测试/临时产物。
+
+### 9. Release 工作流
+
+新增 `.github/workflows/release.yml`，只响应 `v*.*.*` tag。`preflight` job 用严格正则
+`^v\d+\.\d+\.\d+$` 判定，预发布 tag（`v1.2.3-rc.1`）判为 `is_release=false`，
+`publish` job 直接跳过 —— 让预发布 tag **安静跳过**而不是红着失败。
+
+`publish` 在发版前依次卡：编译 → C# 单测 → Pester 全绿 → 打包 → 包名与 tag 一致 →
+包内 `qmctl --help` 版本与 tag 一致 → `SHA256SUMS.txt` 逐条自校验 → 包内无测试产物。
+任何一步不过都不发版。
+
+**本版只验证工作流，不建 tag、不发 Release。**
+
+### 10. 版本号统一 2.0.5
+
+- `QuietModeConfig.Version` → `2.0.5`（产品版本唯一来源）；
+- `QuietMode.csproj` / `QuietMode.Cli.csproj` / `QuietMode.Core.csproj` / `QuietMode.Windows.csproj`
+  的 `<FileVersion>2.0.5.0</FileVersion>` / `<ProductVersion>` / `<InformationalVersion>` 同步；
+- `<AssemblyVersion>` **保持 `2.0.0.0` 不动** —— 程序集标识不该跟产品版本走。
+
+后三个 csproj 原先完全没有版本声明，导致安装器 `[02]` 一直显示 `v1.0.0.0`。
+
+### 11. 文档
+
+- **README 重写**：首页第一屏讲清「v2 是正式版、v1 是历史兼容、两者不得同时作为独立调度器运行」；
+  快速开始改为 13 步 v2 流程，所有命令按真实 CLI 语法核对过（含 `config set` 白名单里
+  **没有** `disks.targets`、必须手改 JSON 这个事实）。删掉指向已不存在的 `QuietMode/QuietMode.cs` 的引用。
+- 新增 `docs/LEGACY.md`：v1 的组件清单、真实命令、行为细节、迁移与回退、10 项结构性缺陷、本机遗留状态。
+- `docs/LEGACY_AUDIT.md` 与 `docs/LEGACY_BEHAVIOR.md` 顶部加「历史资料」标注，指回 README 与 LEGACY.md。
+
+### 12. 测试
+
+| 文件 | 用例数 | 内容 |
+|---|---|---|
+| `tests/ps/QuietMode.TaskState.Tests.ps1` | 38 | 路径拆分、不存在 6 例、无法确认 10 例、SDDL 判据 10 例、是否提权、真机只读 4 例 |
+| `tests/ps/Grant-TaskRead.Tests.ps1` | 21 | 内存 ACL 判据 9 例、SDDL 与 ACL 一致性 4 组、脚本契约 6 例（子进程取退出码 + switch 撞名 AST 守卫）、真实任务集成 4 例（默认跳过） |
+| `tests/ps/Test-QuietModeAclApply.Tests.ps1` | 33 | ACL 真机验收入口的静态契约（不自行加 ACE、生产保护、夹具形态、恢复根位置）、模式互斥与默认只读、非法 TestId 拦截、未提权三个写模式必须 `exit 3`、`-TaskNames` 精确限定、DACL 比较 10 例（AI 位不算失败） |
+| `tests/ps/Install-Contract.Tests.ps1` | 25 | 全目录 PS1/PSM1 双版本 Parser 语法、BOM/换行约定、版本号层次、安装器契约、DryRun 与回滚演练子进程验证；其中 7 条是 CI 工作流契约（双版本矩阵、无 `continue-on-error`、PS 7 走 zip 不走 msi、`--help` 不得接早停管道、tag 逐段判定、不自己打 tag、两个工作流钉同一个 Pester 版本） |
+
+原有 8 个测试文件 79 条**一条没删**。合计 **196 条**：
+PowerShell 5.1 `Total=196 Passed=192 Failed=0 Skipped=4`，
+PowerShell 7.7.0 同一组数字。4 条跳过的是需要提权的真实任务 ACL 集成用例
+（`QM_ALLOW_TASK_INTEGRATION=1` 才跑）。C# 单测 **123 项**全部通过。
+
+在 CI 上把 `QM_ALLOW_TASK_INTEGRATION=1` 打开之后，头两轮各抓到一个
+**本机永远碰不到**的缺陷，都修了：
+
+1. 集成用例的跳过判据写在 `BeforeAll` 里，而 `It ... -Skip:(expr)` 的表达式在
+   **discovery 阶段**求值 —— 那时变量还是 `$null`，于是任何环境都跳过，
+   数字看着正常、覆盖面是零。判据搬进 `BeforeDiscovery`。
+2. `Grant-TaskRead.ps1` 里 `$check` 撞上 `[switch]$Check`。PowerShell 变量名不区分
+   大小写，往带类型约束的 switch 变量里塞 SDDL 字符串会抛
+   `ArgumentTransformationMetadataException`，`-Apply` 在「写后回读」那一步就终止 ——
+   也就是说真实写入从来没有被回读验证过。变量改名 `$sdAfter`，并补一条 AST 守卫
+   扫全仓 `.ps1`/`.psm1`：给与自己 `[switch]` 形参同名的变量赋非布尔值即失败。
+
+第三轮是**本机五档真机执行**，又抓到一个：`-Rollback` 拿完整 SDDL 串做全等比较，
+而 `SetSecurityDescriptor` 写回后 `SE_DACL_AUTO_INHERITED` 位必然带上
+（`D:` → `D:AI`），这一位不受调用方控制 —— 于是恢复永远判失败，而 `-Cleanup`
+要求 `phase=Restored`，整条链卡死在一个标志位上。判据改为按 **ACE 值 + 出现次数**
+比较（顺序无关），控制标志差异降级为 WARN；文件夹与文件仍用字符串全等
+（实测两者都能精确恢复，没有理由放宽）。10 条新增用例把这个坑的两个原始串固化
+成断言，另有一条防回退守卫：判据改回字符串全等就立刻失败。
+
+### 13. 其它
+
+- 新增 `build/run-pester.ps1`：双版本 Pester 运行器，`-NUnitXml <path>` 一次运行同时断言并产出报告
+  （不为了拿 XML 再跑第二遍）；零测试 `exit 2`、有失败 `exit 1`。
+- `.gitignore` 增加 `dist/`。
+
+### 14. ACL 真机验收入口
+
+新增 `powershell/Test-QuietModeAclApply.ps1`。它回答的是本版最要紧的那个未决问题：
+**PowerShell 7.7.0 下真实写任务 ACL 到底行不行** —— 而这件事此前只能靠推断，
+因为它要求动真实对象，日常主机上不合适。
+
+做法是把风险面缩到最小：建一个一次性测试任务 `\QuietMode-ACL-Test-<GUID>\QuietMode-ACL-Probe`，
+Disabled、无触发器、动作是 `cmd.exe /c exit 0`，**不引用任何真实资源**；然后用生产脚本
+`Grant-TaskRead.ps1`（安装器 `[15]` 步调用的同一份）去授权它，再从三个角度回读取证。
+
+| 模式 | 做什么 | 默认 |
+|---|---|---|
+| `-Preflight` | 十项前置条件逐条判，任一不过 `exit 3` | 是（不带开关即此模式） |
+| `-Apply` | 建夹具 → 存原始 SDDL → 调生产脚本 → 回读 → 幂等复跑 → Check 只读 → 比对生产 | |
+| `-Check` | 前后三次快照比对，证明「检查」本身不改状态 | |
+| `-Rollback` | 按原始 SDDL 逐项恢复并回读校验 | |
+| `-Cleanup` | 注销任务、删文件夹、核对生产未变、归档报告 | |
+
+几条硬约束写成了运行时代码而不是注释：
+
+- **生产保护**：每次操作任务对象前过 `Assert-TestScoped` —— 路径必须严格等于当前 GUID
+  的测试文件夹，命中 `\Microsoft\Windows`、`\QuietHDD`、`\QuietMode` 任一前缀立即 `throw`；
+  `TestId` 必须是标准 GUID（它会被拼进文件夹名）。
+- **不复制实现**：本脚本一行 `AddAccessRule` 都没有，授权全部发生在子进程调用的生产脚本里。
+  复制一份进测试脚本，测的就是复制品，没意义。
+- **基线只存 DACL**：`GetSecurityDescriptor(0xF)` 读到的串含 SACL，拿它回写需要
+  `SeSecurityPrivilege` —— 存了个自己写不回去的基线等于没有基线。0xF 只作证据记录。
+- **写后必回读**：`Set-Acl` 不抛异常 ≠ ACE 落到文件上；`SetSecurityDescriptor` 之后
+  原对象作废，必须重新 `GetTask` 再读。
+- **恢复资料先落盘再写 ACL**：`state.json` 在第一次写之前就在
+  `%ProgramData%\QuietMode-AclTestRecovery\<GUID>\` 里了。放这个独立目录而不是生产配置
+  目录，是因为后者被安装器权限加固过（Users 只读）——非提权 `-Preflight` 写不进、
+  提权 `-Apply` 写进去、之后非提权 `-Rollback` 又读不回来，恢复通道不能依赖「你现在是不是管理员」。
+- **失败不删证据**：恢复失败时恢复目录原样保留，报告里给出原始 SDDL，可以手工复原。
+
+真机执行结果见 `docs/ACL_APPLY_HOST_VALIDATION.md`。**本版未在本机跑通完整 `-Apply`**
+（当前会话非提权），该文档如实标注了执行到哪一步、哪一步需要管理员窗口重跑。
+
 ## 2.0.4 — 2026-11-15
 
 ### 严重：PowerShell 7 下 Apply 会把自己装的 v2 回滚掉

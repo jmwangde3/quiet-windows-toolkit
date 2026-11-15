@@ -9,6 +9,9 @@
     <DebugSymbols>false</DebugSymbols>
     <EnableDefaultItems>true</EnableDefaultItems>
     <Deterministic>true</Deterministic>
+    <FileVersion>2.0.5.0</FileVersion>
+    <ProductVersion>2.0.5</ProductVersion>
+    <InformationalVersion>2.0.5</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

@@ -12,6 +12,11 @@
     <Deterministic>true</Deterministic>
     <PlatformTarget>AnyCPU</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
+    <!-- 产品版本跟着 QuietModeConfig.Version 走；AssemblyVersion 不动，
+         这样只是「能看出这是哪一版」，不会改变程序集标识与绑定行为 -->
+    <FileVersion>2.0.5.0</FileVersion>
+    <ProductVersion>2.0.5</ProductVersion>
+    <InformationalVersion>2.0.5</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

@@ -42,19 +42,30 @@
          它只有 Id/Index/SD，于是筛出来 0 个（日志里「任务对象 : 共 0 个」）。
          用 GetTasks(1) 枚举，服务自己知道哪些是任务。
 
+    2026-11-15 追加 -TaskNames：
+      -IncludeTasks 原本会把文件夹下的任务**全部**枚举出来逐个处理。正式安装要的
+      就是这个行为，但 ACL 真机验收（Test-QuietModeAclApply.ps1）要求「只碰明确
+      指定的那一个对象」，枚举结果一律不许当作用户意图。
+      加一个 -TaskNames 白名单：给了就只处理列出的名字，没给保持原来的全枚举。
+      默认目标范围一个字节都没变 —— 安装器调用的还是不带 -TaskNames 的形态。
+
     用法：
       .\Grant-TaskRead.ps1                 # 演练：只说要改什么
       .\Grant-TaskRead.ps1 -Apply          # 真改（需要管理员）
       .\Grant-TaskRead.ps1 -Check          # 只读自检：当前身份能枚举到几个任务
       .\Grant-TaskRead.ps1 -Apply -IncludeTasks              # 连任务对象一起处理
       .\Grant-TaskRead.ps1 -Apply -Folders '\QuietMode\','\QuietHDD\'
+      # 只处理点名的那一个任务对象（ACL 验收用，不枚举）
+      .\Grant-TaskRead.ps1 -Apply -Folders '\QuietMode-ACL-Test-<guid>\' -IncludeTasks -TaskNames 'QuietMode-ACL-Probe'
 #>
 [CmdletBinding()]
 param(
     [string[]]$Folders = @('\QuietMode\', '\QuietHDD\'),
     [switch]$Apply,
     [switch]$Check,
-    [switch]$IncludeTasks
+    [switch]$IncludeTasks,
+    # 只处理这些任务名；留空 = 枚举文件夹下全部任务（原行为）
+    [string[]]$TaskNames = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,6 +75,17 @@ $DaclOnly     = 4                        # DACL_SECURITY_INFORMATION，只碰 DA
 $UsersReadAce = '(A;OICI;FR;;;BU)'       # Users 只读，含子对象继承
 $UsersSid     = 'S-1-5-32-545'           # BUILTIN\Users
 $TaskRoot     = Join-Path $env:SystemRoot 'System32\Tasks'
+
+# ACL 判据只留一份，住在 Modules\QuietMode.TaskState.psm1 里（那里有 PS 5.1 / 7.7
+# 两个版本实测过的表）。以前这里有一份自己的正则，三处实现各写各的，
+# 「Users 只有写权限」被当成「已有读」直接跳过，安装器还报 OK。
+$taskStateModule = Join-Path $PSScriptRoot 'Modules\QuietMode.TaskState.psm1'
+if (-not (Test-Path -LiteralPath $taskStateModule)) {
+    Write-Host ('缺少模块：' + $taskStateModule) -ForegroundColor Red
+    Write-Host '没有它无法判断「已有权限」与「权限不足」，拒绝在猜的基础上改 ACL。' -ForegroundColor Red
+    exit 3
+}
+Import-Module $taskStateModule -Force -ErrorAction Stop
 
 $elevated = $false
 try {
@@ -82,10 +104,16 @@ function ConvertTo-TaskFolderPath {
     return $p
 }
 
+# 判据住在模块里，这里只做同名转发 —— 三个脚本（本脚本 / Fix-TaskVisibility /
+# Install-QuietMode）共用一份实现，不会再出现「某处正则只认有 BU 不认权限位」。
 function Test-UsersReadAce {
     param([string]$Sddl)
-    if ([string]::IsNullOrEmpty($Sddl)) { return $false }
-    return [bool]($Sddl -match '\(A;[^()]*;;;BU\)')
+    return Test-QmUsersReadAce -Sddl $Sddl
+}
+
+function Test-FileHasUsersRead {
+    param($Acl)
+    return Test-QmFileHasUsersRead -Acl $Acl
 }
 
 function Add-DaclAce {
@@ -121,7 +149,7 @@ function Wait-SecurityDescriptor {
 }
 
 function Grant-TaskFileRead {
-    param([string]$FolderPath)
+    param([string]$FolderPath, [string[]]$OnlyNames = @())
 
     $stat = [pscustomobject]@{ Total = 0; Added = 0; Failed = 0 }
     $leaf = $FolderPath.TrimStart('\')
@@ -129,7 +157,14 @@ function Grant-TaskFileRead {
     $dir = Join-Path $TaskRoot $leaf
     if (-not (Test-Path -LiteralPath $dir)) { return $stat }
 
-    foreach ($file in @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)) {
+    # 点名模式只碰列出的文件；没点名就是原来的全目录行为。
+    # 名字比对不区分大小写（Windows 文件系统语义），但只做等值比较，不做通配。
+    $files = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue)
+    if ($OnlyNames -and $OnlyNames.Count -gt 0) {
+        $files = @($files | Where-Object { $n = $_.Name; @($OnlyNames | Where-Object { $_ -ieq $n }).Count -gt 0 })
+    }
+
+    foreach ($file in $files) {
         $stat.Total++
         try {
             # PS 5.1（.NET Framework）上 FileInfo 有实例方法 GetAccessControl / SetAccessControl；
@@ -138,11 +173,7 @@ function Grant-TaskFileRead {
             # 补授权静默失败，WARN 只说要失败不说为什么。Get-Acl / Set-Acl 两个版本都有
             # 且语义一致，用它们绕开这层差异。
             $sec = Get-Acl -LiteralPath $file.FullName
-            $has = $false
-            foreach ($r in @($sec.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))) {
-                if ($r.AccessControlType -eq 'Allow' -and $r.IdentityReference.Value -eq $UsersSid) { $has = $true; break }
-            }
-            if ($has) { continue }
+            if (Test-FileHasUsersRead -Acl $sec) { continue }
 
             $sidObj = New-Object System.Security.Principal.SecurityIdentifier($UsersSid)
             $ace = New-Object System.Security.AccessControl.FileSystemAccessRule(
@@ -153,6 +184,13 @@ function Grant-TaskFileRead {
                 [System.Security.AccessControl.AccessControlType]::Allow)
             $sec.AddAccessRule($ace) | Out-Null
             Set-Acl -LiteralPath $file.FullName -AclObject $sec
+
+            # 写后必须回读：Set-Acl 不抛异常不等于 ACE 落到了文件上。
+            # 旧实现在这里直接 Added++，于是「调用没报错」被当成「授权成功」。
+            $after = Get-Acl -LiteralPath $file.FullName
+            if (-not (Test-FileHasUsersRead -Acl $after)) {
+                throw '写入后回读不到 Users 读权限'
+            }
             $stat.Added++
         } catch {
             Write-Host ("      WARN 任务文件补授权失败：" + $file.Name + " -> " + $_.Exception.Message) -ForegroundColor Yellow
@@ -215,7 +253,10 @@ Write-Host ''
 
 if ($Apply -and -not $elevated) {
     Write-Host '  需要管理员：改任务计划器的安全描述符要提权。' -ForegroundColor Yellow
+    Write-Host '  退出码 3：本次没有做任何修改。' -ForegroundColor Yellow
+    Write-Host '  （旧版这里返回 0，调用方会以为授权已经做完。）' -ForegroundColor DarkGray
     Write-Host ''
+    exit 3
 }
 
 $failed = 0
@@ -250,7 +291,7 @@ foreach ($raw in $Folders) {
     if (Test-UsersReadAce $before) {
         Write-Host '  OK   已有 Users 读权限，跳过文件夹' -ForegroundColor Green
         if ($Apply -and $elevated) {
-            $r0 = Grant-TaskFileRead -FolderPath $path
+            $r0 = Grant-TaskFileRead -FolderPath $path -OnlyNames $TaskNames
             Write-Host ("  任务文件 : 共 " + $r0.Total + " 个，补授权 " + $r0.Added + " 个")
             if ($r0.Failed -gt 0) { $failed++ }
         }
@@ -280,32 +321,35 @@ foreach ($raw in $Folders) {
         continue
     }
 
-    $check = Wait-SecurityDescriptor -Fetch { $svc.GetFolder($path) } -Flags $DaclOnly
-    if (-not $check) {
+    # 变量名别叫 $check：本脚本有 [switch]$Check 形参，PowerShell 变量名不区分大小写，
+    # 给同名变量赋字符串会抛 ArgumentTransformationMetadataException（-Apply 写入路径
+    # 直接死在回读这一步，而 -Check 只读分支永远走不到，所以本地 DryRun 抓不到）。
+    $sdAfter = Wait-SecurityDescriptor -Fetch { $svc.GetFolder($path) } -Flags $DaclOnly
+    if (-not $sdAfter) {
         Write-Host '  FAIL 写入后回读不到安全描述符' -ForegroundColor Red
         $failed++
         continue
     }
-    if (-not (Test-UsersReadAce $check)) {
+    if (-not (Test-UsersReadAce $sdAfter)) {
         Write-Host '  FAIL 写入后回读不到 Users ACE' -ForegroundColor Red
-        Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+        Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
         $failed++
         continue
     }
     # 原有 ACE 一条都不能少（防止 SetSecurityDescriptor 把 DACL 覆盖成只剩新 ACE）
     $lost = 0
     foreach ($m in [regex]::Matches($before, '\([AD];[^()]*\)')) {
-        if ($check.IndexOf($m.Value) -lt 0) { $lost++ }
+        if ($sdAfter.IndexOf($m.Value) -lt 0) { $lost++ }
     }
     if ($lost -gt 0) {
         Write-Host ("  FAIL 写回后丢了 " + $lost + " 条原有 ACE") -ForegroundColor Red
-        Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+        Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
         $failed++
         continue
     }
-    Write-Host ("  DONE 已追加 : " + $check) -ForegroundColor Green
+    Write-Host ("  DONE 已追加 : " + $sdAfter) -ForegroundColor Green
 
-    $r = Grant-TaskFileRead -FolderPath $path
+    $r = Grant-TaskFileRead -FolderPath $path -OnlyNames $TaskNames
     Write-Host ("  任务文件 : 共 " + $r.Total + " 个，补授权 " + $r.Added + " 个")
     if ($r.Failed -gt 0) { $failed++ }
 
@@ -337,9 +381,21 @@ if ($IncludeTasks) {
         }
 
         $tasks = @()
-        try { $tasks = @($folder.GetTasks(1)) } catch { }
+        if ($TaskNames -and $TaskNames.Count -gt 0) {
+            # 点名模式：逐个 GetTask，不枚举。名字错了就报出来，绝不退回全枚举 ——
+            # 「意图是这一个」与「碰巧枚举到一批」在 ACL 写入里是两件事。
+            foreach ($n in $TaskNames) {
+                try { $tasks += $folder.GetTask($n) }
+                catch {
+                    Write-Host ("  FAIL 点名任务不存在或读不到：" + $n + " -> " + $_.Exception.Message) -ForegroundColor Red
+                    $failed++
+                }
+            }
+        } else {
+            try { $tasks = @($folder.GetTasks(1)) } catch { }
+        }
         if ($tasks.Count -eq 0) {
-            Write-Host '  （枚举不到任务）' -ForegroundColor DarkGray
+            Write-Host '  （没有可处理的任务）' -ForegroundColor DarkGray
             try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($svc) } catch { }
             continue
         }
@@ -356,7 +412,7 @@ if ($IncludeTasks) {
                 Write-Host ("  FAIL 读不到 " + $name + " 的安全描述符：" + $_.Exception.Message) -ForegroundColor Red
                 $bad++; continue
             }
-            if ($before -match '\(A;[^()]*;;;BU\)') {
+            if (Test-UsersReadAce -Sddl $before) {
                 Write-Host ("  OK   " + $name + " 已有 Users 读") -ForegroundColor Green
                 continue
             }
@@ -385,29 +441,29 @@ if ($IncludeTasks) {
                 $bad++; continue
             }
 
-            $check = Wait-SecurityDescriptor -Fetch { $folder.GetTask($name) } -Flags $DaclOnly
-            if (-not $check) {
+            $sdAfter = Wait-SecurityDescriptor -Fetch { $folder.GetTask($name) } -Flags $DaclOnly
+            if (-not $sdAfter) {
                 Write-Host ("  FAIL " + $name + " 写入后回读不到 SD（重新取对象重试 8 次全空）") -ForegroundColor Red
                 Write-Host ("       原值已备份：" + $bak) -ForegroundColor Yellow
                 Write-Host ("       兜底：Fix-TaskVisibility.ps1 -Apply -Targets '" + $fullName + "'") -ForegroundColor Yellow
                 $bad++; continue
             }
-            if ($check -notmatch '\(A;[^()]*;;;BU\)') {
+            if (-not (Test-UsersReadAce -Sddl $sdAfter)) {
                 Write-Host ("  FAIL " + $name + " 回读仍没有 Users 读") -ForegroundColor Red
-                Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+                Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
                 $bad++; continue
             }
             $lost = 0
             foreach ($m in [regex]::Matches($before, '\([AD];[^()]*\)')) {
-                if ($check.IndexOf($m.Value) -lt 0) { $lost++ }
+                if ($sdAfter.IndexOf($m.Value) -lt 0) { $lost++ }
             }
             if ($lost -gt 0) {
                 Write-Host ("  FAIL " + $name + " 写回后丢了 " + $lost + " 条原有 ACE") -ForegroundColor Red
-                Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+                Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
                 $bad++; continue
             }
             Write-Host ("  DONE " + $name) -ForegroundColor Green
-            Write-Host ("       现值：" + $check) -ForegroundColor DarkGray
+            Write-Host ("       现值：" + $sdAfter) -ForegroundColor DarkGray
             $done++
         }
 
