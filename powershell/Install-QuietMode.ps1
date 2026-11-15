@@ -228,44 +228,17 @@ function Start-Tray {
     } catch { Write-Warn2 "启动托盘失败：$($_.Exception.Message)" }
 }
 
+# 任务全名拆分与状态判据都住在 Modules\QuietMode.TaskState.psm1 里 —— 那里有
+# PS 5.1 / 7.7 两个版本实测过的判据表，以及「只有明确证明不存在才返回 false」的铁律。
+# 这里保留同名薄包装，是为了让下面几十处调用点一个字都不用改。
 function Split-TaskPath {
     param([string]$FullName)
-    $parts = $FullName.TrimStart('\').Split('\')
-    $name = $parts[-1]
-    $path = '\'
-    if ($parts.Length -gt 1) { $path = '\' + (($parts[0..($parts.Length - 2)]) -join '\') + '\' }
-    return [pscustomobject]@{ Path = $path; Name = $name }
+    return Split-QmTaskPath -FullName $FullName
 }
 
 function Get-TaskState {
     param([string]$FullName)
-    $tp = Split-TaskPath -FullName $FullName
-    try {
-        $t = Get-ScheduledTask -TaskPath $tp.Path -TaskName $tp.Name -ErrorAction Stop
-        return [pscustomobject]@{ Exists = $true; Enabled = ($t.State -ne 'Disabled'); State = [string]$t.State; Error = '' }
-    } catch {
-        $msg = $_.Exception.Message
-        # 「查不到这个任务」必须认成「不存在」。认成「无法确认」的代价不是一句 WARN：
-        # 第 7 步会把它算进 $legacyStillOn，触发不变量回滚，把刚装好的 v2 整个拆掉。
-        # 2026-11-15 用 PowerShell 7 跑 Apply 就这么中招 —— v2 任务被删，机器裸奔。
-        #
-        # 别只靠异常文本：PS 5.1 说「找不到任何匹配的 MSFT_ScheduledTask 对象」，
-        # PS 7 说「未找到匹配的 MSFT_ScheduledTask 对象」。措辞一换，正则静默失效。
-        # CmdletizationQuery_NotFound 这个 FQID 两个版本一致，优先用它；文本只兜底。
-        $notFound = $false
-        try { $notFound = [bool]($_.FullyQualifiedErrorId -match 'CmdletizationQuery_NotFound') } catch { }
-        if (-not $notFound) {
-            $notFound = ($msg -match 'No MSFT_ScheduledTask|未找到匹配|找不到任何匹配|找不到|does not exist|不存在')
-        }
-        if ($notFound) {
-            # \QuietHDD\ 的 ACL 对普通用户不可读：CIM 会报"找不到"，但那是看不见，不是不存在
-            if ($tp.Path -eq '\QuietHDD\' -and -not (Test-Admin)) {
-                return [pscustomobject]@{ Exists = $null; Enabled = $null; State = ''; Error = '未提权，\QuietHDD\ 下的任务不可见（读不到 ≠ 不存在）' }
-            }
-            return [pscustomobject]@{ Exists = $false; Enabled = $null; State = ''; Error = '' }
-        }
-        return [pscustomobject]@{ Exists = $null; Enabled = $null; State = ''; Error = $msg }
-    }
+    return Get-QmTaskState -FullName $FullName
 }
 
 function Set-LegacyEnabled {
@@ -322,8 +295,60 @@ $repoRoot = Resolve-RepoRoot
 if (-not $DeployDir) { $DeployDir = Join-Path $repoRoot 'QuietMode' }
 $DeployDir = [IO.Path]::GetFullPath($DeployDir)
 
+# ---------------------------------------------------------------- 任务状态判据模块
+# Get-TaskState 判错一次的代价是整台机器失去调度器：2026-11-15 用 PS 7 跑 Apply 时，
+# 异常文本措辞从「找不到任何匹配」变成「未找到匹配」，正则漏掉后者，
+# 「不存在」被判成「无法确认」→ 不变量回滚把刚装好的 v2 整个拆掉。
+# 判据从此单独成模块：一份代码两个版本共用，Pester 可以脱离安装流程直接断言。
+$taskStateModule = Join-Path $repoRoot 'powershell\Modules\QuietMode.TaskState.psm1'
+if (-not (Test-Path -LiteralPath $taskStateModule)) {
+    Write-Log ''
+    Write-Log ('载体缺少任务状态判据模块：' + $taskStateModule) 'Red'
+    Write-Log '安装器不能在没有这个模块的情况下继续 —— 无法安全判断 v1 闸门是否还在跑。' 'Red'
+    exit 3
+}
+try {
+    Import-Module $taskStateModule -Force -ErrorAction Stop
+} catch {
+    Write-Log ''
+    Write-Log ('任务状态判据模块加载失败：' + $_.Exception.Message) 'Red'
+    exit 3
+}
+
 $cliBin = Join-Path $repoRoot 'src\QuietMode.Cli\bin\Release\net481'
 $trayBin = Join-Path $repoRoot 'QuietMode\build\bin\Release'
+
+# 二进制可能来自两种载体，优先级固定：
+#   1. 源码仓库编译产物（src\...\net481、QuietMode\build\bin\Release）—— 原行为，排第一
+#   2. 发布包扁平布局（qmctl.exe / QuietMode.exe / dll 与 powershell\ 同级）—— 只作回退
+# 回退只在「首选目录里探针文件不全」时启用，仓库里编译过的情况下路径一个字都不变。
+# 不这么写的话，解压出来的发布包跑 Apply 会死在载体完整性检查上，
+# 而报错信息是「先 dotnet build」—— 对着一个没有源码的包说这句话毫无意义。
+function Resolve-BinDir {
+    param([string[]]$Candidates, [string[]]$Probe, [string]$Fallback)
+
+    foreach ($c in $Candidates) {
+        if (-not $c) { continue }
+        if (-not (Test-Path -LiteralPath $c)) { continue }
+        $ok = $true
+        foreach ($p in $Probe) {
+            if (-not (Test-Path -LiteralPath (Join-Path $c $p))) { $ok = $false; break }
+        }
+        if ($ok) { return $c }
+    }
+    return $Fallback
+}
+
+$cliBin = Resolve-BinDir -Candidates @(
+    (Join-Path $repoRoot 'src\QuietMode.Cli\bin\Release\net481'),
+    (Join-Path $repoRoot 'bin'),
+    $repoRoot
+) -Probe @('qmctl.exe', 'QuietMode.Core.dll', 'QuietMode.Windows.dll') -Fallback $cliBin
+
+$trayBin = Resolve-BinDir -Candidates @(
+    (Join-Path $repoRoot 'QuietMode\build\bin\Release'),
+    $repoRoot
+) -Probe @('QuietMode.exe') -Fallback $trayBin
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $isAdmin = Test-Admin
@@ -343,6 +368,8 @@ Write-Log '============================================================' 'White'
 Write-Log (" QuietMode v2 安装器   模式 = " + $Mode) 'White'
 Write-Log '============================================================' 'White'
 Write-Log (" 仓库     " + $repoRoot)
+Write-Log (" 二进制   " + $cliBin)
+Write-Log (" 托盘     " + $trayBin)
 Write-Log (" 部署目录 " + $DeployDir)
 Write-Log (" 配置根   " + $Root)
 $adminText = '否'
@@ -385,7 +412,11 @@ if ($Mode -eq 'Rollback') {
     foreach ($full in $script:LegacyTasks) {
         $s = Get-TaskState -FullName $full
         if ($s.Exists -eq $false) { Write-Note "$full 不存在（v1 未安装过？）"; continue }
-        if ($s.Exists -eq $null) { Write-Bad ("$full 无法确认：" + $s.Error); continue }
+        if ($s.Exists -eq $null) {
+            # 未提权的回滚演练会走到这里：读不到 ≠ 不存在，不该算失败
+            Write-Warn2 ("$full 无法确认：" + $s.Error)
+            continue
+        }
         if ($s.Enabled -eq $true) { Write-Note "$full 已是启用状态"; continue }
         if (-not $rbApply) { Write-Note "将启用 $full"; continue }
         try {
@@ -465,6 +496,7 @@ if ($osv.Major -ge 10) {
 
 if ($isAdmin) { Write-Ok '已提权（Administrators）' }
 elseif ($Mode -eq 'DryRun') { Write-Note '未提权：DryRun 只读检查可继续；Apply 需要管理员' }
+elseif ($Mode -eq 'Rollback' -and $DryRun) { Write-Note '未提权：回滚演练只打印动作、不动系统，可以继续' }
 else { Write-Bad '未提权' }
 
 # ================================================================ 2 载体完整性
@@ -473,7 +505,7 @@ Write-Step '载体完整性'
 function Show-Artifact {
     param([string]$Path, [string]$Label, [switch]$Required)
     if (-not (Test-Path -LiteralPath $Path)) {
-        if ($Required) { Write-Bad ("缺少 " + $Label + "：" + $Path + "（先 dotnet build QuietMode.sln -c Release）") }
+        if ($Required) { Write-Bad ("缺少 " + $Label + "：" + $Path + "（源码仓库请先 dotnet build QuietMode.sln -c Release；发布包请确认 qmctl.exe / QuietMode.exe 与 powershell\ 同级）") }
         else { Write-Warn2 ("缺少 " + $Label + "：" + $Path) }
         return
     }
@@ -497,7 +529,7 @@ Show-Artifact -Path (Join-Path $trayBin 'QuietMode.exe') -Label '托盘 QuietMod
 $moduleNames = @(
     'QuietMode.Common.psm1', 'QuietMode.Config.psm1', 'QuietMode.Disk.psm1',
     'QuietMode.Fan.psm1', 'QuietMode.Maintenance.psm1', 'QuietMode.Power.psm1',
-    'QuietMode.Security.psm1'
+    'QuietMode.Security.psm1', 'QuietMode.TaskState.psm1'
 )
 foreach ($m in $moduleNames) {
     Show-Artifact -Path (Join-Path $repoRoot ('powershell\Modules\' + $m)) -Label $m -Required
@@ -518,19 +550,72 @@ Write-Step '现有安装'
 
 # ---------------------------------------------------------------- 自检：不存在 ≠ 无法确认
 # 这两个结论在后面的流程里走完全相反的路径：不存在 → 跳过；无法确认 → 算作「v1 停不掉」
-# → 不变量回滚，把 v2 删掉。判错的代价是整台机器失去调度器，所以先探一次。
-# 探针用两层文件夹，确保不会撞上任何真实任务。
-$probe = Get-TaskState -FullName '\__QuietModeSelfCheck__\__NoSuchTask__'
-if ($probe.Exists -ne $false) {
-    Write-Bad '自检失败：查询不存在的任务没有返回「不存在」'
-    Write-Log ('     Exists=' + $probe.Exists + '   Error=' + $probe.Error) 'DarkGray'
-    Write-Log '     这个判错会让「停用 v1 闸门」误判成无法确认，从而回滚整个 v2 安装。' 'Yellow'
+# → 不变量回滚，把 v2 删掉。判错的代价是整台机器失去调度器，所以分两层各验一次。
+#
+# 第一层是纯判据：直接喂两种 PowerShell 措辞 + 权限/连接错误，不依赖提权、不依赖真机状态。
+# 这一层才是真正的回归防线 —— 2026-11-15 出事的正是「文本措辞换了一个字」。
+$judgeOk = $true
+$judgeDetail = @()
+
+$notFoundTexts = @(
+    'CIM 查询: SELECT * FROM MSFT_ScheduledTask WHERE ... 找不到任何匹配的 MSFT_ScheduledTask 对象。请验证查询参数，然后重试。',
+    'CIM 查询: SELECT * FROM MSFT_ScheduledTask WHERE ... 未找到匹配的 MSFT_ScheduledTask 对象。请验证查询参数，然后重试。',
+    'No MSFT_ScheduledTask objects found with property values matching'
+)
+foreach ($t in $notFoundTexts) {
+    $r = Resolve-QmTaskQueryOutcome -FullyQualifiedErrorId '' -Category 'ObjectNotFound' -Message $t -TaskPath '\X\' -IsAdmin $true
+    if ($r.Exists -ne $false) { $judgeOk = $false; $judgeDetail += ('not-found 措辞没判成 false：' + $t.Substring(0, [Math]::Min(40, $t.Length))) }
+}
+$rFqid = Resolve-QmTaskQueryOutcome -FullyQualifiedErrorId 'CmdletizationQuery_NotFound,Get-ScheduledTask' -Category 'ObjectNotFound' -Message '' -TaskPath '\X\' -IsAdmin $true
+if ($rFqid.Exists -ne $false) { $judgeOk = $false; $judgeDetail += 'FQID CmdletizationQuery_NotFound 没判成 false' }
+
+# 反向：这三类必须「无法确认」，判成「不存在」就会误跳过本该停用的闸门
+$mustBeNull = @(
+    @{ C = 'PermissionDenied'; M = '拒绝访问。' },
+    @{ C = 'PermissionDenied'; M = 'Access is denied' },
+    @{ C = 'ResourceUnavailable'; M = 'RPC 服务器不可用。' },
+    @{ C = 'ResourceUnavailable'; M = '服务尚未启动。' },
+    @{ C = ''; M = '找不到网络路径。' },
+    @{ C = 'NotSpecified'; M = '对象引用未设置到对象的实例。' }
+)
+foreach ($c in $mustBeNull) {
+    $r = Resolve-QmTaskQueryOutcome -FullyQualifiedErrorId '' -Category $c.C -Message $c.M -TaskPath '\X\' -IsAdmin $true
+    if ($null -ne $r.Exists) { $judgeOk = $false; $judgeDetail += ('应判「无法确认」却给了结论：' + $c.M) }
+}
+
+# SDDL 判据：只有写权限的 Users ACE 不算「已有读」
+if (Test-QmUsersReadAce -Sddl 'D:AI(A;OICI;FW;;;BU)') { $judgeOk = $false; $judgeDetail += '只有写权限的 BU ACE 被判成已有读' }
+if (-not (Test-QmUsersReadAce -Sddl 'D:AI(A;OICI;FR;;;BU)')) { $judgeOk = $false; $judgeDetail += '标准读 ACE 没被判成已有读' }
+
+if (-not $judgeOk) {
+    Write-Bad '自检失败：任务状态判据与预期不符'
+    foreach ($d in $judgeDetail) { Write-Log ('     ' + $d) 'DarkGray' }
+    Write-Log '     这个判错会让「停用 v1 闸门」误判，从而回滚整个 v2 安装。' 'Yellow'
     Write-Log ('     当前 shell：PowerShell ' + $PSVersionTable.PSVersion.ToString()) 'Yellow'
-    Write-Log '     改用 Windows PowerShell 5.1 重新运行，或先把 Get-TaskState 修好。' 'Yellow'
     if ($script:LogPath) { Write-Log ("日志：" + $script:LogPath) 'Yellow' }
     exit 3
 }
-Write-Ok '任务查询语义自检通过（不存在的任务判为不存在）'
+Write-Ok '任务状态判据自检通过（不存在 → false；权限/连接错误 → 无法确认）'
+
+# 第二层是环境自检：真的去查一个不存在的任务。提权下必须给出 false；
+# 未提权下只能给 null —— 文件夹 ACL 的访问检查先于任务对象，看不见 ≠ 不存在。
+$probe = Get-TaskState -FullName '\__QuietModeSelfCheck__\__NoSuchTask__'
+if ($isAdmin) {
+    if ($probe.Exists -ne $false) {
+        Write-Bad '环境自检失败：提权下查询不存在的任务没有返回「不存在」'
+        Write-Log ('     Exists=' + $probe.Exists + '   Reason=' + $probe.Reason + '   Error=' + $probe.Error) 'DarkGray'
+        if ($script:LogPath) { Write-Log ("日志：" + $script:LogPath) 'Yellow' }
+        exit 3
+    }
+    Write-Ok '环境自检通过（提权下不存在的任务判为不存在）'
+} else {
+    if ($null -ne $probe.Exists) {
+        Write-Bad '环境自检失败：未提权下不该给出确定结论'
+        Write-Log ('     Exists=' + $probe.Exists + '   Reason=' + $probe.Reason) 'DarkGray'
+        exit 3
+    }
+    Write-Note '环境自检：未提权，不存在的任务判为「无法确认」（读不到 ≠ 不存在）—— 预期行为'
+}
 
 $hasConfig = Test-Path -LiteralPath (Join-Path $Root 'config.json')
 $hasBaseline = Test-Path -LiteralPath (Join-Path $Root 'baseline.json')
@@ -1039,7 +1124,7 @@ function Get-QmTaskCacheSddl {
 }
 
 $v2Sddl = Get-QmTaskCacheSddl $v2TaskKey
-if ($v2Sddl -and $v2Sddl -match '\(A;[^()]*;;;BU\)') {
+if ($v2Sddl -and (Test-QmUsersReadAce -Sddl $v2Sddl)) {
     Write-Ok '任务对象已含 Users 读 ACE'
 } elseif (-not $apply) {
     Write-Note '任务对象缺 Users 读 ACE → Apply 时重新注册（XML 原样，只换 sddl）'
@@ -1049,7 +1134,7 @@ if ($v2Sddl -and $v2Sddl -match '\(A;[^()]*;;;BU\)') {
         try {
             $text = (& $fixScript -Apply 2>&1 | Out-String)
             $v2Sddl = Get-QmTaskCacheSddl $v2TaskKey
-            if ($v2Sddl -and $v2Sddl -match '\(A;[^()]*;;;BU\)') {
+            if ($v2Sddl -and (Test-QmUsersReadAce -Sddl $v2Sddl)) {
                 Write-Ok '任务对象已重新注册并含 Users 读 ACE'
             } else {
                 Write-Bad '任务对象仍缺 Users 读 ACE（重新注册没生效）'
@@ -1070,17 +1155,26 @@ if ($v2Sddl -and $v2Sddl -match '\(A;[^()]*;;;BU\)') {
 if ($apply) {
     $grantScript = Join-Path $repoRoot 'powershell\Grant-TaskRead.ps1'
     if (Test-Path -LiteralPath $grantScript) {
+        $grantCode = $null
         try {
             $text = (& $grantScript -Apply -IncludeTasks 2>&1 | Out-String)
+            $grantCode = $LASTEXITCODE
             foreach ($line in ($text -split "`r?`n")) {
                 $t = $line.Trim()
                 if (-not $t) { continue }
                 if ($t -match '^FAIL') { Write-Bad $t }
                 elseif ($t -match '^(DONE|OK)\s') { Write-Ok $t }
             }
-        } catch { Write-Warn2 ("任务文件夹授权失败：" + $_.Exception.Message) }
+            # 退出码是硬判据。旧版这里只按文本行判断：脚本明明 exit 2 / exit 3，
+            # 但只要输出里没有以 FAIL 开头的行，安装器就当成功 —— 授权其实没做。
+            if ($grantCode -ne 0) {
+                Write-Bad ('授权脚本退出码 ' + $grantCode + '（2=有授权失败，3=未提权未执行）')
+            } elseif ($text -match '(?m)^\s*结果：.*失败') {
+                Write-Bad '授权脚本退出码 0 但输出里有失败汇总行'
+            }
+        } catch { Write-Bad ("任务文件夹授权失败：" + $_.Exception.Message) }
     } else {
-        Write-Note ("缺少 " + $grantScript + "，跳过文件夹级授权（托盘非提权仍看不到任务状态）")
+        Write-Warn2 ("缺少 " + $grantScript + "，跳过文件夹级授权（托盘非提权仍看不到任务状态）")
     }
 } else {
     Write-Note '将给 \QuietMode\ 与 \QuietHDD\ 文件夹及其中的任务对象加 Users 只读（托盘免提权才看得到任务）'
