@@ -338,7 +338,7 @@ CI 矩阵：`windows × PowerShell 5.1`、`windows × PowerShell 7.7.0`（官方
 放行。Pester 版本也钉死（`-RequiredVersion 5.7.1`）—— 测试框架版本漂移会让「一边绿一边红」
 变成无法解释的事。
 
-测试规模：C# 单测 **123** 项；Pester **186** 条（本机 182 通过 / 4 跳过）。跳过的是
+测试规模：C# 单测 **123** 项；Pester **196** 条（本机 192 通过 / 4 跳过）。跳过的是
 `Grant-TaskRead` 里那 4 条真实任务 ACL 集成用例 —— 它们要设 `QM_ALLOW_TASK_INTEGRATION=1`
 **并且**在管理员会话里才跑。本机是日常主机，默认不打开这个开关；CI 的 `windows-latest`
 runner 本身提权，工作流里已经打开，所以那 4 条在两条 Windows 腿上是真跑的。
@@ -363,6 +363,11 @@ runner 本身提权，工作流里已经打开，所以那 4 条在两条 Window
 `Grant-TaskRead.ps1` 里（子进程调用，参数与安装器 `[15]` 步一致），验收脚本自己不复制一份实现。
 生产保护是运行时代码：路径必须严格等于当前 GUID 的测试文件夹，命中 `\QuietMode` / `\QuietHDD` /
 `\Microsoft\Windows` 任一前缀立即中止。
+
+**五档已在本机管理员 PowerShell 7.7.0 下真跑完，退出码全 0**：三个面都写入并回读，
+权限只给到 `FR`（不含任何写/改位），第二次 Apply 走 `Skipped` 且四个面零漂移，
+Check 前后快照全等，Rollback 恢复后 `phase=Restored`，Cleanup 后测试对象消失而生产
+6 项快照不变。
 
 本机实测记录见 [`docs/ACL_APPLY_HOST_VALIDATION.md`](docs/ACL_APPLY_HOST_VALIDATION.md)。
 

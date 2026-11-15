@@ -123,8 +123,8 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 实测同一份输入连打两次 SHA256 完全一致：
 
 ```
-8e1a113eec1fd3d38c32cde86f4f072a45452684ae4942ff015bf0bcf15c9d76
-379,891 B / 51 个条目
+80d85339e6648fb1be6008f9fdca56a392ec0cebdbde4e03e223f9aa7bd3f327
+385,186 B / 51 个条目
 ```
 
 包里含：`qmctl.exe`、`QuietMode.exe`、两个 DLL、两份 `.config`、`powershell\` 全树
@@ -136,8 +136,8 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 而它自己又在 zip 里 —— 一旦打进去就构成自指：包内那份记录的必然是上一代的哈希，
 每次重打都对不上，永远自洽不了。打包脚本为此加了一条硬断言，谁把它加回来就直接
 `exit 3`。验证方式也留了：改完 CHANGELOG 再打包，哈希必须保持不变
-（本轮实测：把哈希改成本节的 `8e1a113e…` 之后复打，仍为
-`8e1a113e…`，字节数 379,891 不变）。
+（本轮实测：把哈希改成本节的 `80d85339…` 之后复打，仍为
+`80d85339…`，字节数 385,186 不变）。
 
 脚本会断言三件事：契约文件齐全（含 C# 控制器按常量算出的三条脚本路径）、
 包根含 `powershell\Modules`（`qmctl` 的 RepoLocator 要求）、包里没有测试/临时产物。
@@ -177,11 +177,11 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 |---|---|---|
 | `tests/ps/QuietMode.TaskState.Tests.ps1` | 38 | 路径拆分、不存在 6 例、无法确认 10 例、SDDL 判据 10 例、是否提权、真机只读 4 例 |
 | `tests/ps/Grant-TaskRead.Tests.ps1` | 21 | 内存 ACL 判据 9 例、SDDL 与 ACL 一致性 4 组、脚本契约 6 例（子进程取退出码 + switch 撞名 AST 守卫）、真实任务集成 4 例（默认跳过） |
-| `tests/ps/Test-QuietModeAclApply.Tests.ps1` | 23 | ACL 真机验收入口的静态契约（不自行加 ACE、生产保护、夹具形态、恢复根位置）、模式互斥与默认只读、非法 TestId 拦截、未提权三个写模式必须 `exit 3`、`-TaskNames` 精确限定 |
+| `tests/ps/Test-QuietModeAclApply.Tests.ps1` | 33 | ACL 真机验收入口的静态契约（不自行加 ACE、生产保护、夹具形态、恢复根位置）、模式互斥与默认只读、非法 TestId 拦截、未提权三个写模式必须 `exit 3`、`-TaskNames` 精确限定、DACL 比较 10 例（AI 位不算失败） |
 | `tests/ps/Install-Contract.Tests.ps1` | 25 | 全目录 PS1/PSM1 双版本 Parser 语法、BOM/换行约定、版本号层次、安装器契约、DryRun 与回滚演练子进程验证；其中 7 条是 CI 工作流契约（双版本矩阵、无 `continue-on-error`、PS 7 走 zip 不走 msi、`--help` 不得接早停管道、tag 逐段判定、不自己打 tag、两个工作流钉同一个 Pester 版本） |
 
-原有 8 个测试文件 79 条**一条没删**。合计 **186 条**：
-PowerShell 5.1 `Total=186 Passed=182 Failed=0 Skipped=4`，
+原有 8 个测试文件 79 条**一条没删**。合计 **196 条**：
+PowerShell 5.1 `Total=196 Passed=192 Failed=0 Skipped=4`，
 PowerShell 7.7.0 同一组数字。4 条跳过的是需要提权的真实任务 ACL 集成用例
 （`QM_ALLOW_TASK_INTEGRATION=1` 才跑）。C# 单测 **123 项**全部通过。
 
@@ -196,6 +196,14 @@ PowerShell 7.7.0 同一组数字。4 条跳过的是需要提权的真实任务 
    `ArgumentTransformationMetadataException`，`-Apply` 在「写后回读」那一步就终止 ——
    也就是说真实写入从来没有被回读验证过。变量改名 `$sdAfter`，并补一条 AST 守卫
    扫全仓 `.ps1`/`.psm1`：给与自己 `[switch]` 形参同名的变量赋非布尔值即失败。
+
+第三轮是**本机五档真机执行**，又抓到一个：`-Rollback` 拿完整 SDDL 串做全等比较，
+而 `SetSecurityDescriptor` 写回后 `SE_DACL_AUTO_INHERITED` 位必然带上
+（`D:` → `D:AI`），这一位不受调用方控制 —— 于是恢复永远判失败，而 `-Cleanup`
+要求 `phase=Restored`，整条链卡死在一个标志位上。判据改为按 **ACE 值 + 出现次数**
+比较（顺序无关），控制标志差异降级为 WARN；文件夹与文件仍用字符串全等
+（实测两者都能精确恢复，没有理由放宽）。10 条新增用例把这个坑的两个原始串固化
+成断言，另有一条防回退守卫：判据改回字符串全等就立刻失败。
 
 ### 13. 其它
 
