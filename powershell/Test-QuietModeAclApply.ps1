@@ -643,6 +643,82 @@ function Get-MissingAces {
     return @($lost)
 }
 
+function Split-DaclSddl {
+    <#
+        SACL-free SDDL -> 控制标志 + ACE 列表。
+
+        为什么非得拆开：任务对象的 SE_DACL_AUTO_INHERITED 位（SDDL 里的 AI）
+        不由 SetSecurityDescriptor 决定 —— 一经 Schedule 服务写入，读回来必然带 AI。
+        夹具注册时传的是 D:(...)，所以基线没有 AI；恢复写回同一条串，读回来是 D:AI(...)。
+        三条 ACE 一个字符都没变，但拿完整串做全等比较就永远差这一位。
+
+        2026-11-15 本机真机 Apply 第一次跑到 -Rollback 就撞上这个：
+            FAIL 任务对象恢复后与原始值不一致：D:AI(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY)
+        原始值是 D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY)，差的只是 AI。
+        判据改成「ACE 集合一致 + 控制标志差异单独记录」——
+        控制标志不是权限，不影响任何访问判定；ACE 少了才是真失败。
+    #>
+    param([string]$Sddl)
+
+    $out = [pscustomobject]@{ Flags = ''; Aces = @(); Raw = [string]$Sddl }
+    if ([string]::IsNullOrWhiteSpace($Sddl)) { return $out }
+
+    $m = [regex]::Match($Sddl, '^\s*D:([A-Za-z]*)(.*)$')
+    if ($m.Success) {
+        $out.Flags = [string]$m.Groups[1].Value
+        $body = [string]$m.Groups[2].Value
+    } else {
+        # 少数 API 会直接给裸 ACE 列表，按无前缀处理
+        $out.Flags = ''
+        $body = $Sddl
+    }
+    $out.Aces = @([regex]::Matches($body, '\([^()]*\)') | ForEach-Object { $_.Value })
+    return $out
+}
+
+function Compare-DaclSddl {
+    <#
+        两个 DACL-only SDDL 的差异，分三个层次：
+
+          SddlEqual — 字符串全等。最严，文件夹与文件仍然是这个判据。
+          AcesEqual — 按「ACE 值 + 出现次数」比较，顺序无关。给任务对象用。
+          Missing   — before 有、after 不够的 ACE（真丢了权限）
+          Extra     — after 有、before 没有的 ACE（多给了权限）
+
+        用计数而不是「包含」：同一张 DACL 里理论上可能出现两条一样的 ACE，
+        只判断「存在」会把 2 条变 1 条当成通过。
+    #>
+    param([string]$Before, [string]$After)
+
+    $b = Split-DaclSddl -Sddl $Before
+    $a = Split-DaclSddl -Sddl $After
+
+    $missing = New-Object System.Collections.ArrayList
+    foreach ($ace in @($b.Aces | Select-Object -Unique)) {
+        $need = @($b.Aces | Where-Object { $_ -eq $ace }).Count
+        $have = @($a.Aces | Where-Object { $_ -eq $ace }).Count
+        if ($have -lt $need) { [void]$missing.Add($ace) }
+    }
+
+    $extra = New-Object System.Collections.ArrayList
+    foreach ($ace in @($a.Aces | Select-Object -Unique)) {
+        $need = @($a.Aces | Where-Object { $_ -eq $ace }).Count
+        $had  = @($b.Aces | Where-Object { $_ -eq $ace }).Count
+        if ($had -lt $need) { [void]$extra.Add($ace) }
+    }
+
+    return [pscustomobject]@{
+        SddlEqual   = ($Before -eq $After)
+        AcesEqual   = ($missing.Count -eq 0 -and $extra.Count -eq 0)
+        FlagsBefore = $b.Flags
+        FlagsAfter  = $a.Flags
+        Missing     = @($missing)
+        Extra       = @($extra)
+        BeforeCount = @($b.Aces).Count
+        AfterCount  = @($a.Aces).Count
+    }
+}
+
 # ---------------------------------------------------------------- 快照三元组
 
 function Get-FixtureSnapshot {
@@ -1331,14 +1407,18 @@ function Invoke-Rollback {
         } else {
             $cur = Get-SddlWithFlags -Object $task
             Write-Note ('当前 : ' + $cur.Sddl)
-            if ($cur.Sddl -eq $state.taskSddlBefore) {
-                Write-Ok '任务对象已经是原始状态，无需改写'
+            $cmpPre = Compare-DaclSddl -Before ([string]$state.taskSddlBefore) -After ([string]$cur.Sddl)
+            if ($cmpPre.AcesEqual) {
+                # ACE 已与基线逐条一致：可能是压根没改过，也可能是上次恢复到一半只差 AI 位。
+                Write-Ok '任务对象 ACE 已与原始值一致，无需改写'
+                if (-not $cmpPre.SddlEqual) {
+                    Write-Warn2 ('控制标志：D:' + $cmpPre.FlagsBefore + ' -> D:' + $cmpPre.FlagsAfter + '（SE_DACL_AUTO_INHERITED，不影响任何 ACE）')
+                }
                 $script:Results['rollback_task'] = 'already'
             } else {
                 try {
                     $task.SetSecurityDescriptor([string]$state.taskSddlBefore, 0)
                     # SetSecurityDescriptor 之后原对象作废，必须重新 GetTask 再回读
-                    $okSd = $false
                     $last = ''
                     for ($i = 0; $i -lt 8; $i++) {
                         Start-Sleep -Milliseconds 150
@@ -1351,13 +1431,20 @@ function Invoke-Rollback {
                     if (-not $last) {
                         Write-Bad '任务对象写入后回读不到安全描述符'
                         $script:Results['rollback_task'] = 'readback-empty'
-                    } elseif ($last -eq $state.taskSddlBefore) {
-                        Write-Ok '任务对象已恢复并回读一致'
-                        $script:Results['rollback_task'] = 'restored'
-                        $okSd = $true
                     } else {
-                        Write-Bad ('任务对象恢复后与原始值不一致：' + $last)
-                        $script:Results['rollback_task'] = 'mismatch'
+                        $cmp = Compare-DaclSddl -Before ([string]$state.taskSddlBefore) -After $last
+                        if ($cmp.AcesEqual) {
+                            Write-Ok ('任务对象已恢复：' + $cmp.AfterCount + ' 条 ACE 与原始值逐条一致')
+                            if (-not $cmp.SddlEqual) {
+                                Write-Warn2 ('控制标志：D:' + $cmp.FlagsBefore + ' -> D:' + $cmp.FlagsAfter + '（SE_DACL_AUTO_INHERITED，不影响任何 ACE）')
+                            }
+                            $script:Results['rollback_task'] = 'restored'
+                        } else {
+                            Write-Bad ('任务对象恢复后 ACE 与原始值不一致：' + $last)
+                            if ($cmp.Missing.Count -gt 0) { Write-Note ('缺失 ACE：' + ($cmp.Missing -join ' ')) }
+                            if ($cmp.Extra.Count -gt 0) { Write-Note ('多出 ACE：' + ($cmp.Extra -join ' ')) }
+                            $script:Results['rollback_task'] = 'mismatch'
+                        }
                     }
                 } catch {
                     Write-Bad ('任务对象恢复失败：' + $_.Exception.Message)
@@ -1523,8 +1610,9 @@ function Invoke-Cleanup {
             $task = Get-TestTask -Service $svc
             if ($null -ne $task) {
                 $sd = (Get-SddlWithFlags -Object $task).Sddl
-                if ($sd -ne [string]$state.taskSddlBefore) {
-                    Write-Warn2 '任务对象 SD 与记录的原始值不完全一致，但阶段是 Restored —— 继续删除（对象本身是测试对象）'
+                $cmpClean = Compare-DaclSddl -Before ([string]$state.taskSddlBefore) -After ([string]$sd)
+                if (-not $cmpClean.AcesEqual) {
+                    Write-Warn2 ('任务对象 ACE 与记录的原始值不一致（缺 ' + $cmpClean.Missing.Count + ' 条 / 多 ' + $cmpClean.Extra.Count + ' 条），但阶段是 Restored —— 继续删除（对象本身是测试对象）')
                 }
             }
         }

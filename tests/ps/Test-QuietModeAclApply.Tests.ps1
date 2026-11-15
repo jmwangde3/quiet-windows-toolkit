@@ -246,3 +246,114 @@ Describe 'Grant-TaskRead.ps1 — -TaskNames 精确限定' {
         $text | Should -Match 'Grant-TaskFileRead -FolderPath \$path -OnlyNames \$TaskNames'
     }
 }
+
+Describe 'Test-QuietModeAclApply.ps1 — DACL 比较（AI 位不算恢复失败）' {
+
+    <#
+        为什么单独测这两个函数
+        ----------------------
+        2026-11-15 本机第一次真机 Apply 全绿，-Rollback 却判 1 项 FAIL：
+
+            FAIL 任务对象恢复后与原始值不一致：D:AI(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY)
+
+        原始值是 D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY) ——
+        三条 ACE 逐字相同，新增的 (A;;FR;;;BU) 也确实清掉了，差别只有 AI
+        （SE_DACL_AUTO_INHERITED）。这一位不受 SetSecurityDescriptor 控制：
+        夹具用 RegisterTaskDefinition 传入无 AI 的串时能原样存下，
+        一经 Schedule 服务 SetSecurityDescriptor 写回，读回来必然带 AI。
+
+        结论：任务对象的恢复判据必须是「ACE 集合一致」，控制标志差异只记 WARN。
+        少了这条，-Rollback 永远 FAIL，-Cleanup 永远被跳过，整条链跑不完。
+
+        脚本顶层会执行主流程，不能 dot-source，所以只从 AST 里取出这两个纯函数加载。
+    #>
+    BeforeAll {
+        $src = Get-Content -LiteralPath $script:TestScript -Raw -Encoding UTF8
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$null)
+        $wanted = @('Split-DaclSddl', 'Compare-DaclSddl')
+        $found = @($ast.FindAll({
+            param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $wanted -contains $n.Name
+        }, $true))
+        $found.Count | Should -Be 2 -Because '两个函数都得在脚本里，缺一个说明被改名或删掉了'
+        foreach ($fn in $found) { . ([scriptblock]::Create($fn.Extent.Text)) }
+    }
+
+    It '拆出控制标志与 ACE 列表' {
+        $r = Split-DaclSddl -Sddl 'D:PAI(A;;FA;;;BA)(A;;FA;;;SY)'
+        $r.Flags | Should -Be 'PAI'
+        @($r.Aces).Count | Should -Be 2
+        $r.Aces[0] | Should -Be '(A;;FA;;;BA)'
+    }
+
+    It '无标志位的 DACL：Flags 为空串而不是 Null' {
+        $r = Split-DaclSddl -Sddl 'D:(A;;FA;;;BA)'
+        $r.Flags | Should -Be ''
+        @($r.Aces).Count | Should -Be 1
+    }
+
+    It '空串与 Null 都不抛错，返回 0 条 ACE' {
+        foreach ($v in @('', $null)) {
+            $r = Split-DaclSddl -Sddl $v
+            @($r.Aces).Count | Should -Be 0
+        }
+    }
+
+    It '只差 AI 位：ACE 集合一致，字符串不全等' {
+        $r = Compare-DaclSddl -Before 'D:(A;;FA;;;BA)(A;;FA;;;SY)' -After 'D:AI(A;;FA;;;BA)(A;;FA;;;SY)'
+        $r.AcesEqual | Should -BeTrue
+        $r.SddlEqual | Should -BeFalse
+        $r.FlagsBefore | Should -Be ''
+        $r.FlagsAfter | Should -Be 'AI'
+    }
+
+    It '复现 11-15 真机那次 Rollback 的两个串 —— 必须判通过' {
+        $before = 'D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY)'
+        $after  = 'D:AI(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY)'
+        $r = Compare-DaclSddl -Before $before -After $after
+        $r.AcesEqual | Should -BeTrue -Because '三条 ACE 一个字符都没变，只多了 AI'
+        @($r.Missing).Count | Should -Be 0
+        @($r.Extra).Count | Should -Be 0
+        $r.BeforeCount | Should -Be 3
+        $r.AfterCount | Should -Be 3
+    }
+
+    It '恢复后还带着 Users 读 ACE —— 必须判失败，并指出多出哪一条' {
+        $before = 'D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY)'
+        $after  = 'D:AI(A;;FR;;;BU)(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY)'
+        $r = Compare-DaclSddl -Before $before -After $after
+        $r.AcesEqual | Should -BeFalse
+        @($r.Extra).Count | Should -Be 1
+        $r.Extra[0] | Should -Be '(A;;FR;;;BU)'
+    }
+
+    It '丢掉一条原始 ACE —— 必须判失败，并指出缺哪一条' {
+        $before = 'D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;SY)'
+        $after  = 'D:AI(A;;FA;;;BA)(A;;FA;;;SY)'
+        $r = Compare-DaclSddl -Before $before -After $after
+        $r.AcesEqual | Should -BeFalse
+        @($r.Missing).Count | Should -Be 1
+        $r.Missing[0] | Should -Be '(A;;FR;;;SY)'
+    }
+
+    It 'ACE 顺序变化不算差异（规范化会重排，权限语义不变）' {
+        $r = Compare-DaclSddl -Before 'D:(A;;FA;;;BA)(A;;FA;;;SY)' -After 'D:(A;;FA;;;SY)(A;;FA;;;BA)'
+        $r.SddlEqual | Should -BeFalse
+        $r.AcesEqual | Should -BeTrue
+    }
+
+    It '重复 ACE 按条数比较，不是按「存在」' {
+        $before = 'D:(A;;FA;;;BA)(A;;FA;;;BA)'
+        $after  = 'D:(A;;FA;;;BA)'
+        $r = Compare-DaclSddl -Before $before -After $after
+        $r.AcesEqual | Should -BeFalse -Because '2 条变 1 条是丢了权限'
+        @($r.Missing).Count | Should -Be 1
+    }
+
+    It 'Rollback 的任务对象判据不再用字符串全等 —— 回退这行会重新撞上 AI 位' {
+        $text = Get-Content -LiteralPath $script:TestScript -Raw -Encoding UTF8
+        $text | Should -Not -Match '\$last\s+-eq\s+\$state\.taskSddlBefore'
+        $text | Should -Match 'Compare-DaclSddl -Before \(\[string\]\$state\.taskSddlBefore\) -After \$last'
+    }
+}
