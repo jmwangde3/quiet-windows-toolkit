@@ -187,6 +187,13 @@ jobs:
 
       - name: Pester (all tests + NUnit XML)
         shell: pwsh
+        # QM_ALLOW_TASK_INTEGRATION=1 打开 Grant-TaskRead.Tests.ps1 里那 4 条真实 ACL 集成用例：
+        # 在 runner 上建唯一前缀的临时任务文件夹、真的调 SetSecurityDescriptor / Set-Acl、
+        # 回读验证 ACE 在位且权限没扩大，最后清理。windows-latest runner 默认提权，
+        # 这层覆盖本来就拿得到 —— 之前不设这个开关，等于把「真实写入」永远留在未验证状态。
+        # 用例带 AfterAll 清理，且对象名是 \QuietMode-Test-<guid>\，不碰 runner 上任何既有任务。
+        env:
+          QM_ALLOW_TASK_INTEGRATION: '1'
         run: |
           $ErrorActionPreference = 'Stop'
           & $env:QM_PWSH -NoProfile -ExecutionPolicy Bypass -File 'build\run-pester.ps1' -NUnitXml 'testResults.xml'

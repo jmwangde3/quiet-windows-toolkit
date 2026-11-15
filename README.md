@@ -338,10 +338,33 @@ CI 矩阵：`windows × PowerShell 5.1`、`windows × PowerShell 7.7.0`（官方
 放行。Pester 版本也钉死（`-RequiredVersion 5.7.1`）—— 测试框架版本漂移会让「一边绿一边红」
 变成无法解释的事。
 
-测试规模：C# 单测 **123** 项；Pester **162** 条（本机 158 通过 / 4 跳过，CI runner 上
-157 通过 / 5 跳过）。跳过的是需要真实任务 ACL 写入的集成用例（设 `QM_ALLOW_TASK_INTEGRATION=1`
-并在管理员窗口里才跑），以及那条「未提权时 `-Apply` 必须返回 3」—— 它只在非提权会话里执行，
-而 CI runner 本身是提权的。
+测试规模：C# 单测 **123** 项；Pester **185** 条（本机 181 通过 / 4 跳过）。跳过的是
+`Grant-TaskRead` 里那 4 条真实任务 ACL 集成用例 —— 它们要设 `QM_ALLOW_TASK_INTEGRATION=1`
+**并且**在管理员会话里才跑。本机是日常主机，默认不打开这个开关；CI 的 `windows-latest`
+runner 本身提权，工作流里已经打开，所以那 4 条在两条 Windows 腿上是真跑的。
+
+### ACL 真机验收
+
+真实写任务对象的 SDDL、改 `System32\Tasks` 下的文件 ACL，这层单独有一个入口：
+
+```powershell
+# 默认只读预检，十项前置条件逐条判
+.\powershell\Test-QuietModeAclApply.ps1 -Preflight
+
+# 管理员 PowerShell 7.7.0 窗口
+.\powershell\Test-QuietModeAclApply.ps1 -Apply      # 建夹具 → 调生产实现 → 回读 → 幂等 → Check → 比对生产
+.\powershell\Test-QuietModeAclApply.ps1 -Check      # 只读：前后快照比对，证明不改状态
+.\powershell\Test-QuietModeAclApply.ps1 -Rollback   # 按原始 SDDL 逐项恢复并回读校验
+.\powershell\Test-QuietModeAclApply.ps1 -Cleanup    # 注销任务、删文件夹、归档报告
+```
+
+测试对象是 `\QuietMode-ACL-Test-<GUID>\QuietMode-ACL-Probe`：Disabled、无触发器、
+动作只有 `cmd.exe /c exit 0`，不引用任何真实资源。授权动作全部发生在生产脚本
+`Grant-TaskRead.ps1` 里（子进程调用，参数与安装器 `[15]` 步一致），验收脚本自己不复制一份实现。
+生产保护是运行时代码：路径必须严格等于当前 GUID 的测试文件夹，命中 `\QuietMode` / `\QuietHDD` /
+`\Microsoft\Windows` 任一前缀立即中止。
+
+本机实测记录见 [`docs/ACL_APPLY_HOST_VALIDATION.md`](docs/ACL_APPLY_HOST_VALIDATION.md)。
 
 ---
 

@@ -57,6 +57,11 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 
 任务对象授权那两处 `-match '\(A;[^()]*;;;BU\)'` 一并换成 `Test-UsersReadAce -Sddl`。
 
+另加 `-TaskNames` 白名单：给了就只对点名的任务调用 `GetTask`，**不枚举**；没给保持原来的
+全枚举。安装器调用的仍然是不带该参数的形态，正式安装的默认目标范围一个字节都没变。
+这条参数是给下面的 ACL 真机验收用的 —— 「只碰我点的那一个对象」和「碰巧枚举到一批」
+在 ACL 写入里是两件不同的事。
+
 ### 5. 安装器支持发布包扁平布局
 
 `$cliBin` / `$trayBin` 改为按候选列表探测：源码编译产物优先，找不到再回退到包根
@@ -118,12 +123,12 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 实测同一份输入连打两次 SHA256 完全一致：
 
 ```
-002ef10d7e2b4cd77b444ce53ecbf5539af299e048cebd447bbf70868fcce022
-347,815 B / 49 个条目
+64da1b4005616e7fa5b1b5b317980e09f95e396c497e6ff9fa690e08d7ca7e91
+376,995 B / 51 个条目
 ```
 
 包里含：`qmctl.exe`、`QuietMode.exe`、两个 DLL、两份 `.config`、`powershell\` 全树
-（16 个脚本 + 8 个模块 + Worker + 2 个 `.cmd`）、`config/default-policy.json`、
+（17 个脚本 + 8 个模块 + Worker + 2 个 `.cmd`）、`config/default-policy.json`、
 `README.md`、`SAFETY.md`、`LICENSE`、`docs\*.md`、`SHA256SUMS.txt`。
 不含 `tests\`、`obj\`、`.git\`、`*.pdb`。
 
@@ -131,7 +136,7 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 而它自己又在 zip 里 —— 一旦打进去就构成自指：包内那份记录的必然是上一代的哈希，
 每次重打都对不上，永远自洽不了。打包脚本为此加了一条硬断言，谁把它加回来就直接
 `exit 3`。验证方式也留了：改完 CHANGELOG 再打包，哈希必须保持不变
-（实测改前改后同为 `002ef10d…`）。
+（实测改前改后同为 `f7307683…`）。
 
 脚本会断言三件事：契约文件齐全（含 C# 控制器按常量算出的三条脚本路径）、
 包根含 `powershell\Modules`（`qmctl` 的 RepoLocator 要求）、包里没有测试/临时产物。
@@ -171,10 +176,11 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 |---|---|---|
 | `tests/ps/QuietMode.TaskState.Tests.ps1` | 38 | 路径拆分、不存在 6 例、无法确认 10 例、SDDL 判据 10 例、是否提权、真机只读 4 例 |
 | `tests/ps/Grant-TaskRead.Tests.ps1` | 20 | 内存 ACL 判据 9 例、SDDL 与 ACL 一致性 4 组、脚本契约 5 例（子进程取退出码）、真实任务集成 4 例（默认跳过） |
+| `tests/ps/Test-QuietModeAclApply.Tests.ps1` | 23 | ACL 真机验收入口的静态契约（不自行加 ACE、生产保护、夹具形态、恢复根位置）、模式互斥与默认只读、非法 TestId 拦截、未提权三个写模式必须 `exit 3`、`-TaskNames` 精确限定 |
 | `tests/ps/Install-Contract.Tests.ps1` | 25 | 全目录 PS1/PSM1 双版本 Parser 语法、BOM/换行约定、版本号层次、安装器契约、DryRun 与回滚演练子进程验证；其中 7 条是 CI 工作流契约（双版本矩阵、无 `continue-on-error`、PS 7 走 zip 不走 msi、`--help` 不得接早停管道、tag 逐段判定、不自己打 tag、两个工作流钉同一个 Pester 版本） |
 
-原有 8 个测试文件 79 条**一条没删**。合计 **162 条**：
-PowerShell 5.1 `Total=162 Passed=158 Failed=0 Skipped=4`，
+原有 8 个测试文件 79 条**一条没删**。合计 **185 条**：
+PowerShell 5.1 `Total=185 Passed=181 Failed=0 Skipped=4`，
 PowerShell 7.7.0 同一组数字。4 条跳过的是需要提权的真实任务 ACL 集成用例
 （`QM_ALLOW_TASK_INTEGRATION=1` 才跑）。C# 单测 **123 项**全部通过。
 
@@ -183,6 +189,44 @@ PowerShell 7.7.0 同一组数字。4 条跳过的是需要提权的真实任务 
 - 新增 `build/run-pester.ps1`：双版本 Pester 运行器，`-NUnitXml <path>` 一次运行同时断言并产出报告
   （不为了拿 XML 再跑第二遍）；零测试 `exit 2`、有失败 `exit 1`。
 - `.gitignore` 增加 `dist/`。
+
+### 14. ACL 真机验收入口
+
+新增 `powershell/Test-QuietModeAclApply.ps1`。它回答的是本版最要紧的那个未决问题：
+**PowerShell 7.7.0 下真实写任务 ACL 到底行不行** —— 而这件事此前只能靠推断，
+因为它要求动真实对象，日常主机上不合适。
+
+做法是把风险面缩到最小：建一个一次性测试任务 `\QuietMode-ACL-Test-<GUID>\QuietMode-ACL-Probe`，
+Disabled、无触发器、动作是 `cmd.exe /c exit 0`，**不引用任何真实资源**；然后用生产脚本
+`Grant-TaskRead.ps1`（安装器 `[15]` 步调用的同一份）去授权它，再从三个角度回读取证。
+
+| 模式 | 做什么 | 默认 |
+|---|---|---|
+| `-Preflight` | 十项前置条件逐条判，任一不过 `exit 3` | 是（不带开关即此模式） |
+| `-Apply` | 建夹具 → 存原始 SDDL → 调生产脚本 → 回读 → 幂等复跑 → Check 只读 → 比对生产 | |
+| `-Check` | 前后三次快照比对，证明「检查」本身不改状态 | |
+| `-Rollback` | 按原始 SDDL 逐项恢复并回读校验 | |
+| `-Cleanup` | 注销任务、删文件夹、核对生产未变、归档报告 | |
+
+几条硬约束写成了运行时代码而不是注释：
+
+- **生产保护**：每次操作任务对象前过 `Assert-TestScoped` —— 路径必须严格等于当前 GUID
+  的测试文件夹，命中 `\Microsoft\Windows`、`\QuietHDD`、`\QuietMode` 任一前缀立即 `throw`；
+  `TestId` 必须是标准 GUID（它会被拼进文件夹名）。
+- **不复制实现**：本脚本一行 `AddAccessRule` 都没有，授权全部发生在子进程调用的生产脚本里。
+  复制一份进测试脚本，测的就是复制品，没意义。
+- **基线只存 DACL**：`GetSecurityDescriptor(0xF)` 读到的串含 SACL，拿它回写需要
+  `SeSecurityPrivilege` —— 存了个自己写不回去的基线等于没有基线。0xF 只作证据记录。
+- **写后必回读**：`Set-Acl` 不抛异常 ≠ ACE 落到文件上；`SetSecurityDescriptor` 之后
+  原对象作废，必须重新 `GetTask` 再读。
+- **恢复资料先落盘再写 ACL**：`state.json` 在第一次写之前就在
+  `%ProgramData%\QuietMode-AclTestRecovery\<GUID>\` 里了。放这个独立目录而不是生产配置
+  目录，是因为后者被安装器权限加固过（Users 只读）——非提权 `-Preflight` 写不进、
+  提权 `-Apply` 写进去、之后非提权 `-Rollback` 又读不回来，恢复通道不能依赖「你现在是不是管理员」。
+- **失败不删证据**：恢复失败时恢复目录原样保留，报告里给出原始 SDDL，可以手工复原。
+
+真机执行结果见 `docs/ACL_APPLY_HOST_VALIDATION.md`。**本版未在本机跑通完整 `-Apply`**
+（当前会话非提权），该文档如实标注了执行到哪一步、哪一步需要管理员窗口重跑。
 
 ## 2.0.4 — 2026-11-15
 
