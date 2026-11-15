@@ -118,14 +118,20 @@ elseif ($text -match '(?m)^\s*结果：.*失败') { Write-Bad '授权脚本退�
 实测同一份输入连打两次 SHA256 完全一致：
 
 ```
-7c31f676eeb3a1e06b176f18a6f49a732003c645e3d5f14ef79bc6baef90f271
-373,011 B / 50 个条目
+002ef10d7e2b4cd77b444ce53ecbf5539af299e048cebd447bbf70868fcce022
+347,815 B / 49 个条目
 ```
 
 包里含：`qmctl.exe`、`QuietMode.exe`、两个 DLL、两份 `.config`、`powershell\` 全树
 （16 个脚本 + 8 个模块 + Worker + 2 个 `.cmd`）、`config/default-policy.json`、
-`README.md`、`SAFETY.md`、`LICENSE`、`CHANGELOG.md`、`docs\*.md`、`SHA256SUMS.txt`。
+`README.md`、`SAFETY.md`、`LICENSE`、`docs\*.md`、`SHA256SUMS.txt`。
 不含 `tests\`、`obj\`、`.git\`、`*.pdb`。
+
+**`CHANGELOG.md` 故意不进包。** 它在 2.0.5 这一节里记着这个 zip 的 SHA256，
+而它自己又在 zip 里 —— 一旦打进去就构成自指：包内那份记录的必然是上一代的哈希，
+每次重打都对不上，永远自洽不了。打包脚本为此加了一条硬断言，谁把它加回来就直接
+`exit 3`。验证方式也留了：改完 CHANGELOG 再打包，哈希必须保持不变
+（实测改前改后同为 `002ef10d…`）。
 
 脚本会断言三件事：契约文件齐全（含 C# 控制器按常量算出的三条脚本路径）、
 包根含 `powershell\Modules`（`qmctl` 的 RepoLocator 要求）、包里没有测试/临时产物。

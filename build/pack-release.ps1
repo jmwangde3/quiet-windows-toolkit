@@ -137,7 +137,10 @@ foreach ($f in $psFiles) {
 }
 
 # 文档与默认策略
-foreach ($n in @('README.md', 'SAFETY.md', 'LICENSE', 'CHANGELOG.md')) {
+# 注意：CHANGELOG.md 不进包。它在 2.0.5 一节里记着这个 zip 的 SHA256，
+# 而它自己又在 zip 里面 —— 一旦打进去，包内那份记录的必然是上一代的哈希，
+# 每次重打都会变，永远自洽不了。发布说明里写哈希就够了，包里不需要它。
+foreach ($n in @('README.md', 'SAFETY.md', 'LICENSE')) {
     [void](Add-PkgFile -Source (Join-Path $repoRoot $n) -Relative $n)
 }
 [void](Add-PkgFile -Source (Join-Path $repoRoot 'config\default-policy.json') -Relative 'config/default-policy.json')
@@ -194,6 +197,13 @@ $forbidden = @(Get-ChildItem -LiteralPath $pkgRoot -Recurse -File |
 if ($forbidden.Count -gt 0) {
     Write-Host '包内混进了不该收的文件：' -ForegroundColor Red
     foreach ($f in $forbidden) { Write-Host ('   ' + $f.FullName) -ForegroundColor Red }
+    exit 3
+}
+
+# CHANGELOG 记录了本包的 SHA256，而它自己若在包里就是自指 —— 包内那份永远
+# 落后一代，每次重打都对不上。这条断言防止有人「顺手」把它加回来。
+if (Test-Path -LiteralPath (Join-Path $pkgRoot 'CHANGELOG.md')) {
+    Write-Host 'CHANGELOG.md 不得进包：它记着本 zip 的哈希，进去就构成自指' -ForegroundColor Red
     exit 3
 }
 
