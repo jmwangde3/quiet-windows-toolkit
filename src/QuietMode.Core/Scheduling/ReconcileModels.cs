@@ -57,6 +57,7 @@ namespace QuietMode.Core.Scheduling
                 case "done": head += "  [完成]"; break;
                 case "failed": head += "  [失败] " + Error; break;
                 case "skipped": head += "  [跳过] " + Error; break;
+                case "unverified": head += "  [未验证] " + Error; break;
                 case "notrun": head += "  [未执行] " + Error; break;
                 default: head += "  [待执行]"; break;
             }

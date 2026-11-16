@@ -76,6 +76,26 @@ function Invoke-QmPowerCfgNative {
     return $r
 }
 
+function ConvertTo-QmPowerSchemeGuid {
+    <#
+    .SYNOPSIS
+        把任意来源的 GUID 字符串规范成小写无花括号的 D 格式；不合法返回空串。
+
+    .DESCRIPTION
+        v2.0.6 第一版只做了 Trim('{','}') —— 那只是剥两端字符，不是验证。
+        一个被污染的 ActivePowerScheme 值会被直接拼进注册表路径，读到别的键。
+        2.0.6 加固：所有 GUID 必须先过这里，不合法就当「没有证据」。
+    #>
+    [CmdletBinding()]
+    param([string]$Guid)
+
+    if ([string]::IsNullOrWhiteSpace($Guid)) { return '' }
+    $g = [guid]::Empty
+    $s = ([string]$Guid).Trim().Trim('{', '}').Trim()
+    if ([guid]::TryParse($s, [ref]$g)) { return $g.ToString('D').ToLowerInvariant() }
+    return ''
+}
+
 function Get-QmActivePowerSchemeFromRegistry {
     <#
     .SYNOPSIS
@@ -89,7 +109,7 @@ function Get-QmActivePowerSchemeFromRegistry {
         if ($k) {
             $v = [string]$k.GetValue('ActivePowerScheme')
             $k.Close()
-            return $v.Trim().Trim('{', '}').ToLowerInvariant()
+            return ConvertTo-QmPowerSchemeGuid -Guid $v
         }
     } catch { }
     return ''
@@ -106,7 +126,15 @@ function Get-QmActivePowerScheme {
         「写入期间还是这个」，宁可多花 1 秒。
 
     .OUTPUTS
-        [ordered]@{ guid; name; registryGuid; consistent; source; error }
+        [ordered]@{ guid; name; registryGuid; registryMatch; consistent; stable; source; error }
+
+    .NOTES
+        consistent / stable 的区别（2.0.6 加固）：
+          consistent   只有 ConfirmDelayMs > 0 时才有意义，表示两次探测 GUID 相同
+          stable       本次探测结果是否可以作为写入依据 —— 没做复探时默认 true，
+                       做了复探就必须两次一致
+        调用方要写电源设置时必须判 stable，不能只看 guid 非空。
+        第一版只判 guid 非空，于是「明确检测到方案正在被切走」依然会写。
     #>
     [CmdletBinding()]
     param(
@@ -114,15 +142,15 @@ function Get-QmActivePowerScheme {
     )
 
     $r = [ordered]@{
-        guid = ''; name = ''; registryGuid = ''; consistent = $false
-        source = ''; error = ''
+        guid = ''; name = ''; registryGuid = ''; registryMatch = $false
+        consistent = $false; stable = $false; source = ''; error = ''
     }
 
     $probe = Invoke-QmPowerCfgNative -Arguments (New-QmPowerCfgArgumentSet -Kind getactive)
     if ($probe.ok) {
         $m = [regex]::Match($probe.text, $script:GuidPattern)
         if ($m.Success) {
-            $r.guid = $m.Value.ToLowerInvariant()
+            $r.guid = ConvertTo-QmPowerSchemeGuid -Guid $m.Value
             $r.source = 'powercfg'
             $n = [regex]::Match($probe.text, '\(([^()]+)\)\s*$')
             if ($n.Success) { $r.name = $n.Groups[1].Value.Trim() }
@@ -134,6 +162,7 @@ function Get-QmActivePowerScheme {
     }
 
     $r.registryGuid = Get-QmActivePowerSchemeFromRegistry
+    $r.registryMatch = [bool]($r.guid -and $r.registryGuid -and ($r.guid -eq $r.registryGuid))
 
     if (-not $r.guid) { return $r }
 
@@ -143,12 +172,16 @@ function Get-QmActivePowerScheme {
         $g2 = ''
         if ($again.ok) {
             $mm = [regex]::Match($again.text, $script:GuidPattern)
-            if ($mm.Success) { $g2 = $mm.Value.ToLowerInvariant() }
+            if ($mm.Success) { $g2 = ConvertTo-QmPowerSchemeGuid -Guid $mm.Value }
         }
-        $r.consistent = ($g2 -eq $r.guid)
+        $r.consistent = [bool]($g2 -and ($g2 -eq $r.guid))
+        $r.stable = $r.consistent
         if (-not $r.consistent) {
-            $r.error = "活动方案在探测期间发生变化：$($r.guid) -> ${g2}"
+            $r.error = "活动方案在探测期间不稳定：$($r.guid) -> $g2"
         }
+    } else {
+        # 没做复探：结论只代表「读到了」，写入方必须自己承担「读到这里可能已经变了」的风险。
+        $r.stable = $true
     }
 
     return $r
@@ -216,19 +249,25 @@ function Get-QmDiskIdleSeconds {
     )
 
     $r = [ordered]@{
-        ac = -1; dc = -1; captured = $false; source = ''; error = ''
-        scheme = $SchemeGuid
+        ac = -1; dc = -1; captured = $false; acCaptured = $false; dcCaptured = $false
+        source = ''; error = ''; scheme = ''
     }
 
     if (-not $SchemeGuid) {
         $active = Get-QmActivePowerScheme
         $SchemeGuid = $active.guid
-        $r.scheme = $SchemeGuid
         if (-not $SchemeGuid) {
             $r.error = 'POWERCFG_NOT_READY：' + $active.error
             return $r
         }
+    } else {
+        $SchemeGuid = ConvertTo-QmPowerSchemeGuid -Guid $SchemeGuid
+        if (-not $SchemeGuid) {
+            $r.error = 'POWERCFG_NOT_READY：方案 GUID 非法'
+            return $r
+        }
     }
+    $r.scheme = $SchemeGuid
 
     # 路径一：powercfg /query（十六进制索引，与语言无关）
     $prev = $ErrorActionPreference
@@ -236,22 +275,31 @@ function Get-QmDiskIdleSeconds {
     try {
         $q = Invoke-QmPowerCfgNative -Arguments (New-QmPowerCfgArgumentSet -Kind query -SchemeGuid $SchemeGuid)
         if ($q.ok -and $q.text) {
-            $hex = @()
-            foreach ($m in [regex]::Matches($q.text, '0x([0-9a-fA-F]{1,8})')) {
-                $v = 0
-                if ([int]::TryParse($m.Groups[1].Value, [System.Globalization.NumberStyles]::HexNumber, $null, [ref]$v)) {
-                    $hex += $v
+            # 只有输出里确实出现目标设置 GUID，才能认定这一段是 DISKIDLE 单个设置的块。
+            # 若第三参数被某个 powercfg 版本忽略（退化成整个 SUB_DISK 子组），
+            # 「取最后两个 0x」会静默拿到别的设置的值 —— 那比读不到更糟。
+            if ($q.text -notmatch [regex]::Escape($script:DiskIdleSetting)) {
+                $r.error = 'query 输出里没有 DISKIDLE 设置块（setting 参数可能被忽略）'
+            } else {
+                $hex = @()
+                foreach ($m in [regex]::Matches($q.text, '0x([0-9a-fA-F]{1,8})')) {
+                    $v = 0
+                    if ([int]::TryParse($m.Groups[1].Value, [System.Globalization.NumberStyles]::HexNumber, $null, [ref]$v)) {
+                        $hex += $v
+                    }
                 }
+                # 输出顺序：最小 / 最大 / 增量 / 当前交流 / 当前直流
+                if ($hex.Count -ge 2) {
+                    $r.ac = $hex[$hex.Count - 2]
+                    $r.dc = $hex[$hex.Count - 1]
+                    $r.captured = $true
+                    $r.acCaptured = $true
+                    $r.dcCaptured = $true
+                    $r.source = 'powercfg'
+                    return $r
+                }
+                $r.error = 'query 输出里没有足够的 0x 数值'
             }
-            # 输出顺序：最小 / 最大 / 增量 / 当前交流 / 当前直流
-            if ($hex.Count -ge 2) {
-                $r.ac = $hex[$hex.Count - 2]
-                $r.dc = $hex[$hex.Count - 1]
-                $r.captured = $true
-                $r.source = 'powercfg'
-                return $r
-            }
-            $r.error = 'query 输出里没有足够的 0x 数值'
         } elseif (-not $q.ok) {
             $r.error = 'query 失败：' + $q.error
         }
@@ -266,10 +314,11 @@ function Get-QmDiskIdleSeconds {
         if ($k2) {
             $a = $k2.GetValue('ACSettingIndex')
             $d = $k2.GetValue('DCSettingIndex')
-            if ($null -ne $a) { $r.ac = [int]$a }
-            if ($null -ne $d) { $r.dc = [int]$d }
+            if ($null -ne $a) { $r.ac = [int]$a; $r.acCaptured = $true }
+            if ($null -ne $d) { $r.dc = [int]$d; $r.dcCaptured = $true }
             $k2.Close()
-            if ($r.ac -ge 0 -or $r.dc -ge 0) {
+            # 只读到一侧也算 captured —— 但调用方必须逐侧判，不能拿「整体 captured」代替「这个值可信」。
+            if ($r.acCaptured -or $r.dcCaptured) {
                 $r.captured = $true
                 $r.source = 'registry'
                 $r.error = ''
@@ -297,15 +346,23 @@ function Invoke-QmSpinDown {
                     attempts; exitAc; exitDc; exitActive; command; error }
 
     .NOTES
-        code 取值：
-          DISKIDLE_ALREADY_OK       原本就是目标值，未写入
-          POWERCFG_APPLIED          写入 + 激活 + 同 GUID 回读全部通过
-          POWERCFG_NOT_READY        活动方案取不到 / query 不通，未写入
-          POWERCFG_WRITE_FAILED     写入命令非零退出
-          POWERCFG_UNREADABLE       写入后回读不到（-1 只代表无证据）
-          POWERCFG_VERIFY_MISMATCH  写入成功但回读与目标不符
-          POWER_PLAN_CHANGED        写入过程中活动方案被外部切走
-          ELEVATION_REQUIRED        非管理员
+        code 取值（→ 后面的 status）：
+          DISKIDLE_ALREADY_OK       原本就是目标值，未写入            → Done
+          POWERCFG_APPLIED          写入 + 激活 + 同 GUID 回读通过      → Done
+          POWERCFG_NOT_READY        活动方案取不到 / query 不通，未写入  → Unknown
+          POWERCFG_WRITE_FAILED     写入命令非零退出                    → Failed
+          POWERCFG_UNREADABLE       写入后回读不到（-1 只代表无证据）   → Unknown
+          POWERCFG_VERIFY_MISMATCH  写入成功但回读与目标不符            → Failed
+          POWER_PLAN_CHANGED        活动方案被外部切走 / 探测期间不稳定  → Unknown
+          INVALID_SECONDS           入参非法                              → Failed
+          ELEVATION_REQUIRED        非管理员                              → Failed
+
+        2.0.6 加固点（外部审查后修）：
+          - 活动方案探测结果必须 stable 才允许写入，不再只看 guid 非空
+          - 读不到当前活动方案时禁止 setactive（原实现会短路继续，把旧方案抢回来）
+          - 激活后回读通过，还要再确认活动方案仍是目标方案，否则本轮不算成功
+          - AC 读不到（-1）与 AC 读到了但不等于目标，是两件事，前者是 Unknown
+          - changed 在第一次写成功时就置位，不再等到回读之后
     #>
     [CmdletBinding()]
     param(
@@ -318,7 +375,13 @@ function Invoke-QmSpinDown {
         previousAc = -1; previousDc = -1; changed = $false; scheme = ''; schemeName = ''
         attempts = 0; exitAc = -1; exitDc = -1; exitActive = -1; command = ''; error = ''
     }
-    if ($Seconds -lt 0) { $Seconds = 0; $out.seconds = 0 }
+    # 负数不能静默变 0：0 的语义是「永不停止」，把配置错误变成永不停止是最坏的结果。
+    if ($Seconds -lt 0) {
+        $out.status = 'Failed'
+        $out.code = 'INVALID_SECONDS'
+        $out.error = "DISKIDLE 秒数不能为负数：$Seconds"
+        return $out
+    }
 
     # QuietMode.Core 里的 Test-QmElevated 是唯一权威；单独 import 本模块时退回本地判定。
     $elevated = $false
@@ -334,11 +397,21 @@ function Invoke-QmSpinDown {
     }
 
     # 写入前先认准活动方案；2 秒复探一次，避免「读到 A、写到 B」。
+    # 注意判的是 stable 不是「guid 非空」：复探发现方案正在被切走时，guid 仍然非空，
+    # 但此时写入必然打偏 —— 这种「已经知道不稳定还照写」是比读不到更糟的失败。
     $active = Get-QmActivePowerScheme -ConfirmDelayMs 2000
     if (-not $active.guid) {
         $out.code = 'POWERCFG_NOT_READY'
         $out.status = 'Unknown'
         $out.error = '无法确定活动电源方案：' + $active.error
+        return $out
+    }
+    if (-not $active.stable) {
+        $out.code = 'POWER_PLAN_CHANGED'
+        $out.status = 'Unknown'
+        $out.scheme = $active.guid
+        $out.schemeName = $active.name
+        $out.error = '活动方案在探测期间不稳定，本轮不写入：' + $active.error
         return $out
     }
 
@@ -365,17 +438,19 @@ function Invoke-QmSpinDown {
     }
 
     $waits = @(2000, 5000)
+    # 上限从等待表推导，避免以后改等待次数忘了同步循环次数。
+    $maxAttempts = $waits.Count + 1
     $lastCode = 'POWERCFG_WRITE_FAILED'
     $lastError = ''
 
-    for ($attempt = 1; $attempt -le 3; $attempt++) {
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
         $out.attempts = $attempt
 
         # 每次重试都重新取 GUID：外部工具可能刚刚换过方案，旧 GUID 不能复用。
         $scheme = if ($attempt -eq 1) { $active.guid } else { (Get-QmActivePowerScheme).guid }
         if (-not $scheme) {
             $lastCode = 'POWERCFG_NOT_READY'
-            $lastError = '重试时无法确定活动电源方案'
+            $lastError = "第 $attempt 次尝试时无法确定活动电源方案"
             break
         }
         $out.scheme = $scheme
@@ -385,7 +460,7 @@ function Invoke-QmSpinDown {
         if (-not $probe.ok) {
             $lastCode = 'POWERCFG_NOT_READY'
             $lastError = 'POWERCFG_NOT_READY（' + $probe.command + '）：' + $probe.error
-            if ($attempt -le $waits.Count) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
             continue
         }
 
@@ -396,9 +471,11 @@ function Invoke-QmSpinDown {
         if (-not $acRun.ok) {
             $lastCode = 'POWERCFG_WRITE_FAILED'
             $lastError = "POWERCFG_WRITE_FAILED AC（$($acRun.command)）：$($acRun.error)"
-            if ($attempt -le $waits.Count) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
             continue
         }
+        # 第一次写成功就意味着系统状态已经被动过 —— 后续即便失败，也不能对外报「什么都没改」。
+        $out.changed = $true
 
         $dcArgs = New-QmPowerCfgArgumentSet -Kind setdc -SchemeGuid $scheme -Seconds $Seconds
         $dcRun = Invoke-QmPowerCfgNative -Arguments $dcArgs
@@ -406,16 +483,24 @@ function Invoke-QmSpinDown {
         if (-not $dcRun.ok) {
             $lastCode = 'POWERCFG_WRITE_FAILED'
             $lastError = "POWERCFG_WRITE_FAILED DC（$($dcRun.command)）：$($dcRun.error)"
-            if ($attempt -le $waits.Count) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
             continue
         }
 
-        # 写的是哪个方案，就激活哪个方案；如果它已经不是活动方案，别把旧方案抢回来。
-        $nowGuid = (Get-QmActivePowerScheme).guid
-        if ($nowGuid -and $nowGuid -ne $scheme) {
+        # 激活之前必须能读到当前活动方案。读不到就什么都不做。
+        # 原实现写成 `if ($nowGuid -and $nowGuid -ne $scheme)`：读不到时条件为假，
+        # 会径直 setactive 旧 GUID —— 等于在不知道当前方案的情况下把旧方案抢回来。
+        $now = Get-QmActivePowerScheme
+        if (-not $now.guid) {
+            $lastCode = 'POWERCFG_NOT_READY'
+            $lastError = '无法确认当前活动方案，拒绝激活（避免把旧方案抢回来）'
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            continue
+        }
+        if ($now.guid -ne $scheme) {
             $lastCode = 'POWER_PLAN_CHANGED'
-            $lastError = "POWER_PLAN_CHANGED：写入期间活动方案从 $scheme 变成 $nowGuid，按新方案重写"
-            if ($attempt -le $waits.Count) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            $lastError = "POWER_PLAN_CHANGED：写入期间活动方案从 $scheme 变成 $($now.guid)，按新方案重写"
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
             continue
         }
 
@@ -424,40 +509,69 @@ function Invoke-QmSpinDown {
         if (-not $actRun.ok) {
             $lastCode = 'POWERCFG_WRITE_FAILED'
             $lastError = "POWERCFG_WRITE_FAILED setactive（$($actRun.command)）：$($actRun.error)"
-            if ($attempt -le $waits.Count) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
             continue
         }
 
         $after = Get-QmDiskIdleSeconds -SchemeGuid $scheme
         $out.ac = $after.ac
         $out.dc = $after.dc
-        $out.changed = $true
 
         if (-not $after.captured) {
             $lastCode = 'POWERCFG_UNREADABLE'
             $lastError = 'POWERCFG_UNREADABLE：写入后回读不到 DISKIDLE（' + $after.error + '）'
-            if ($attempt -le $waits.Count) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
             continue
         }
 
-        $okAc = ($after.ac -eq $Seconds)
-        $okDc = ($after.dc -lt 0) -or ($after.dc -eq $Seconds)
-        if ($okAc -and $okDc) {
-            $out.status = 'Done'
-            $out.code = 'POWERCFG_APPLIED'
-            $out.error = ''
-            return $out
+        # 回读通过还不够：必须确认现在真的还在这个方案上。
+        # 否则「A 写好了 → A 被激活 → 立刻被切到 B → 程序读 A 发现是 1200」会被报成成功，
+        # 而用户实际跑的 B 根本没改过。
+        $final = Get-QmActivePowerScheme
+        if (-not $final.guid) {
+            $lastCode = 'POWERCFG_UNREADABLE'
+            $lastError = '回读后无法确认活动方案（' + $final.error + '）'
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            continue
+        }
+        if ($final.guid -ne $scheme) {
+            $lastCode = 'POWER_PLAN_CHANGED'
+            $lastError = "POWER_PLAN_CHANGED：验证期间活动方案从 $scheme 变为 $($final.guid)"
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            continue
         }
 
-        $lastCode = 'POWERCFG_VERIFY_MISMATCH'
-        $lastError = ("POWERCFG_VERIFY_MISMATCH：目标 {0}s，回读 AC={1}s DC={2}s（方案 $scheme）" -f $Seconds, $after.ac, $after.dc)
-        if ($attempt -le $waits.Count) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+        # 三件事必须分开，不能混成一个布尔：
+        #   读到了但不等于目标 → 真没写进去 / 被夹到范围外 → MISMATCH（Failed）
+        #   根本没读到（-1）   → 没有证据               → UNREADABLE（Unknown）
+        #   读到了且等于目标   → 通过
+        $knownMismatch = ($after.acCaptured -and ($after.ac -ne $Seconds)) -or
+                         ($after.dcCaptured -and ($after.dc -ne $Seconds))
+        if ($knownMismatch) {
+            $lastCode = 'POWERCFG_VERIFY_MISMATCH'
+            $lastError = ("POWERCFG_VERIFY_MISMATCH：目标 {0}s，回读 AC={1}s DC={2}s（方案 $scheme）" -f $Seconds, $after.ac, $after.dc)
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            continue
+        }
+        if (-not $after.acCaptured) {
+            # DC 读到了但 AC 没读到：写入可能成功也可能没成功，不能报 Done。
+            $lastCode = 'POWERCFG_UNREADABLE'
+            $lastError = ("POWERCFG_UNREADABLE：AC 索引读不到（DC={0}s），无法证明写入生效" -f $after.dc)
+            if ($attempt -lt $maxAttempts) { Start-Sleep -Milliseconds $waits[$attempt - 1] }
+            continue
+        }
+
+        $out.status = 'Done'
+        $out.code = 'POWERCFG_APPLIED'
+        $out.error = ''
+        return $out
     }
 
     $out.code = $lastCode
     $out.error = $lastError
-    if ($lastCode -eq 'POWERCFG_UNREADABLE' -or $lastCode -eq 'POWERCFG_NOT_READY') {
-        # 读不到 ≠ 写失败：这是「没有证据」，不许伪装成失败，也不许伪装成成功。
+    if ($lastCode -eq 'POWERCFG_UNREADABLE' -or $lastCode -eq 'POWERCFG_NOT_READY' -or $lastCode -eq 'POWER_PLAN_CHANGED') {
+        # 读不到 / 被别人切走 ≠ 功能坏了：这是「没有证据」或「外部干扰，下一轮再来」。
+        # 不许伪装成失败（托盘不该为此亮红叹号），也不许伪装成成功。
         $out.status = 'Unknown'
     }
     return $out

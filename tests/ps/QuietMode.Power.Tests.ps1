@@ -117,7 +117,15 @@ Describe 'Get-QmDiskIdleSeconds' {
             return
         }
 
-        $text = (& powercfg.exe /query SCHEME_CURRENT SUB_DISK DISKIDLE 2>$null | Out-String)
+        # 这里必须用模块自己的参数构造，而不是手写命令：
+        # 手写就等于绕过生产路径，测出来的东西不能证明线上调用是对的。
+        $qArgs = @(& $script:Mod {
+            param($g)
+            New-QmPowerCfgArgumentSet -Kind query -SchemeGuid $g
+        } $script:Active.guid)
+        $qArgs.Count | Should -BeGreaterOrEqual 3
+
+        $text = (& powercfg.exe @qArgs 2>$null | Out-String)
         $values = @()
         foreach ($m in [regex]::Matches($text, '0x([0-9a-fA-F]{1,8})')) {
             $values += [Convert]::ToInt32($m.Groups[1].Value, 16)
@@ -143,5 +151,96 @@ Describe 'Get-QmDiskIdleSeconds' {
         $again.ac | Should -Be $script:Reading.ac
         $again.dc | Should -Be $script:Reading.dc
         $again.captured | Should -Be $script:Reading.captured
+    }
+
+    It 'acCaptured / dcCaptured 逐侧标记，不能拿整体 captured 代替' {
+        foreach ($name in 'acCaptured', 'dcCaptured') {
+            $script:Reading.Keys | Should -Contain $name
+            $script:Reading[$name] | Should -BeOfType [bool]
+        }
+        # 一个值被标记为 captured，当且仅当它不是 -1 哨兵
+        $script:Reading.acCaptured | Should -Be ($script:Reading.ac -ge 0)
+        $script:Reading.dcCaptured | Should -Be ($script:Reading.dc -ge 0)
+    }
+}
+
+Describe 'GUID 规范化' {
+
+    It '接受小写 D 格式' {
+        $g = & $script:Mod { param($v) ConvertTo-QmPowerSchemeGuid -Guid $v } '381b4222-f694-41f0-9685-ff5bb260df2e'
+        $g | Should -Be '381b4222-f694-41f0-9685-ff5bb260df2e'
+    }
+
+    It '剥掉花括号并统一小写' {
+        $g = & $script:Mod { param($v) ConvertTo-QmPowerSchemeGuid -Guid $v } '{381B4222-F694-41F0-9685-FF5BB260DF2E}'
+        $g | Should -Be '381b4222-f694-41f0-9685-ff5bb260df2e'
+    }
+
+    It '容忍首尾空白' {
+        $g = & $script:Mod { param($v) ConvertTo-QmPowerSchemeGuid -Guid $v } '  381b4222-f694-41f0-9685-ff5bb260df2e  '
+        $g | Should -Be '381b4222-f694-41f0-9685-ff5bb260df2e'
+    }
+
+    It '非法输入返回空串（Trim 剥括号不是验证）' {
+        foreach ($bad in '', '   ', 'not-a-guid', '{381b4222}', '..\..\evil', '381b4222-f694-41f0-9685-ff5bb260df2e\..\x') {
+            $g = & $script:Mod { param($v) ConvertTo-QmPowerSchemeGuid -Guid $v } $bad
+            $g | Should -Be '' -Because "「$bad」不是合法 GUID，必须当成没有证据"
+        }
+    }
+}
+
+Describe 'Get-QmActivePowerScheme 的 stability 语义' {
+
+    It '返回 stable 字段' {
+        $script:Active.Keys | Should -Contain 'stable'
+        $script:Active.stable | Should -BeOfType [bool]
+    }
+
+    It '不做复探时 stable 默认为 true（只代表读到了）' {
+        $s = Get-QmActivePowerScheme
+        if (-not $s.guid) { Set-ItResult -Skipped -Because '取不到活动方案'; return }
+        $s.stable | Should -BeTrue
+    }
+
+    It '复探一致时 stable 为 true' {
+        $s = Get-QmActivePowerScheme -ConfirmDelayMs 300
+        if (-not $s.guid) { Set-ItResult -Skipped -Because '取不到活动方案'; return }
+        $s.consistent | Should -BeTrue
+        $s.stable | Should -BeTrue
+    }
+
+    It 'registryMatch 是真实比较结果，不是采而不判' {
+        $script:Active.Keys | Should -Contain 'registryMatch'
+        if ($script:Active.guid -and $script:Active.registryGuid) {
+            $script:Active.registryMatch | Should -Be ($script:Active.guid -eq $script:Active.registryGuid)
+        }
+    }
+}
+
+Describe 'Invoke-QmSpinDown 的入参校验' {
+
+    It '负数秒数直接拒绝，不静默变成 0（0 = 永不停止，语义更危险）' {
+        $r = Invoke-QmSpinDown -Seconds -1
+        $r.status | Should -Be 'Failed'
+        $r.code | Should -Be 'INVALID_SECONDS'
+        $r.error | Should -Match '不能为负数'
+    }
+
+    It '拒绝发生在提权判定之前，所以普通权限也能得到明确错误' {
+        $r = Invoke-QmSpinDown -Seconds -1200
+        $r.code | Should -Not -Be 'ELEVATION_REQUIRED'
+    }
+
+    It '非管理员调用合法秒数时返回 ELEVATION_REQUIRED 且不写系统' {
+        if ([bool]((New-Object Security.Principal.WindowsPrincipal(
+                [Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+                [Security.Principal.WindowsBuiltInRole]::Administrator))) {
+            Set-ItResult -Skipped -Because '当前会话已提权，无法验证拒绝路径'
+            return
+        }
+        $r = Invoke-QmSpinDown -Seconds 1200
+        $r.status | Should -Be 'Failed'
+        $r.code | Should -Be 'ELEVATION_REQUIRED'
+        $r.changed | Should -BeFalse
     }
 }
