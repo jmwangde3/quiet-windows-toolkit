@@ -118,7 +118,7 @@ function Get-QmActivePowerScheme {
         source = ''; error = ''
     }
 
-    $probe = Invoke-QmPowerCfgNative -Arguments @('/getactivescheme')
+    $probe = Invoke-QmPowerCfgNative -Arguments (New-QmPowerCfgArgumentSet -Kind getactive)
     if ($probe.ok) {
         $m = [regex]::Match($probe.text, $script:GuidPattern)
         if ($m.Success) {
@@ -139,7 +139,7 @@ function Get-QmActivePowerScheme {
 
     if ($ConfirmDelayMs -gt 0) {
         Start-Sleep -Milliseconds $ConfirmDelayMs
-        $again = Invoke-QmPowerCfgNative -Arguments @('/getactivescheme')
+        $again = Invoke-QmPowerCfgNative -Arguments (New-QmPowerCfgArgumentSet -Kind getactive)
         $g2 = ''
         if ($again.ok) {
             $mm = [regex]::Match($again.text, $script:GuidPattern)
@@ -234,7 +234,7 @@ function Get-QmDiskIdleSeconds {
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $q = Invoke-QmPowerCfgNative -Arguments @('/query', $SchemeGuid, $script:DiskSubGroup, $script:DiskIdleSetting)
+        $q = Invoke-QmPowerCfgNative -Arguments (New-QmPowerCfgArgumentSet -Kind query -SchemeGuid $SchemeGuid)
         if ($q.ok -and $q.text) {
             $hex = @()
             foreach ($m in [regex]::Matches($q.text, '0x([0-9a-fA-F]{1,8})')) {
@@ -333,8 +333,6 @@ function Invoke-QmSpinDown {
         return $out
     }
 
-    $sec = [string]$Seconds
-
     # 写入前先认准活动方案；2 秒复探一次，避免「读到 A、写到 B」。
     $active = Get-QmActivePowerScheme -ConfirmDelayMs 2000
     if (-not $active.guid) {
@@ -383,7 +381,7 @@ function Invoke-QmSpinDown {
         $out.scheme = $scheme
 
         # 就绪判据：这个方案必须能被 /query 读通，否则不写。
-        $probe = Invoke-QmPowerCfgNative -Arguments @('/query', $scheme, $script:DiskSubGroup, $script:DiskIdleSetting)
+        $probe = Invoke-QmPowerCfgNative -Arguments (New-QmPowerCfgArgumentSet -Kind query -SchemeGuid $scheme)
         if (-not $probe.ok) {
             $lastCode = 'POWERCFG_NOT_READY'
             $lastError = 'POWERCFG_NOT_READY（' + $probe.command + '）：' + $probe.error
@@ -391,7 +389,7 @@ function Invoke-QmSpinDown {
             continue
         }
 
-        $acArgs = @('/setacvalueindex', $scheme, $script:DiskSubGroup, $script:DiskIdleSetting, $sec)
+        $acArgs = New-QmPowerCfgArgumentSet -Kind setac -SchemeGuid $scheme -Seconds $Seconds
         $acRun = Invoke-QmPowerCfgNative -Arguments $acArgs
         $out.command = $acRun.command
         $out.exitAc = $acRun.exit
@@ -402,7 +400,7 @@ function Invoke-QmSpinDown {
             continue
         }
 
-        $dcArgs = @('/setdcvalueindex', $scheme, $script:DiskSubGroup, $script:DiskIdleSetting, $sec)
+        $dcArgs = New-QmPowerCfgArgumentSet -Kind setdc -SchemeGuid $scheme -Seconds $Seconds
         $dcRun = Invoke-QmPowerCfgNative -Arguments $dcArgs
         $out.exitDc = $dcRun.exit
         if (-not $dcRun.ok) {
@@ -421,7 +419,7 @@ function Invoke-QmSpinDown {
             continue
         }
 
-        $actRun = Invoke-QmPowerCfgNative -Arguments @('/setactive', $scheme)
+        $actRun = Invoke-QmPowerCfgNative -Arguments (New-QmPowerCfgArgumentSet -Kind setactive -SchemeGuid $scheme)
         $out.exitActive = $actRun.exit
         if (-not $actRun.ok) {
             $lastCode = 'POWERCFG_WRITE_FAILED'
