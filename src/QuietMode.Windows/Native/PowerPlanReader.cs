@@ -88,12 +88,20 @@ namespace QuietMode.Windows.Native
 
                     object a = key.GetValue("ACSettingIndex");
                     object d = key.GetValue("DCSettingIndex");
-                    if (a == null && d == null)
+
+                    // AC 必须读到，只读到 DC 不算「读到了」。
+                    // 反例（2.0.6 稳定化修）：只判「两侧都缺」才失败，于是 AC 缺失时本方法仍返回 true，
+                    // Capture() 置 Captured=true 而 AcSeconds 留 -1，SpinDownObservation.Matches 把
+                    // 「没有证据」误判成「有偏差」，Verifier 走 Problem 并触发自动修复 ——
+                    // 与 PS 侧已修的「读不到 ≠ 写失败」原则相反。缺 AC 一律回落到 powercfg。
+                    if (a == null)
                     {
-                        error = "AC/DCSettingIndex 均不存在";
+                        error = "ACSettingIndex 不存在";
                         return false;
                     }
-                    if (a != null) acSeconds = Convert.ToInt32(a);
+                    acSeconds = Convert.ToInt32(a);
+                    // DC 只在存在时才采信：台式机可能没有电池分支，此时 dcSeconds 保持 -1，
+                    // Matches 会跳过 DC 比对（DcSeconds >= 0 才参与）。
                     if (d != null) dcSeconds = Convert.ToInt32(d);
                     return true;
                 }
@@ -120,9 +128,26 @@ namespace QuietMode.Windows.Native
 
                 using (Process p = Process.Start(psi))
                 {
-                    string output = p.StandardOutput.ReadToEnd();
-                    string err = p.StandardError.ReadToEnd();
-                    p.WaitForExit(10000);
+                    // 两个流必须同时排空。顺序 ReadToEnd() 会在子进程不关流时无限阻塞，
+                    // 后面的 WaitForExit(10000) 根本没机会执行 —— 10 秒超时形同虚设，
+                    // reconcile 线程会被一个卡住的 powercfg 永久占住。
+                    System.Threading.Tasks.Task<string> outputTask = p.StandardOutput.ReadToEndAsync();
+                    System.Threading.Tasks.Task<string> errorTask = p.StandardError.ReadToEndAsync();
+
+                    if (!p.WaitForExit(10000))
+                    {
+                        try
+                        {
+                            p.Kill();
+                            p.WaitForExit(1000);
+                        }
+                        catch { }
+                        error = "powercfg 执行超时（10 秒），已终止";
+                        return false;
+                    }
+
+                    string output = outputTask.Result;
+                    string err = errorTask.Result;
 
                     if (p.ExitCode != 0)
                     {

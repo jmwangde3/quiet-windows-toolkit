@@ -79,12 +79,44 @@ PowerShell 不会把含空格的字符串拆成多个原生命令参数，powerc
 
 | 项 | 结果 |
 | --- | --- |
-| C# 编译 | 0 错误 |
+| C# 编译 | 0 警告 0 错误 |
 | C# 单测 | 123 / 123 |
-| Pester 5.1（含新增 8 条参数构造回归） | 204 总数，200 通过，4 跳过，0 失败 |
+| Pester 5.1（含新增 12 条回归） | 216 总数，212 通过，4 跳过，0 失败 |
 | 真机写入 | 注入 `AC=0 / DC=1200` 后一次写成：`Done / POWERCFG_APPLIED / attempts=1`，回读 `1200/1200` |
 
 新增测试钉住的三条不变量：每个参数不得含空白、不得出现 `SCHEME_CURRENT`、`setac` 必须是 5 个参数。
+
+### 7. 稳定化收口（第二轮外部审查，`bfb996f` 之后）
+
+第二轮审查（针对 `bfb996f`）判 NO-GO，三个 P0 全在 **C# 侧** —— 也就是 PS 写入器修好之后，
+围着它的读写两条旁路还留着同类毛病：
+
+| # | 位置 | 缺陷 | 后果 |
+| --- | --- | --- | --- |
+| P0-1 | `PowerPlanReader.TryReadFromRegistry` | 只判「AC/DC 都不存在」才失败，只读到 DC 也返回 true | `Captured=true` 而 `AcSeconds=-1` → `Matches=false` → `v.Problem()` 把它当**可修复偏差**并触发自动修复。PS 侧已修的「读不到 ≠ 有偏差」在 C# 侧没落实 |
+| P0-2 | `PowerPlanReader.TryReadFromPowerCfg` | 顺序 `ReadToEnd()` 在 `WaitForExit(10000)` 之前 | 子进程不关流时第一个 `ReadToEnd()` 就无限阻塞，10 秒超时形同虚设，reconcile 线程被永久占住 |
+| P0-3 | `SpinDownController.Apply` | `if (minutes < 0) minutes = 0`，且 `minutes * 60 > MaxSeconds` 先乘后比 | 负数被静默当成「永不停止」并报成功；极大正数整数溢出让上限检查失效。上一轮只修了 PS 侧，这里是**改了一半** |
+
+修法（均单文件、未改动既有接口）：
+
+- P0-1：AC 必须存在才返回 true，缺 AC 一律回落 `powercfg`；DC 仍允许缺失（台式机无电池分支时 `-1` 由 `Matches` 跳过）。
+- P0-2：两个流同时 `ReadToEndAsync()`，先 `WaitForExit(10000)`；超时就 `Kill()` 并返回失败，不再访问 `ExitCode`。
+- P0-3：负数直接返回 `INVALID_MINUTES`（与 PS 的 `INVALID_SECONDS` 同语义），上限改用 `minutes > MaxSeconds / 60` 比较；`ToText()` 对 `INVALID_MINUTES` 单独输出，不再显示成「演练：目标 0 秒」。
+
+顺带把产品版本元数据推到 2.0.6：`ProductInfo.Version` + 四个 csproj 的 `FileVersion` / `ProductVersion` /
+`InformationalVersion`（`AssemblyVersion` 仍为 `2.0.0.0`，程序集标识不跟产品版本走）。
+
+审查同时确认了两件「本来担心但其实没问题」的事：`2>&1` 合流后 `[string]$ErrorRecord` 不带 GUID，
+不会污染 `/getactivescheme` 的解析；`0` 秒与「未读到」（`-1`）在所有读路径上都能区分。
+
+### 8. 明确没做的事（记在 2.0.7）
+
+- 整体 verdict 的四级化：`unverified` 只是 worker 步骤状态，**不参与** `ReconcileVerifier` 的 verdict 计算。
+  最终 Ok/Failed 仍由系统观测决定 —— 不要以为已经四级化。
+- 受管方案列表（把 DISKIDLE 同时写进 Balanced 与 Bitsum），根治与 Process Lasso 的方案竞争。
+- `PowerReadACValueIndex` P/Invoke 读值，替代解析本地化文本。
+- 复探「第二次探测失败」与「第二次读到不同 GUID」共用 `POWER_PLAN_CHANGED`（同为 `Unknown`，不写入）。
+- 重试切换方案时 `schemeName` / `previousAc` / `previousDc` 不跟着更新，日志可能 B 的 GUID 配 A 的原值。
 
 ## 2.0.5 — 2026-11-15
 

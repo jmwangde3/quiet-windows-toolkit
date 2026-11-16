@@ -40,6 +40,10 @@ namespace QuietMode.Windows
 
         public string ToText()
         {
+            // 入参非法时既不是「演练」也不是「未生效」，先单独说清楚，
+            // 否则会显示成「演练：目标 0 秒」这种自相矛盾的输出。
+            if (string.Equals(ErrorCode, "INVALID_MINUTES", StringComparison.OrdinalIgnoreCase))
+                return "DISKIDLE 未改动：" + Error;
             if (!Apply)
             {
                 return "演练（未写入）：目标 DISKIDLE = " + RequestedSeconds + " 秒\n  "
@@ -73,8 +77,19 @@ namespace QuietMode.Windows
         {
             SpinDownResult r = new SpinDownResult();
             r.Apply = apply;
-            if (minutes < 0) minutes = 0;
-            if (minutes * 60 > MaxSeconds) minutes = MaxSeconds / 60;
+
+            // 负数不能静默变 0：0 的语义是「永不停止」，把错误输入变成永不停止是最坏的结果。
+            // 这条在 2.0.6 里先修了 PS 侧（INVALID_SECONDS），C# 写入入口没跟上 —— 同一个公共 API
+            // 里两种语义，等于「用 qmctl spin set -5 会得到成功」。两处必须一致。
+            if (minutes < 0)
+            {
+                r.ErrorCode = "INVALID_MINUTES";
+                r.Error = "DISKIDLE 分钟数不能为负数：" + minutes;
+                return r;
+            }
+
+            // 用除法比较上限：先 minutes * 60 再比大小，极大正数会整数溢出让上限检查失效。
+            if (minutes > MaxSeconds / 60) minutes = MaxSeconds / 60;
             r.RequestedSeconds = minutes * 60;
             r.Elevated = StatusProbe.IsElevated();
 
