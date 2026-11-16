@@ -175,8 +175,13 @@ try {
                 }
                 $sec = [int]$sd.seconds
                 $r = Invoke-QmSpinDown -Seconds $sec
-                $detail = "目标 ${sec}s 回读 AC=$($r.ac)s DC=$($r.dc)s"
-                if ($r.status -ne 'Done') { $status = 'failed'; $err = [string]$r.error }
+                # 方案 GUID 与写入前原值必须进日志：活动方案被外部工具切换时，
+                # 只有这两个字段能解释「为什么刚才还对、现在就错」。
+                $detail = "目标 ${sec}s 回读 AC=$($r.ac)s DC=$($r.dc)s 原值 AC=$($r.previousAc)s DC=$($r.previousDc)s 方案=$($r.scheme) 尝试=$($r.attempts)"
+                if ($r.status -ne 'Done') {
+                    $status = 'failed'
+                    $err = if ($r.code) { "[$($r.code)] $($r.error)" } else { [string]$r.error }
+                }
             }
             'fan' {
                 $fan = $req.fan

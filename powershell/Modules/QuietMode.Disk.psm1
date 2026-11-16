@@ -345,11 +345,16 @@ function Get-QmDiskOccupancy {
                 $cmd = [string]$p.CommandLine
                 $hit = ''
                 foreach ($l in $letters) {
-                    if ($exe -and $exe.ToUpperInvariant().Contains($l)) { $hit = '可执行文件在该盘'; break }
+                    # 盘符必须带冒号并且落在路径起始处：只匹配单个字母会把 D、E 这种
+                    # 出现在任意单词里的字符也算命中（v2.0.5 的 busySummary 因此误报过）。
+                    if ($exe -and $exe.StartsWith($l + ':', [System.StringComparison]::OrdinalIgnoreCase)) {
+                        $hit = '可执行文件在该盘'; break
+                    }
                 }
                 if ($hit -eq '') {
                     foreach ($l in $letters) {
-                        if ($cmd -and $cmd.ToUpperInvariant().Contains($l)) { $hit = '命令行参数指向该盘'; break }
+                        $pattern = '(?i)(^|[\s"'',;=])' + [regex]::Escape($l) + ':'
+                        if ($cmd -and [regex]::IsMatch($cmd, $pattern)) { $hit = '命令行参数指向该盘'; break }
                     }
                 }
                 if ($hit -eq '') { continue }

@@ -16,14 +16,23 @@ $tests = Join-Path $root 'tests\ps'
 
 Write-Host "PowerShell $($PSVersionTable.PSVersion) / $([System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription)"
 
-$pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.7.0' } | Select-Object -First 1
+$required = [version]'5.7.0'
+$pinned = [version]'5.7.1'
+$installed = @(Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge $required })
+# 「钉版本」必须真的钉住：托管 runner 的镜像自带 5.9.0，只按 >= 取第一个会悄悄用镜像版，
+# 把 release.yml 里装的 5.7.1 架空。这里优先取 5.7.1，没有才退到已装的最高版本。
+$pester = $installed | Where-Object { $_.Version -eq $pinned } | Select-Object -First 1
+if (-not $pester) { $pester = $installed | Sort-Object Version -Descending | Select-Object -First 1 }
 if (-not $pester) {
-    Write-Host 'Pester 5.7+ 未安装，尝试安装...' -ForegroundColor Yellow
+    Write-Host "Pester $required+ 未安装，尝试安装..." -ForegroundColor Yellow
     Set-PSRepository PSGallery -InstallationPolicy Trusted -ErrorAction SilentlyContinue
-    Install-Module Pester -MinimumVersion 5.7.0 -Force -SkipPublisherCheck -Scope CurrentUser
-    $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.7.0' } | Select-Object -First 1
+    Install-Module Pester -RequiredVersion $pinned -Force -SkipPublisherCheck -Scope CurrentUser
+    Import-Module Pester -RequiredVersion $pinned -Force
+    $pester = Get-Module -ListAvailable Pester | Where-Object { $_.Version -eq $pinned } | Select-Object -First 1
+} else {
+    Import-Module Pester -RequiredVersion $pester.Version -Force
 }
-Import-Module Pester -MinimumVersion 5.7.0 -Force
+if (-not $pester) { Write-Host 'ERROR 找不到可用的 Pester' -ForegroundColor Red; exit 3 }
 Write-Host "Pester $($pester.Version)"
 
 $cfg = New-PesterConfiguration

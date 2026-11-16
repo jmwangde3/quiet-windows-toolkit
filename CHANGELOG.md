@@ -1,5 +1,91 @@
 # 变更记录
 
+## 2.0.6 — 未发布（2026-11-16）
+
+主题：**DISKIDLE 写入路径的参数传递缺陷**。这一版修的是一个 100% 复现、却被误读成「偶发」的故障：
+只要当前 AC 不是目标值，`spindown` 步骤就永远失败；只有别人恰好把值留成目标值时它才「通过」。
+
+### 1. 根因：`& powercfg.exe $a` 把五段参数发成了一整条
+
+v2.0.5 及以前：
+
+```powershell
+$cmds = @(
+    "/setacvalueindex SCHEME_CURRENT SUB_DISK DISKIDLE $sec",
+    "/setdcvalueindex SCHEME_CURRENT SUB_DISK DISKIDLE $sec",
+    "/setactive SCHEME_CURRENT"
+)
+foreach ($a in $cmds) {
+    $null = & powercfg.exe $a 2>$null
+    if ($LASTEXITCODE -ne 0) { ... }
+}
+```
+
+PowerShell 不会把含空格的字符串拆成多个原生命令参数，powercfg 收到一整条 `argv[1]`，
+一律「参数无效」+ 退出码 1；`2>$null` 又把唯一证据吞掉，日志里只剩一行「退出码 1」。
+
+实测对照（只读 `/query`）：
+
+| 写法 | 退出码 | 输出 |
+| --- | --- | --- |
+| `& powercfg.exe '/query SCHEME_CURRENT SUB_DISK DISKIDLE'` | 1 | 参数无效 -- 键入「/?」得到帮助 |
+| `$a=@('/query','SCHEME_CURRENT','SUB_DISK','DISKIDLE'); & powercfg.exe @a` | 0 | 正常列出 5 个 0x 值 |
+
+### 2. 为什么看起来像「12 分钟 / 46 分钟后自愈」
+
+不是时间效应。Process Lasso 自带日志（`C:\ProgramData\ProcessLasso\logs\processlasso.log`，ActionId 28）
+记录了 11 条「当前电源计划已更改」：`pbz.exe` → Bitsum Highest Performance，`processgovernor.exe` → 平衡
+（配置 `GamingChangePowerPlan=true`）。活动方案切到哪个，决定那一次 reconcile 读到的 AC 是否恰好等于目标值。
+
+`reconcile.log` 的 `why=` 行给的是真实读数（C# 独立复观测）：`期望 1200s，实际 AC=0s DC=1200s`。
+而 worker 步骤 detail 里的 `AC=-1 DC=-1` 是 `Invoke-QmSpinDown` 初始化后**没走到回读就 return** 的哨兵值 ——
+不是「两条读路径都失败」。这两处数字不矛盾，它们是不同阶段的产物。
+
+### 3. 写入改成「真实 GUID + 同 GUID 回读 + 分类错误码」
+
+`powershell/Modules/QuietMode.Power.psm1` 重写写入路径：
+
+- 参数一律走 `New-QmPowerCfgArgumentSet` 产出的 `string[]`，`& $exe @Arguments`；stderr 用 `2>&1` 合流。
+- 目标方案取真实 GUID：`/getactivescheme`，并与 HKLM `ActivePowerScheme` 交叉；写入前 2 秒复探，不一致不写。
+- 写前就绪判据：`/query <guid> SUB_DISK DISKIDLE` 必须 exit 0。
+- 写 AC / DC 后重新读活动方案；**变了就不 `setactive` 旧方案**，按新方案重写（`POWER_PLAN_CHANGED`）。
+- 回读固定读刚写的那个 GUID，而不是「当前方案」。
+- 三次重试，间隔 2 s / 5 s，每次重取 GUID。
+- 新增导出 `Get-QmActivePowerScheme`（`-ConfirmDelayMs`）。
+
+错误码：`POWERCFG_APPLIED` / `DISKIDLE_ALREADY_OK` / `POWERCFG_NOT_READY` / `POWERCFG_WRITE_FAILED` /
+`POWERCFG_UNREADABLE` / `POWERCFG_VERIFY_MISMATCH` / `POWER_PLAN_CHANGED` / `ELEVATION_REQUIRED`。
+
+`status` 三态：`Done` / `Failed` / `Unknown` —— 读不到是「没有证据」，既不伪装成功，也不伪装失败。
+
+### 4. 步骤日志能自己解释失败
+
+`spindown` 的 detail 现在带方案 GUID、写入前原值与尝试次数：
+
+```
+目标 1200s 回读 AC=1200s DC=1200s 原值 AC=0s DC=1200s 方案=381b4222-... 尝试=1
+```
+
+失败时 `err` 前缀错误码，例如 `[POWERCFG_WRITE_FAILED] ...：退出码 1：参数无效 ...`。
+
+### 5. 顺带清掉两条 2.0.6 待办
+
+- `QuietMode.Disk.psm1` 的占用进程盘符匹配：单字母 `Contains('D')` 改为 `StartsWith('D:')` 与
+  `(?i)(^|[\s"',;=])D:` 词边界匹配，`busySummary` 不再把含该字母的任意单词算作占用。
+- `build/run-pester.ps1`：原来 `Where-Object Version -ge 5.7.0 | Select-Object -First 1` 在托管 runner 上
+  会选中镜像自带的 5.9.0，把 `release.yml` 装的 5.7.1 架空。改为优先 5.7.1，并 `Import-Module -RequiredVersion`。
+
+### 6. 验证
+
+| 项 | 结果 |
+| --- | --- |
+| C# 编译 | 0 错误 |
+| C# 单测 | 123 / 123 |
+| Pester 5.1（含新增 8 条参数构造回归） | 204 总数，200 通过，4 跳过，0 失败 |
+| 真机写入 | 注入 `AC=0 / DC=1200` 后一次写成：`Done / POWERCFG_APPLIED / attempts=1`，回读 `1200/1200` |
+
+新增测试钉住的三条不变量：每个参数不得含空白、不得出现 `SCHEME_CURRENT`、`setac` 必须是 5 个参数。
+
 ## 2.0.5 — 2026-11-15
 
 主题：**安装器跨版本兼容性与发布工程加固。核心行为零改动** —— 夜间静音、维护任务禁用、
