@@ -11,7 +11,7 @@ Windows 本机「深夜静音」工具集：23:58 起把风扇切到静音曲线
 
 | | v2（当前正式版） | v1（历史兼容，冻结） |
 |---|---|---|
-| 版本 | **2.0.5** | 不再演进 |
+| 版本 | **2.0.6** | 不再演进 |
 | 入口 | `qmctl.exe` | 仓库根 `quiet-hdd-*.ps1` |
 | 安装器 | `powershell\Install-QuietMode.ps1` | 各脚本自己注册任务 |
 | 调度 | 单一任务 `\QuietMode\QuietMode-Reconcile` | `\QuietHDD\` 两个闸门任务 |
@@ -98,7 +98,7 @@ dotnet build QuietMode.sln -c Release      # qmctl + Core + Windows + 托盘 + �
 QuietMode\build\build.cmd                  # 单独产出托盘 QuietMode\QuietMode.exe
 ```
 
-用发布包的话（`build\pack-release.ps1` 产出的 `QuietMode-v2.0.5-win-x64.zip`）解压后目录结构
+用发布包的话（`build\pack-release.ps1` 产出的 `QuietMode-v2.0.6-win-x64.zip`）解压后目录结构
 已经满足 `qmctl` 的 `RepoLocator`（从自身目录向上找 `powershell\Modules`），不用再编译。
 
 检查产物在不在：
