@@ -36,6 +36,11 @@ namespace QuietMode.Core.Models
         /// 把窗口标识持久化下来，才能做到「本夜不再进入、下一夜照常」。
         /// </summary>
         public string AutoSilentSuppressedWindow = "";
+        /// <summary>夜间手动关闭之后，仍需在白天边界执行一次完整恢复。</summary>
+        public bool PendingMorningRestore;
+        /// <summary>Identifies the current quiet activation so desktop actions run once per activation.</summary>
+        public string EverythingQuietCycle = "";
+        public string EverythingQuietSinceUtc = "";
         /// <summary>最近一次 reconcile 的结论：Ok | Degraded | Failed | NotRun。</summary>
         public string LastVerdict = "";
         /// <summary>最近一次验证的偏差分类：Compliant | ActionableDrift | UnfixableDrift | ObservationUnknown | SafetyBlocked。</summary>
@@ -67,6 +72,9 @@ namespace QuietMode.Core.Models
             o.Set("autoSilentActive", AutoSilentActive);
             o.Set("autoSilentSuppressed", AutoSilentSuppressed);
             o.Set("autoSilentSuppressedWindow", AutoSilentSuppressedWindow ?? "");
+            o.Set("pendingMorningRestore", PendingMorningRestore);
+            o.Set("everythingQuietCycle", EverythingQuietCycle ?? "");
+            o.Set("everythingQuietSinceUtc", EverythingQuietSinceUtc ?? "");
             o.Set("lastVerdict", LastVerdict ?? "");
             o.Set("lastDrift", LastDrift ?? "");
             JsonArray problems;
@@ -97,6 +105,9 @@ namespace QuietMode.Core.Models
             s.AutoSilentActive = o.GetBool("autoSilentActive", false);
             s.AutoSilentSuppressed = o.GetBool("autoSilentSuppressed", false);
             s.AutoSilentSuppressedWindow = o.GetString("autoSilentSuppressedWindow", "");
+            s.PendingMorningRestore = o.GetBool("pendingMorningRestore", false);
+            s.EverythingQuietCycle = o.GetString("everythingQuietCycle", "");
+            s.EverythingQuietSinceUtc = o.GetString("everythingQuietSinceUtc", "");
             s.LastVerdict = o.GetString("lastVerdict", "");
             s.LastDrift = o.GetString("lastDrift", "");
             s.LastProblems.Clear();

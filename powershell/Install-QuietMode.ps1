@@ -408,6 +408,14 @@ if ($Mode -eq 'Rollback') {
         } catch { Write-Bad ("删除任务失败：" + $_.Exception.Message) }
     }
 
+    Write-Step '恢复原 Everything 任务'
+    if ($rbApply) {
+        try {
+            Import-Module (Join-Path $PSScriptRoot 'Modules\QuietMode.Everything.psm1') -Force
+            Write-Note (Set-QmEverythingWindowTask -Root $Root -DeployDir $DeployDir -Restore)
+        } catch { Write-Bad ("Everything 任务回滚失败：" + $_.Exception.Message) }
+    } else { Write-Note '若已迁移，停用 Everything 新任务并恢复原 Start / Stop' }
+
     Write-Step '恢复 v1 闸门'
     foreach ($full in $script:LegacyTasks) {
         $s = Get-TaskState -FullName $full
@@ -529,12 +537,14 @@ Show-Artifact -Path (Join-Path $trayBin 'QuietMode.exe') -Label '托盘 QuietMod
 $moduleNames = @(
     'QuietMode.Common.psm1', 'QuietMode.Config.psm1', 'QuietMode.Disk.psm1',
     'QuietMode.Fan.psm1', 'QuietMode.Maintenance.psm1', 'QuietMode.Power.psm1',
-    'QuietMode.Security.psm1', 'QuietMode.TaskState.psm1'
+    'QuietMode.Security.psm1', 'QuietMode.TaskState.psm1', 'QuietMode.Everything.psm1'
 )
 foreach ($m in $moduleNames) {
     Show-Artifact -Path (Join-Path $repoRoot ('powershell\Modules\' + $m)) -Label $m -Required
 }
 Show-Artifact -Path (Join-Path $repoRoot 'powershell\Worker\Invoke-QuietModeWorker.ps1') -Label 'Worker' -Required
+# Everything 窗口闸门由 QuietMode.exe --everything-window 承担（WinExe，不创建控制台），
+# 不再需要 powershell Worker；QuietMode.exe 的存在性由上方的托盘检查覆盖。
 foreach ($s in @('Disks\Invoke-DiskOperation.ps1', 'Maintenance\Invoke-MaintenanceOperation.ps1')) {
     Show-Artifact -Path (Join-Path $repoRoot ('powershell\' + $s)) -Label $s
 }
@@ -785,8 +795,9 @@ $planLines.Add('5. 授予 Users 读取任务文件的权限（托盘免提权）
 if ($KeepLegacy) { $planLines.Add('6. v1 闸门：按 -KeepLegacy 保留（两套调度会互相覆盖）') }
 elseif ($v1Active.Count -gt 0) { $planLines.Add('6. 停用 v1 闸门：' + ($v1Active -join ', ')) }
 else { $planLines.Add('6. 停用 v1 闸门：没有需要停用的') }
-$planLines.Add('7. 清掉手动静音与今晚抑制标记（state auto），随后立即对齐一次')
-$planLines.Add('8. 启动托盘')
+$planLines.Add('7. 迁移已启用的 Everything Start / Stop 任务')
+$planLines.Add('8. 清掉手动静音与今晚抑制标记（state auto），随后立即对齐一次')
+$planLines.Add('9. 启动托盘')
 
 foreach ($line in $planLines) { Write-Note $line }
 Write-Note '不变量：任何时刻只允许一套调度器控制磁盘；v2 注册失败就不动 v1，v1 停不掉就回滚 v2。'
@@ -838,8 +849,11 @@ if (-not (Test-Path -LiteralPath $psSrc)) {
     Write-Note ("将复制 " + $psSrc + " → " + $psDst)
 } else {
     try {
-        if (Test-Path -LiteralPath $psDst) { Remove-Item -LiteralPath $psDst -Recurse -Force }
-        Copy-Item -LiteralPath $psSrc -Destination $psDst -Recurse -Force
+        foreach ($file in (Get-ChildItem -LiteralPath $psSrc -Recurse -File)) {
+            $target = Join-Path $psDst $file.FullName.Substring($psSrc.Length + 1)
+            [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target))
+            Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+        }
         $n = @(Get-ChildItem -LiteralPath $psDst -Recurse -File).Count
         if (Test-Path -LiteralPath (Join-Path $psDst 'Worker\Invoke-QuietModeWorker.ps1')) {
             Write-Ok ("脚本树已部署（" + $n + " 个文件），Worker 可达")
@@ -1217,6 +1231,15 @@ if ($apply -and -not $KeepLegacy -and $legacyStillOn.Count -gt 0) {
     if ($script:LogPath) { Write-Log ("日志：" + $script:LogPath) 'Yellow' }
     exit 7
 }
+
+# ================================================================ Everything 跟随当前窗口
+Write-Step '迁移 Everything 夜间让路任务'
+if ($apply) {
+    try {
+        Import-Module (Join-Path $PSScriptRoot 'Modules\QuietMode.Everything.psm1') -Force
+        Write-Note (Set-QmEverythingWindowTask -Root $Root -DeployDir $DeployDir)
+    } catch { Write-Bad ("Everything 任务迁移失败：" + $_.Exception.Message) }
+} else { Write-Note '若有启用的原 Start / Stop 任务，将切换为交互用户会话中的窗口检查' }
 
 # ================================================================ 8 交回自动
 Write-Step '交回自动调度'

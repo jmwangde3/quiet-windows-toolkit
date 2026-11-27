@@ -152,6 +152,10 @@ if ($KeepTask) {
 # ================================================================ 2 确认已停
 Write-Step '确认调度已停止'
 if (-not $KeepTask -and $apply) {
+    try {
+        Import-Module (Join-Path $PSScriptRoot 'Modules\QuietMode.Everything.psm1') -Force
+        Write-Note (Set-QmEverythingWindowTask -Root $Root -Restore)
+    } catch { Write-Bad ("Everything 任务恢复失败：" + $_.Exception.Message) }
     $after = Invoke-QmJson @('task', 'status')
     if ($null -eq $after.Data) {
         Write-Warn2 '无法回读任务状态，继续恢复（磁盘安全优先于流程完整性）'

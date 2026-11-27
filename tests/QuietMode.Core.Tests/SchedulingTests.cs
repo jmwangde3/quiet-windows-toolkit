@@ -114,10 +114,19 @@ namespace QuietMode.Core.Tests
                 Eq("none", DecideAt(st, sc, new DateTime(2026, 11, 12, 6, 0, 0)).Action);
                 Eq("none", DecideAt(st, sc, new DateTime(2026, 11, 12, 10, 1, 0)).Action);
 
-                // 10:02 之后是白天，正常
-                Decision day = DecideAt(st, sc, new DateTime(2026, 11, 12, 10, 2, 0));
-                Eq(ControllerState.DayActive, day.State);
-                Eq("none", day.Action);
+                // 重新读取已保存状态，模拟夜里手动关闭后次日由计划任务接手。
+                st = QuietModeState.FromJson(st.ToJson());
+                DateTime morning = new DateTime(2026, 11, 12, 10, 2, 0);
+                StateMachine.NormalizeSuppression(st, sc, morning);
+                Eq(false, st.AutoSilentSuppressed);
+                Eq(ControllerState.EnteringDay, DecideAt(st, sc, morning).State);
+                Eq("day", DecideAt(st, sc, morning).Action);
+                StateMachine.ApplyRun(st, "day", "Failed", "", morning.ToUniversalTime(), false, "schedule", scheduledDay: true);
+                Eq(true, st.PendingMorningRestore);
+                Eq("day", DecideAt(st, sc, morning.AddMinutes(1)).Action);
+                StateMachine.ApplyRun(st, "day", "Ok", "", morning.ToUniversalTime(), false, "schedule", scheduledDay: true);
+                Eq(false, st.PendingMorningRestore);
+                Eq("none", DecideAt(st, sc, morning.AddMinutes(2)).Action);
 
                 // 次日 23:58：窗口换了，抑制自动失效，自动静音恢复
                 DateTime nextNight = new DateTime(2026, 11, 12, 23, 58, 0);
@@ -126,6 +135,24 @@ namespace QuietMode.Core.Tests
                 Decision next = DecideAt(st, sc, nextNight);
                 Eq(ControllerState.EnteringNight, next.State);
                 Eq("night", next.Action);
+            });
+
+            Run("状态机：白天手动关闭只跳过下一夜，开机补偿不消耗定时恢复", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+                QuietModeState st = new QuietModeState();
+                DateTime beforeNight = new DateTime(2026, 11, 11, 14, 0, 0);
+                StateMachine.Suppress(st, sc, beforeNight);
+                Eq(false, st.PendingMorningRestore);
+                Eq("none", DecideAt(st, sc, new DateTime(2026, 11, 12, 10, 2, 0)).Action);
+
+                DateTime boot = new DateTime(2026, 11, 12, 9, 30, 0);
+                StateMachine.Suppress(st, sc, boot.AddHours(-2));
+                WindowEvaluation w = ScheduleWindow.Evaluate(sc, boot, TimeSpan.FromMinutes(5));
+                Eq(true, w.StartupOverrideApplied);
+                Eq(false, StateMachine.IsScheduledDay(w));
+                Eq("none", StateMachine.Decide(new DecisionInput { State = st, Schedule = sc, Window = w, Now = boot }).Action);
+                Eq(true, st.PendingMorningRestore);
             });
 
             Run("状态机：夜间重启后抑制保持，手动静音可以覆盖", delegate
@@ -146,6 +173,33 @@ namespace QuietMode.Core.Tests
                 Decision d = DecideAt(st, sc, new DateTime(2026, 11, 12, 3, 40, 0));
                 Eq(ControllerState.ManualQuiet, d.State);
                 Eq("night", d.Action);
+            });
+
+            Run("Everything：同一次静音保留标记，手动关闭后重新开启生成新标记", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+                QuietModeState st = new QuietModeState();
+                DateTime night = new DateTime(2026, 11, 12, 1, 0, 0);
+                Decision on = DecideAt(st, sc, night);
+                Eq(true, StateMachine.UpdateEverythingQuietCycle(st, on.Action, on));
+                string first = st.EverythingQuietCycle;
+                True(first.Length > 0, "应在夜间 Worker 启动前通知 Everything");
+
+                st = QuietModeState.FromJson(st.ToJson());
+                Eq(first, st.EverythingQuietCycle);
+                Eq(false, StateMachine.UpdateEverythingQuietCycle(st, "night", on));
+                Eq(false, StateMachine.UpdateEverythingQuietCycle(st, "none", new Decision { State = ControllerState.SchedulePaused }));
+                Eq(first, st.EverythingQuietCycle);
+
+                StateMachine.Suppress(st, sc, night.AddMinutes(1));
+                Eq("", st.EverythingQuietCycle);
+                Eq(true, st.PendingMorningRestore);
+
+                StateMachine.ClearSuppression(st);
+                Eq(true, StateMachine.UpdateEverythingQuietCycle(st, "night", on));
+                True(first != st.EverythingQuietCycle, "重新进入静音应生成新标记");
+                Eq(true, StateMachine.UpdateEverythingQuietCycle(st, "day", on));
+                Eq("", st.EverythingQuietCycle);
             });
 
             Run("状态机：手动静音已生效时不再每十分钟重跑整条夜间链", delegate
@@ -559,6 +613,16 @@ namespace QuietMode.Core.Tests
                 Eq(1, doc.SelectNodes("//t:Triggers/t:LogonTrigger", ns).Count);
                 Eq(2, doc.SelectNodes("//t:Triggers/t:EventTrigger", ns).Count);
                 Eq("PT2M", doc.SelectSingleNode("//t:Triggers/t:BootTrigger/t:Delay", ns).InnerText);
+            });
+
+            Run("任务 XML：单数字小时按本地 ISO 时间写入", delegate
+            {
+                ScheduleSettings s = DefaultSchedule();
+                s.NightStart = "1:30";
+                s.DayStart = "9:02";
+                string xml = TaskXml.Build(s, "x.exe", "a", "", "", "", new DateTime(2026, 11, 27));
+                True(xml.Contains("<StartBoundary>2026-11-27T01:30:00</StartBoundary>"), "夜间起点");
+                True(xml.Contains("<StartBoundary>2026-11-27T09:02:00</StartBoundary>"), "白天起点");
             });
 
             Run("漂移分类：只有可修复偏差才允许自动重跑", delegate

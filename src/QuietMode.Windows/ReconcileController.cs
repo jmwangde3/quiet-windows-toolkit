@@ -218,6 +218,7 @@ namespace QuietMode.Windows
             ReconcileRun run = Plan(paths, cfg, baseline, state, action, trigger, apply, timeoutMs);
             if (!string.IsNullOrEmpty(run.Error)) return run;
             if (cfg == null) return run;
+            if (apply) PublishEverythingQuietCycle(paths, state, run);
 
             if (!apply || run.Action == "none" || run.Action == "verify")
             {
@@ -244,6 +245,7 @@ namespace QuietMode.Windows
                                       + repair + " 强制重跑");
                 forced.Decision = forced.Decision ?? run.Decision;
                 run = forced;
+                PublishEverythingQuietCycle(paths, state, run);
             }
 
             string repo = RepoLocator.FindForExecutingAssembly();
@@ -295,6 +297,20 @@ namespace QuietMode.Windows
             PersistState(paths, run, state);
             run.EndUtc = NowIso();
             return run;
+        }
+
+        private static void PublishEverythingQuietCycle(QuietModePaths paths, QuietModeState state, ReconcileRun run)
+        {
+            string previous = state == null ? "" : state.EverythingQuietCycle;
+            string previousSince = state == null ? "" : state.EverythingQuietSinceUtc;
+            if (!StateMachine.UpdateEverythingQuietCycle(state, run.Action, run.Decision)) return;
+            try { new StateStore(paths).Save(state); }
+            catch (Exception ex)
+            {
+                state.EverythingQuietCycle = previous;
+                state.EverythingQuietSinceUtc = previousSince;
+                run.Plan.Notes.Add("无法提前通知 Everything 切换：" + ex.Message);
+            }
         }
 
         /// <summary>只回读当前状态，不改任何东西。verify 用。</summary>
@@ -430,7 +446,8 @@ namespace QuietMode.Windows
                     : new List<string>(run.Verification.Problems.Count > 20
                         ? run.Verification.Problems.GetRange(0, 20)
                         : run.Verification.Problems);
-                StateMachine.ApplyRun(state, run.Action, verdict, run.Error, DateTime.UtcNow, nightOk, run.Trigger);
+                StateMachine.ApplyRun(state, run.Action, verdict, run.Error, DateTime.UtcNow, nightOk, run.Trigger,
+                                      StateMachine.IsScheduledDay(run.Window));
                 // 写「跑完之后停在哪」，不是「跑之前打算进哪」：照抄决策值会让 state.json
                 // 整夜停在 EnteringNight、整个白天停在 EnteringDay，与实机相位差一格。
                 if (run.Decision != null)

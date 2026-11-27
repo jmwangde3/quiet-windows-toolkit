@@ -14,6 +14,8 @@ namespace QuietMode
     ///
     /// --diag   写一份自检（只读，不改系统）
     /// --status 把 qmctl status 的原始 JSON 写到 diag 目录，便于外部排查
+    /// --everything-window  计划任务每分钟调用一次：按 state.json 收敛 Everything 进程。
+    ///                      必须是 WinExe 直接跑（不经过 powershell.exe），否则会创建控制台。
     /// </summary>
     internal static class Program
     {
@@ -23,6 +25,18 @@ namespace QuietMode
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             AppPaths.EnsureDataDir();
+
+            // 每分钟一次的短命调用最先分派：它不该写日志（会把 QuietMode.log 刷爆），
+            // 也不该注册 UI 异常处理器。
+            string first = args.Length > 0 ? args[0].ToLowerInvariant() : "";
+            if (first == "--everything-window")
+            {
+                // 必须在单实例 Mutex 之前返回：落下 Mutex 会弹「已经在运行」的框，
+                // 等于每分钟一个弹窗。
+                Environment.ExitCode = EverythingWindowGate.Run(args);
+                return;
+            }
+
             TrayLog.Write("Main entered" + (args.Length > 0 ? " arg=" + args[0] : " (no args)"));
 
             Application.ThreadException += delegate(object s, ThreadExceptionEventArgs e)
@@ -40,7 +54,6 @@ namespace QuietMode
                 TrayLog.Write("UnhandledException: " + (e.ExceptionObject == null ? "null" : e.ExceptionObject.ToString()));
             };
 
-            string first = args.Length > 0 ? args[0].ToLowerInvariant() : "";
             if (first == "--diag")
             {
                 Diagnostics.Run();

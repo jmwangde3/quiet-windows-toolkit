@@ -56,6 +56,8 @@ namespace QuietMode.Core.Scheduling
             string day = string.IsNullOrWhiteSpace(s.DayStart) ? "10:02" : s.DayStart.Trim();
             if (TimeText.ToMinutes(night) < 0) night = "23:58";
             if (TimeText.ToMinutes(day) < 0) day = "10:02";
+            night = TimeOfDay.Format(TimeOfDay.Parse(night));
+            day = TimeOfDay.Format(TimeOfDay.Parse(day));
 
             // 夜间重复必须覆盖整个窗口：23:58 → 10:02 是 10 小时 4 分。
             // 早先写死 PT10H，最后 4 分钟没人管；窗口一改更是全错。

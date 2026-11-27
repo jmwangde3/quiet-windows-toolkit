@@ -1,5 +1,13 @@
 # 变更记录
 
+## 2.0.7 — 2026-11-28
+
+- **修复每分钟闪窗**：窗口检查原先由计划任务拉起 `powershell.exe` 执行，控制台程序在「默认终端 = Windows Terminal」的机器上每次都新建可见窗口，`-WindowStyle Hidden` 拦不住（窗口先创建、后隐藏）。现改为 `QuietMode.exe --everything-window`（WinExe，PE 子系统为 GUI，不创建控制台），判定逻辑等价移植为 `QuietMode/App/EverythingWindowGate.cs`。原 `powershell/Worker/Invoke-EverythingWindow.ps1` 不再被任何地方引用。
+- 夜里手动关闭静音会抑制本夜重新开启。早晨仍在 `dayStart` 执行一次完整恢复，失败会在后续调度中重试。
+- 已安装的 Everything 夜间让路任务通过 Apply 迁移为登录用户会话中的状态检查。静音开启和关闭各执行一次，同一次静音里手动打开 Everything 后会保持运行。
+- 生成 QuietMode 计划任务时，`1:30` 这类单数字小时会规范为 `01:30`。
+- Apply 部署脚本树改为逐文件覆盖，不再整目录删除重建（避免持有句柄时整树复制失败）。
+
 ## 2.0.6 — 2026-11-16
 
 主题：**DISKIDLE 写入路径的参数传递缺陷**。这一版修的是一个 100% 复现、却被误读成「偶发」的故障：

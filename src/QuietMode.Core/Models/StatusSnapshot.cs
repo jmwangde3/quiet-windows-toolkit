@@ -127,6 +127,7 @@ namespace QuietMode.Core.Models
             st.Set("lastNightRunUtc", s.LastNightRunUtc ?? "");
             st.Set("lastDayRunUtc", s.LastDayRunUtc ?? "");
             st.Set("autoOffDayStamp", s.AutoOffDayStamp ?? "");
+            st.Set("pendingMorningRestore", s.PendingMorningRestore);
             st.Set("recoveryActive", s.Recovery != null && s.Recovery.Active);
             if (s.Recovery != null && s.Recovery.Active) st.Set("recoveryReason", s.Recovery.Reason ?? "");
 

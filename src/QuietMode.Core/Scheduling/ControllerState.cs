@@ -265,7 +265,8 @@ namespace QuietMode.Core.Scheduling
                 }
                 return d;
             }
-            if (w.IsNight && IsSuppressed(st, sc, input.Now))
+            bool scheduledNight = ScheduleWindow.InWindow(w.NowMinutes, w.NightStartMinutes, w.DayStartMinutes);
+            if ((w.IsNight || scheduledNight) && IsSuppressed(st, sc, input.Now))
             {
                 // 「今晚不再自动开启」只对按下按钮的那一夜有效。
                 // 恢复到白天状态成功之后仍然保持 ManualNormal，绝不能顺手把标记清掉 ——
@@ -330,6 +331,13 @@ namespace QuietMode.Core.Scheduling
             }
 
             // 5. 白天。
+            if (st.PendingMorningRestore && IsScheduledDay(w))
+            {
+                d.State = ControllerState.EnteringDay;
+                d.Action = "day";
+                d.Reason = "夜间手动关闭后，在白天起点执行完整恢复";
+                return d;
+            }
             if (st.AutoSilentActive)
             {
                 d.State = ControllerState.EnteringDay;
@@ -398,8 +406,38 @@ namespace QuietMode.Core.Scheduling
         {
             if (st == null) return;
             st.ModeOn = false;
+            st.ModeOnSinceUtc = "";
             st.AutoSilentSuppressed = true;
+            st.EverythingQuietCycle = "";
+            st.EverythingQuietSinceUtc = "";
             st.AutoSilentSuppressedWindow = NightWindow.Key(s, now);
+            if (ScheduleWindow.Evaluate(s, now, null).IsNight)
+                st.PendingMorningRestore = true;
+        }
+
+        public static bool IsScheduledDay(WindowEvaluation w)
+        {
+            return w != null && w.DayStartMinutes >= 0 && w.NightStartMinutes >= 0
+                   && w.DayStartMinutes != w.NightStartMinutes
+                   && !ScheduleWindow.InWindow(w.NowMinutes, w.NightStartMinutes, w.DayStartMinutes);
+        }
+
+        /// <summary>Publish the intended mode before the worker tries to offline disks.</summary>
+        public static bool UpdateEverythingQuietCycle(QuietModeState st, string action, Decision decision)
+        {
+            if (st == null || action == "verify") return false;
+            bool quiet;
+            if (action == "night") quiet = true;
+            else if (action == "day" || action == "restore") quiet = false;
+            else if (decision != null && decision.State != ControllerState.SchedulePaused
+                     && decision.State != ControllerState.Error) quiet = decision.TargetNight;
+            else return false;
+
+            bool cycleActive = !string.IsNullOrEmpty(st.EverythingQuietCycle);
+            if (quiet == cycleActive) return false;
+            st.EverythingQuietCycle = quiet ? Guid.NewGuid().ToString("N") : "";
+            st.EverythingQuietSinceUtc = quiet ? DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture) : "";
+            return true;
         }
 
         /// <summary>用户要求手动静音 / 交回自动调度：抑制立即作废。</summary>
@@ -417,7 +455,8 @@ namespace QuietMode.Core.Scheduling
         ///          —— 只用来记「开机补跑确实发生过」，不参与任何决策。
         /// </summary>
         public static void ApplyRun(QuietModeState st, string action, string verdict, string errorCode,
-                                    DateTime utcNow, bool nightSucceeded, string trigger = null)
+                                    DateTime utcNow, bool nightSucceeded, string trigger = null,
+                                    bool scheduledDay = false)
         {
             if (st == null) return;
             string stamp = utcNow.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture);
@@ -454,6 +493,7 @@ namespace QuietMode.Core.Scheduling
                 {
                     st.AutoSilentActive = false;
                     st.LastDayRunUtc = stamp;
+                    if (scheduledDay) st.PendingMorningRestore = false;
                     // 刻意不清 AutoSilentSuppressed：白天恢复成功只说明「已经回到白天」，
                     // 不代表用户改主意想今晚再静音一次。清理由窗口切换负责。
                     if (st.Recovery != null) st.Recovery.Active = false;
