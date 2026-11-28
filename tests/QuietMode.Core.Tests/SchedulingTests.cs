@@ -232,6 +232,92 @@ namespace QuietMode.Core.Tests
                 Eq("night", first.Action);
             });
 
+            Run("同次开机：01:54 退出、02:10 重开、09:02 恢复并清除 Everything 批次", delegate
+            {
+                ScheduleSettings sc = new ScheduleSettings { NightStart = "1:30", DayStart = "9:02" };
+                DateTime date = new DateTime(2026, 11, 28);
+                QuietModeState st = new QuietModeState { AutoSilentActive = true };
+                DateTime off = date.AddHours(1).AddMinutes(54);
+                StateMachine.Suppress(st, sc, off);
+                Eq("day", DecideAt(st, sc, off).Action);
+                StateMachine.ApplyRun(st, "day", "Ok", "", off.ToUniversalTime(), false);
+                DateTime on = date.AddHours(2).AddMinutes(10);
+                st.ModeOn = true;
+                st.ModeOnSinceUtc = on.ToUniversalTime().ToString("o");
+                StateMachine.ClearSuppression(st);
+                StateMachine.UpdateEverythingQuietCycle(st, "night", DecideAt(st, sc, on));
+                StateMachine.ApplyRun(st, "night", "Ok", "", on.ToUniversalTime(), true);
+                st = QuietModeState.FromJson(st.ToJson());
+                DateTime morning = date.AddHours(9).AddMinutes(2);
+                Eq(ControllerState.ManualQuiet, DecideAt(st, sc, morning.AddSeconds(-1)).State);
+                Decision exit = DecideAt(st, sc, morning);
+                Eq("day", exit.Action);
+                Eq(false, exit.TargetNight);
+                Eq(false, st.ModeOn);
+                Eq(true, StateMachine.UpdateEverythingQuietCycle(st, exit.Action, exit));
+                Eq("", st.EverythingQuietCycle);
+                StateMachine.ApplyRun(st, "day", "Failed", "", morning.ToUniversalTime(), false, "schedule", true);
+                Eq("day", DecideAt(st, sc, morning.AddMinutes(30)).Action);
+                StateMachine.ApplyRun(st, "day", "Ok", "", morning.ToUniversalTime(), false, "schedule", true);
+                Eq("none", DecideAt(st, sc, morning.AddMinutes(31)).Action);
+                Eq("night", DecideAt(st, sc, date.AddDays(1).AddHours(2)).Action);
+            });
+
+            Run("跨午夜：错过晨间触发也补恢复，只收回白天起点以前的覆盖", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+                DateTime morning = new DateTime(2026, 11, 28, 10, 2, 0);
+                QuietModeState st = new QuietModeState { ModeOn = true, ModeOnSinceUtc = morning.AddHours(-11).ToUniversalTime().ToString("o") };
+                st.SchedulePaused = true;
+                Eq(ControllerState.ManualQuiet, DecideAt(st, sc, morning).State);
+                st.SchedulePaused = false;
+                sc.Enabled = false;
+                Eq(ControllerState.ManualQuiet, DecideAt(st, sc, morning).State);
+                sc.Enabled = true;
+                Eq("day", DecideAt(st, sc, morning.AddHours(1)).Action);
+                Eq(true, st.PendingMorningRestore); // 即便夜间只部分生效，仍须完整恢复
+                st.ModeOn = true;
+                st.ModeOnSinceUtc = morning.ToUniversalTime().ToString("o");
+                Eq(ControllerState.ManualQuiet, DecideAt(st, sc, morning.AddHours(1)).State);
+                Eq("day", DecideAt(st, sc, morning.AddDays(1)).Action);
+            });
+
+            Run("白天手动退出静音，今晚仍按时自动开启", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+                DateTime now = new DateTime(2026, 11, 28, 12, 0, 0);
+                QuietModeState st = new QuietModeState { ModeOn = true, AutoSilentActive = true };
+                StateMachine.Suppress(st, sc, now);
+                Eq(false, st.AutoSilentSuppressed);
+                Eq("day", DecideAt(st, sc, now).Action);
+                StateMachine.ApplyRun(st, "day", "Ok", "", now.ToUniversalTime(), false, "manual", true);
+                Eq("night", DecideAt(st, sc, now.Date.AddHours(23).AddMinutes(58)).Action);
+            });
+
+            Run("部分进入静音后手动恢复失败，本夜也会重试白天恢复", delegate
+            {
+                ScheduleSettings sc = DefaultSchedule();
+                DateTime night = new DateTime(2026, 11, 28, 2, 0, 0);
+                QuietModeState st = new QuietModeState { ModeOn = true, AutoSilentActive = false };
+                StateMachine.Suppress(st, sc, night);
+                StateMachine.ApplyRun(st, "day", "Failed", "恢复未完成", night.ToUniversalTime(), false, "manual");
+                Eq("day", DecideAt(st, sc, night.AddMinutes(10)).Action);
+                StateMachine.ApplyRun(st, "day", "Ok", "", night.AddMinutes(10).ToUniversalTime(), false, "schedule");
+                Eq("none", DecideAt(st, sc, night.AddMinutes(20)).Action);
+                Eq(true, st.PendingMorningRestore);
+            });
+
+            Run("白天降级显示白天相位并保留维护警告", delegate
+            {
+                ReconcileVerification v = new ReconcileVerification { Action = "day" };
+                v.Warning("maintenance", true, "SysMain", "服务未运行");
+                v.Settle();
+                Eq("DayDegraded", v.VerdictText);
+                Eq("服务未运行", v.Diagnostics()[0]);
+                v.Action = "night";
+                Eq("NightDegraded", v.VerdictText);
+            });
+
             Run("状态机：上次开机前的手动静音不在白天开机时恢复", delegate
             {
                 // 2026-11-14 实况：00:49 手动静音 → 01:09 关机 → 12:35 开机。

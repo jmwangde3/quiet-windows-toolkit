@@ -1,5 +1,15 @@
 # 变更记录
 
+## 2.0.9 — 2026-11-28
+
+- 进入静音且有目标盘时，先触发登录会话中的 Everything 退出任务。夜间 Worker 等待客户端退出，并在每块盘脱机前复查。退出失败或超时会推迟脱机。
+- 同一次静音期间手动重开 Everything 会保留进程。若还有盘未脱机，待客户端退出后由后续调度重试。
+
+## 2.0.8 — 2026-11-28
+
+- 手动开启或重新开启静音后，下一个白天起点会收回覆盖并恢复白天。错过起点后，白天首次调度会补做恢复。
+- 托盘手动退出立即执行白天恢复。若本次计划要求启动 SysMain，会在其他设备恢复后再确认一次。部分恢复时，托盘和日志显示具体原因。
+
 ## 2.0.7 — 2026-11-28
 
 - **修复每分钟闪窗**：窗口检查原先由计划任务拉起 `powershell.exe` 执行，控制台程序在「默认终端 = Windows Terminal」的机器上每次都新建可见窗口，`-WindowStyle Hidden` 拦不住（窗口先创建、后隐藏）。现改为 `QuietMode.exe --everything-window`（WinExe，PE 子系统为 GUI，不创建控制台），判定逻辑等价移植为 `QuietMode/App/EverythingWindowGate.cs`。原 `powershell/Worker/Invoke-EverythingWindow.ps1` 不再被任何地方引用。

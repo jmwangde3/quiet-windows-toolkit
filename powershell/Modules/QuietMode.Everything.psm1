@@ -129,4 +129,43 @@ function Set-QmEverythingWindowTask {
     return 'Everything now follows QuietMode state in the interactive session.'
 }
 
-Export-ModuleMember -Function Get-QmEverythingTaskXml, Set-QmEverythingWindowTask
+function Get-QmEverythingClients {
+    # SYSTEM sees clients across user sessions. The Everything service in session 0 stays running.
+    [Diagnostics.Process]::GetProcessesByName('Everything') | Where-Object { $_.SessionId -ne 0 }
+}
+
+function Confirm-QmEverythingForOffline {
+    [CmdletBinding()]
+    param([string]$Root, [string]$Cycle, [switch]$RequestExit, [int]$TimeoutSeconds = 35)
+
+    $ErrorActionPreference = 'Stop'
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $requested = $false
+    do {
+        $state = [IO.File]::ReadAllText((Join-Path $Root 'state.json')) | ConvertFrom-Json
+        if ($Cycle -notmatch '^[0-9a-f]{32}$' -or $state.everythingQuietCycle -cne $Cycle) {
+            throw '静音状态已改变，取消本次脱机。'
+        }
+        $clients = @(Get-QmEverythingClients)
+        if ($clients.Count -eq 0) { return }
+        if (-not $RequestExit) { throw 'Everything 正在运行，保留磁盘在线。' }
+
+        $since = [datetimeoffset]$state.everythingQuietSinceUtc
+        foreach ($client in $clients) {
+            if ($client.StartTime.ToUniversalTime() -gt $since.UtcDateTime) {
+                throw '本次静音后重新打开了 Everything，保留进程及在线磁盘。'
+            }
+        }
+        if (-not $requested) {
+            # Run the installed WinExe in its registered interactive user session.
+            Start-ScheduledTask -TaskPath '\Everything NightIndex\' -TaskName 'QuietMode-Window' -ErrorAction Stop
+            $requested = $true
+        }
+        if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            throw '等待 Everything 退出超时，保留磁盘在线。'
+        }
+        Start-Sleep -Milliseconds 250
+    } while ($true)
+}
+
+Export-ModuleMember -Function Get-QmEverythingTaskXml, Set-QmEverythingWindowTask, Confirm-QmEverythingForOffline

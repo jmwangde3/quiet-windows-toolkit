@@ -487,7 +487,8 @@ function Invoke-QmDiskState {
         [Parameter(Mandatory = $true)] $Disk,
         [Parameter(Mandatory = $true)][bool]$Offline,
         [switch]$Apply,
-        [switch]$Force
+        [switch]$Force,
+        [scriptblock]$BeforeOffline
     )
 
     $requested = if ($Offline) { 'offline' } else { 'online' }
@@ -551,6 +552,14 @@ function Invoke-QmDiskState {
         return $result
     }
 
+    if ($Offline -and $BeforeOffline) {
+        try { & $BeforeOffline }
+        catch {
+            $result.errorCode = 'OFFLINE_DEFERRED'
+            $result.errorMessage = $_.Exception.Message
+            return $result
+        }
+    }
     $failCode = 'SET_FAILED'
     try {
         Set-Disk -InputObject $fresh -IsOffline $Offline -ErrorAction Stop
@@ -608,7 +617,8 @@ function Invoke-QmDiskOperation {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()] $Targets,
         [switch]$Apply,
         [switch]$Force,
-        [string]$LogFile = ''
+        [string]$LogFile = '',
+        [scriptblock]$BeforeOffline
     )
 
     $disks = @(Get-QmDiskInventory)
@@ -651,7 +661,7 @@ function Invoke-QmDiskOperation {
                 steps = @($match.reason); warnings = @($match.notes)
             }
         } else {
-            $r = Invoke-QmDiskState -Disk $match.disk -Offline ($Operation -eq 'offline') -Apply:$Apply -Force:$Force
+            $r = Invoke-QmDiskState -Disk $match.disk -Offline ($Operation -eq 'offline') -Apply:$Apply -Force:$Force -BeforeOffline $BeforeOffline
             $r.warnings = @($match.notes) + @($r.warnings)
         }
         $results += $r

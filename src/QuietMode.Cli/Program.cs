@@ -1405,7 +1405,9 @@ namespace QuietMode.Cli
                 return 2;
             }
 
-            ReconcileRun run = ReconcileController.Run(paths, cfg, baseline, state, "auto", "manual", true, 300000);
+            // 手动退出也要恢复一次未完全生效的静音，保留恢复事务的优先级。
+            string action = i == "manual-normal" && !(state.Recovery != null && state.Recovery.Active) ? "day" : "auto";
+            ReconcileRun run = ReconcileController.Run(paths, cfg, baseline, state, action, "manual", true, 300000);
 
             if (_json)
             {

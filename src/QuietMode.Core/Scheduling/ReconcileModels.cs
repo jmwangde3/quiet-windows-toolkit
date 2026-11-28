@@ -317,6 +317,13 @@ namespace QuietMode.Core.Scheduling
             Classification = DriftClassifier.Classify(Items);
         }
 
+        public List<string> Diagnostics()
+        {
+            List<string> messages = new List<string>(Problems);
+            messages.AddRange(Warnings);
+            return messages;
+        }
+
         public int FixableCount
         {
             get
@@ -334,7 +341,7 @@ namespace QuietMode.Core.Scheduling
                 switch (Verdict)
                 {
                     case ReconcileVerdict.Ok: return Action == "night" ? "NightActive" : "DayActive";
-                    case ReconcileVerdict.Degraded: return "NightDegraded";
+                    case ReconcileVerdict.Degraded: return Action == "night" || Action == "verify-night" ? "NightDegraded" : "DayDegraded";
                     case ReconcileVerdict.Failed: return "Failed";
                     default: return "Unknown";
                 }

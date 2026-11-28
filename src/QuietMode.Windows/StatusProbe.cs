@@ -32,11 +32,15 @@ namespace QuietMode.Windows
             catch { s.ConfigExists = false; }
 
             s.State = new StateStore(paths).Load();
-            s.Window = ScheduleWindow.Evaluate(cfg.Schedule, DateTime.Now, SystemClock.Uptime());
+            DateTime now = DateTime.Now;
+            TimeSpan? uptime = SystemClock.Uptime();
+            s.Window = ScheduleWindow.Evaluate(cfg.Schedule, now, uptime);
 
             DecisionInput input = new DecisionInput();
             input.Schedule = cfg.Schedule;
-            input.State = s.State;
+            input.Now = now;
+            input.Uptime = uptime;
+            input.State = QuietModeState.FromJson(s.State.ToJson());
             input.Window = s.Window;
             input.Trigger = "status";
             input.LastRunFailed = StateMachine.IsLastRunFailed(s.State);

@@ -104,7 +104,8 @@ namespace QuietMode.Windows
             if (timeoutMs <= 0) timeoutMs = DefaultTimeoutMs;
 
             DateTime now = DateTime.Now;
-            run.Window = ScheduleWindow.Evaluate(cfg.Schedule, now, SystemClock.Uptime());
+            TimeSpan? uptime = SystemClock.Uptime();
+            run.Window = ScheduleWindow.Evaluate(cfg.Schedule, now, uptime);
 
             DecisionInput input = new DecisionInput();
             input.Schedule = cfg.Schedule;
@@ -112,14 +113,11 @@ namespace QuietMode.Windows
             input.Window = run.Window;
             input.Trigger = run.Trigger;
             input.Now = now;
+            input.Uptime = uptime;
             input.LastRunFailed = StateMachine.IsLastRunFailed(input.State);
             // 抑制标记先对账到当前夜间窗口：窗口换了就自动松开，旧状态就补上窗口。
             StateMachine.NormalizeSuppression(input.State, cfg.Schedule, now);
-            // 开机后第一次 reconcile：上次开机前留下的手动静音不在白天恢复。
-            string manualExpired = StateMachine.ExpireStaleManualOverride(
-                input.State, run.Window, DateTime.UtcNow, SystemClock.Uptime());
             run.Decision = StateMachine.Decide(input);
-            if (manualExpired.Length > 0) run.Decision.Notes.Add(manualExpired);
 
             string resolved = ResolveAction(action, run.Decision);
             run.Action = resolved;
@@ -151,7 +149,8 @@ namespace QuietMode.Windows
 
             // 显式动作与时间窗口相反时，调度器会在下一次心跳把它改回去。
             // 不提示的话，用户会以为「点完又掉了」是操作失败。
-            if ((resolved == "day" || resolved == "restore") && run.Window != null && run.Window.Band == TimeBand.Night)
+            if ((resolved == "day" || resolved == "restore") && run.Window != null && run.Window.Band == TimeBand.Night
+                && run.Decision.State != ControllerState.ManualNormal)
                 run.Plan.Notes.Add("现在是夜间窗口，本次只生效到下一次心跳（10 分钟内）；要整夜保持在白天状态，用 qmctl apply manual-normal");
             if (resolved == "night" && run.Window != null && run.Window.Band == TimeBand.Day)
                 run.Plan.Notes.Add("现在是白天窗口，本次只生效到下一次心跳；要整白天保持在夜间状态，用 qmctl apply manual-quiet");
@@ -195,6 +194,8 @@ namespace QuietMode.Windows
                 string verdict = run.Verification != null
                     ? run.Verification.Verdict.ToString()
                     : (string.IsNullOrEmpty(run.Error) ? "NotRun" : "Failed");
+                if (!string.IsNullOrEmpty(run.Error)) verdict = "Failed";
+                List<string> messages = run.Verification == null ? null : run.Verification.Diagnostics();
                 string line = NowIso()
                               + " trigger=" + (trigger ?? "")
                               + " action=" + (string.IsNullOrEmpty(run.Action) ? "none" : run.Action)
@@ -203,9 +204,9 @@ namespace QuietMode.Windows
                               + (run.Verification == null ? "" : " drift=" + run.Verification.Classification)
                               + (run.Decision == null ? "" : " state=" + run.Decision.State)
                               + (string.IsNullOrEmpty(run.Error) ? "" : " error=" + ProcessRunner.Flatten(run.Error))
-                              + (run.Verification == null || run.Verification.Problems.Count == 0
+                              + (messages == null || messages.Count == 0
                                     ? ""
-                                    : " why=" + ProcessRunner.Flatten(run.Verification.Problems[0]))
+                                    : " why=" + ProcessRunner.Flatten(messages[0]))
                               + Environment.NewLine;
                 File.AppendAllText(path, line, new UTF8Encoding(false));
             }
@@ -269,6 +270,7 @@ namespace QuietMode.Windows
             run.ResultFile = resFile;
 
             JsonObject req = BuildRequest(cfg, run, paths);
+            req.Set("everythingQuietCycle", state == null ? "" : state.EverythingQuietCycle);
             try { PrivilegedIo.WriteNewText(reqFile, req.ToJson(true) + "\n"); }
             catch (Exception ex) { run.Error = "写入请求文件失败：" + ex.Message; return run; }
 
@@ -435,17 +437,22 @@ namespace QuietMode.Windows
             if (state == null || paths == null) return;
             try
             {
+                StateStore store = new StateStore(paths);
+                if (run.Action == "night" && store.Load().EverythingQuietCycle != state.EverythingQuietCycle)
+                {
+                    run.Ok = false;
+                    run.Error = "静音批次已切换，忽略旧夜间任务的结果";
+                    return;
+                }
                 string verdict = run.Verification == null ? "Unknown" : run.Verification.Verdict.ToString();
                 bool nightOk = string.Equals(run.Action, "night", StringComparison.OrdinalIgnoreCase)
                                && run.Verification != null && run.Verification.Verdict == ReconcileVerdict.Ok;
                 // 先把「为什么」写进状态，再写 verdict：状态文件必须能自己解释失败，
                 // 而不是显示 NightActive 却什么警告都没有。
                 state.LastDrift = run.Verification == null ? "" : run.Verification.Classification.ToString();
-                state.LastProblems = run.Verification == null
-                    ? new List<string>()
-                    : new List<string>(run.Verification.Problems.Count > 20
-                        ? run.Verification.Problems.GetRange(0, 20)
-                        : run.Verification.Problems);
+                state.LastProblems = run.Verification == null ? new List<string>() : run.Verification.Diagnostics();
+                if (state.LastProblems.Count > 20) state.LastProblems.RemoveRange(20, state.LastProblems.Count - 20);
+                if (!string.IsNullOrEmpty(run.Error)) { verdict = "Failed"; nightOk = false; }
                 StateMachine.ApplyRun(state, run.Action, verdict, run.Error, DateTime.UtcNow, nightOk, run.Trigger,
                                       StateMachine.IsScheduledDay(run.Window));
                 // 写「跑完之后停在哪」，不是「跑之前打算进哪」：照抄决策值会让 state.json
@@ -454,14 +461,15 @@ namespace QuietMode.Windows
                 {
                     state.ControllerState = ControllerStates.Settle(
                         run.Action,
-                        run.Verification != null && run.Verification.Verdict == ReconcileVerdict.Ok,
+                        verdict == "Ok",
                         run.Decision.State).ToString();
                 }
-                new StateStore(paths).Save(state);
+                store.Save(state);
                 run.StateSaved = true;
             }
             catch (Exception ex)
             {
+                run.Ok = false;
                 run.Error = (string.IsNullOrEmpty(run.Error) ? "" : run.Error + "；") + "状态写回失败：" + ex.Message;
             }
         }

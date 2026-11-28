@@ -673,7 +673,9 @@ namespace QuietMode.Ui
             else
             {
                 if (!string.IsNullOrEmpty(err)) lines.Add(err);
-                else lines.Add("验证未通过。");
+                JNode issues = ver["problems"].Count > 0 ? ver["problems"] : ver["warnings"];
+                if (issues.Count > 0) lines.Add(issues[0].AsString(""));
+                if (lines.Count == 0) lines.Add("验证未通过。");
             }
             if (!string.IsNullOrEmpty(verdictText)) lines.Add("验证：" + verdictText.Replace("\r", "").Replace("\n", "；"));
             return string.Join("\n", lines.ToArray());

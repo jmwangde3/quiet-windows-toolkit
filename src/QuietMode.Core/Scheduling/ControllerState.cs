@@ -97,6 +97,7 @@ namespace QuietMode.Core.Scheduling
         public bool LastRunFailed;
         /// <summary>决策时刻（本地）。必须由调用方显式给出，否则「今晚」无法界定。</summary>
         public DateTime Now = DateTime.Now;
+        public TimeSpan? Uptime;
     }
 
     public sealed class Decision
@@ -166,25 +167,12 @@ namespace QuietMode.Core.Scheduling
         }
 
         /// <summary>
-        /// 上次开机前留下的手动静音，不在白天开机时自动恢复。
-        ///
-        /// 手动静音是个持续覆盖（modeOn=true），它会跨关机活下来。夜里开启、第二天中午开机，
-        /// 系统就忠实地在中午把夜间链重跑一遍 —— 磁盘置离线、维护任务禁用、风扇静音。逻辑上
-        /// 没错（人确实按下过），但没有任何提示，看到的只是「中午盘掉线了」。
-        ///
-        /// 判定依据是 ModeOnSinceUtc 与本次开机时刻的比较，而不是「开机多久」：只看开机时长
-        /// 会误伤「刚开机就按下静音，一分钟后到点 reconcile」这种正常用法；反过来，如果开机
-        /// 那几次心跳没跑成，只看时长又会让守卫永远失效。
-        ///
-        /// 返回非空字符串表示已清除并给出说明，调用方把它塞进 Decision.Notes。
+        /// 自动调度在白天起点收回之前的手动静音。白天开机仍清理上次开机前的覆盖。
         /// </summary>
         public static string ExpireStaleManualOverride(QuietModeState st, WindowEvaluation w,
-                                                      DateTime nowUtc, TimeSpan? uptime)
+                                                      DateTime nowUtc, TimeSpan? uptime, bool scheduleActive = true)
         {
-            if (st == null || !st.ModeOn) return "";
-            if (w == null || w.IsNight) return "";          // 夜里保留：静音本来就是要的
-
-            DateTime bootUtc = uptime.HasValue ? nowUtc - uptime.Value : DateTime.MinValue;
+            if (st == null || !st.ModeOn || w == null || w.IsNight) return "";
 
             DateTime setUtc;
             bool hasStamp = DateTime.TryParse(st.ModeOnSinceUtc ?? "",
@@ -192,20 +180,21 @@ namespace QuietMode.Core.Scheduling
                                               System.Globalization.DateTimeStyles.AdjustToUniversal
                                               | System.Globalization.DateTimeStyles.AssumeUniversal,
                                               out setUtc);
-            if (hasStamp)
-            {
-                // 留两分钟余量吸收时钟毛刺：本次开机之后按下的，一律保留。
-                if (setUtc >= bootUtc.AddMinutes(-2)) return "";
-            }
-            else
-            {
-                // 旧状态（schema ≤ 4）没有时间戳：只有「刚开机」那几次心跳敢判定，别的时候不猜。
-                if (!uptime.HasValue || uptime.Value.TotalMinutes > BootGuardMinutes) return "";
-            }
+            bool scheduledDay = scheduleActive && IsScheduledDay(w);
+            DateTime localNow = nowUtc.ToLocalTime();
+            DateTime boundary = localNow.Date.AddMinutes(w.DayStartMinutes);
+            if (boundary > localNow) boundary = boundary.AddDays(-1);
+            bool crossed = scheduledDay && hasStamp && setUtc < boundary.ToUniversalTime();
+            bool beforeBoot = uptime.HasValue && (hasStamp
+                ? setUtc < nowUtc - uptime.Value - TimeSpan.FromMinutes(2)
+                : uptime.Value.TotalMinutes <= BootGuardMinutes);
+            if (!crossed && !beforeBoot) return "";
 
             st.ModeOn = false;
             st.ModeOnSinceUtc = "";
-            return "上次开机前开启的手动静音未在白天开机时恢复（需要静音请重新点一次）";
+            if (scheduledDay) st.PendingMorningRestore = true;
+            return beforeBoot ? "上次开机前开启的手动静音未在白天开机时恢复（需要静音请重新点一次）"
+                              : "已到白天起点，本次手动静音结束";
         }
 
         /// <summary>没有 ModeOnSinceUtc 可依据时，「刚开机」的判定阈值（分钟）。</summary>
@@ -235,6 +224,10 @@ namespace QuietMode.Core.Scheduling
                 d.Reason = "上次恢复未完成（" + (string.IsNullOrEmpty(st.Recovery.Reason) ? "未记录原因" : st.Recovery.Reason) + "）";
                 return d;
             }
+
+            string expired = ExpireStaleManualOverride(st, w, input.Now.ToUniversalTime(), input.Uptime,
+                                                       sc.Enabled && !st.SchedulePaused);
+            if (expired.Length > 0) d.Notes.Add(expired);
 
             // 2. 用户手动覆盖。
             //
@@ -273,7 +266,8 @@ namespace QuietMode.Core.Scheduling
                 // 那正是同一夜每十分钟又进一次夜间的原因。
                 d.State = ControllerState.ManualNormal;
                 d.TargetNight = false;
-                if (st.AutoSilentActive)
+                if (st.AutoSilentActive || (input.LastRunFailed &&
+                    string.Equals(st.LastReconcileAction, "day", StringComparison.OrdinalIgnoreCase)))
                 {
                     d.Action = "day";
                     d.Reason = "用户手动关闭了今晚的自动静音，正在恢复白天状态";
@@ -335,7 +329,7 @@ namespace QuietMode.Core.Scheduling
             {
                 d.State = ControllerState.EnteringDay;
                 d.Action = "day";
-                d.Reason = "夜间手动关闭后，在白天起点执行完整恢复";
+                d.Reason = "按白天起点执行完整恢复";
                 return d;
             }
             if (st.AutoSilentActive)
@@ -400,19 +394,20 @@ namespace QuietMode.Core.Scheduling
 
         /// <summary>
         /// 用户按下「关闭自动静音」：抑制标记绑定到当前夜间窗口。
-        /// 窗口之外按下去等于「跳过下一夜」，这也是用户能理解的语义。
+        /// 白天退出正在生效的静音后，下一夜照常。已经是常态时显式抑制仍能跳过下一夜。
         /// </summary>
         public static void Suppress(QuietModeState st, ScheduleSettings s, DateTime now)
         {
             if (st == null) return;
+            bool scheduledNight = ScheduleWindow.Evaluate(s, now, null).IsNight;
+            bool exitingQuiet = st.ModeOn || st.AutoSilentActive || !string.IsNullOrEmpty(st.EverythingQuietCycle);
             st.ModeOn = false;
             st.ModeOnSinceUtc = "";
-            st.AutoSilentSuppressed = true;
             st.EverythingQuietCycle = "";
             st.EverythingQuietSinceUtc = "";
-            st.AutoSilentSuppressedWindow = NightWindow.Key(s, now);
-            if (ScheduleWindow.Evaluate(s, now, null).IsNight)
-                st.PendingMorningRestore = true;
+            st.AutoSilentSuppressed = scheduledNight || !exitingQuiet;
+            st.AutoSilentSuppressedWindow = st.AutoSilentSuppressed ? NightWindow.Key(s, now) : "";
+            if (scheduledNight) st.PendingMorningRestore = true;
         }
 
         public static bool IsScheduledDay(WindowEvaluation w)

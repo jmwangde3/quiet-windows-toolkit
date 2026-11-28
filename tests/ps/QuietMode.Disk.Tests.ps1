@@ -108,3 +108,20 @@ Describe 'ConvertTo-QmName' {
         }
     }
 }
+
+Describe 'Disk write ordering' {
+    It 'rechecks the offline guard after validating the target and before Set-Disk, even with Force' {
+        InModuleScope QuietMode.Disk {
+            $disk = @{ uniqueId='fake-disk'; number=12; isOffline=$false }
+            Mock Test-QmDiskSafety { @{ allowed=$true; blocks=@(); warnings=@() } }
+            Mock Get-Disk { [pscustomobject]@{ UniqueId='fake-disk'; IsOffline=$false } }
+            Mock Set-Disk { throw 'unexpected disk write' }
+            $r = Invoke-QmDiskState -Disk $disk -Offline $true -Apply -Force -BeforeOffline { throw 'client reopened' }
+            $r.success | Should -BeFalse
+            $r.errorCode | Should -Be 'OFFLINE_DEFERRED'
+            $r.errorMessage | Should -Be 'client reopened'
+            Should -Invoke Get-Disk -Times 1 -Exactly
+            Should -Invoke Set-Disk -Times 0 -Exactly
+        }
+    }
+}

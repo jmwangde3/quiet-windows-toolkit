@@ -76,7 +76,7 @@ function Add-WorkerLog {
     } catch { }
 }
 
-foreach ($m in @('QuietMode.Common', 'QuietMode.Maintenance', 'QuietMode.Disk', 'QuietMode.Fan', 'QuietMode.Power')) {
+foreach ($m in @('QuietMode.Common', 'QuietMode.Maintenance', 'QuietMode.Disk', 'QuietMode.Fan', 'QuietMode.Power', 'QuietMode.Everything')) {
     $p = Join-Path $modDir ($m + '.psm1')
     if (-not (Test-Path -LiteralPath $p)) {
         Write-QmWorkerResult (New-QmWorkerError 'NO_MODULE' "找不到模块：$p") $ResultFile
@@ -122,8 +122,26 @@ try {
 
     $results = New-Object System.Collections.ArrayList
     $failed = 0
+    $serviceToConfirm = $null
     $diskTargets = @($req.diskTargets)
     $diskForce = [bool]$req.diskForce
+
+    $beforeOffline = $null
+    if ($action -eq 'night' -and $diskTargets.Count -gt 0) {
+        $cycle = [string]$req.everythingQuietCycle
+        $gateError = ''
+        try {
+            Confirm-QmEverythingForOffline -Root $Root -Cycle $cycle -RequestExit
+            Add-WorkerLog ('{0} [night] Everything 已退出或原本未运行' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+        } catch {
+            $gateError = $_.Exception.Message
+            Add-WorkerLog ('{0} [night] 暂缓磁盘脱机：{1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $gateError)
+        }
+        $beforeOffline = {
+            if ($gateError) { throw $gateError }
+            Confirm-QmEverythingForOffline -Root $Root -Cycle $cycle
+        }.GetNewClosure()
+    }
 
     foreach ($s in $steps) {
         $module = [string]$s.module
@@ -145,6 +163,9 @@ try {
                     $r = Invoke-QmMaintenanceStep $ms
                     [void]$sub.Add($r)
                     if ($r.status -eq 'Failed') { $mFailed++ }
+                    if ($action -in 'day','restore' -and $ms.action -eq 'StartService' -and $ms.name -eq 'SysMain') {
+                        $serviceToConfirm = $ms
+                    }
                 }
                 $detail = "$($sub.Count) 步，失败 $mFailed"
                 if ($mFailed -gt 0) {
@@ -158,12 +179,12 @@ try {
                     $detail = '没有启用的目标磁盘'
                     break
                 }
-                $r = Invoke-QmDiskOperation -Operation $op -Targets $diskTargets -Apply -Force:$diskForce
+                $r = Invoke-QmDiskOperation -Operation $op -Targets $diskTargets -Apply -Force:$diskForce -BeforeOffline $beforeOffline
                 $bad = @($r.results | Where-Object { -not $_.success })
                 $detail = "$(@($r.results).Count) 块磁盘，失败 $($bad.Count)"
                 if ($bad.Count -gt 0) {
                     $status = 'failed'
-                    $err = (($bad | ForEach-Object { "$($_.friendlyName):$($_.errorCode)" }) -join '; ')
+                    $err = (($bad | ForEach-Object { "$($_.friendlyName):$($_.errorCode) $($_.errorMessage)" }) -join '; ')
                 }
             }
             'spindown' {
@@ -208,6 +229,15 @@ try {
             }
             'verify' {
                 $detail = '由 C# 复观测做最终判定'
+                if ($null -ne $serviceToConfirm -and $failed -eq 0) {
+                    # SysMain 有过在维护步骤返回 Running 后又停止的情况。只补本次计划要求启动的服务。
+                    $confirmed = Invoke-QmMaintenanceStep $serviceToConfirm
+                    $detail += "；SysMain=$($confirmed.status) $($confirmed.observedAfter)"
+                    if ($confirmed.status -notin 'Done','Skipped') {
+                        $status = 'failed'
+                        $err = "SysMain 恢复未确认：$($confirmed.error)"
+                    }
+                }
             }
             default {
                 $status = 'failed'

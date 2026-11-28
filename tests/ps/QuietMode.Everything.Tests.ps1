@@ -97,3 +97,53 @@ Describe 'Everything follows the current QuietMode state' {
         $xml.Task.Actions.Exec.Arguments | Should -Not -Match 'WindowStyle'
     }
 }
+
+Describe 'Everything before disk offline' {
+    BeforeEach {
+        $script:cycle = '0123456789abcdef0123456789abcdef'
+        Set-EverythingTestState @{ everythingQuietCycle=$script:cycle; everythingQuietSinceUtc='2026-11-27T12:00:00Z' }
+        Mock Start-ScheduledTask -ModuleName QuietMode.Everything {}
+    }
+
+    It 'requests exit in the interactive session and waits for the client to disappear' {
+        InModuleScope QuietMode.Everything -Parameters @{ rootPath=$TestDrive; cycle=$script:cycle } {
+            param($rootPath,$cycle)
+            $script:clientReads = 0
+            Mock Get-QmEverythingClients {
+                $script:clientReads++
+                if ($script:clientReads -eq 1) { [pscustomobject]@{ StartTime=[datetime]'2026-11-26' } }
+            }
+            Confirm-QmEverythingForOffline -Root $rootPath -Cycle $cycle -RequestExit
+            Should -Invoke Start-ScheduledTask -Times 1 -Exactly -ParameterFilter {
+                $TaskName -eq 'QuietMode-Window' -and $TaskPath -eq '\Everything NightIndex\'
+            }
+            $script:clientReads | Should -Be 2
+        }
+    }
+
+    It 'allows offline without a registered task when no client is running' {
+        Mock Get-QmEverythingClients -ModuleName QuietMode.Everything {}
+        Confirm-QmEverythingForOffline -Root $TestDrive -Cycle $script:cycle -RequestExit
+        Should -Invoke Start-ScheduledTask -ModuleName QuietMode.Everything -Times 0 -Exactly
+    }
+
+    It 'blocks offline on timeout and on a task launch error' {
+        Mock Get-QmEverythingClients -ModuleName QuietMode.Everything { [pscustomobject]@{ StartTime=[datetime]'2026-11-26' } }
+        { Confirm-QmEverythingForOffline -Root $TestDrive -Cycle $script:cycle -RequestExit -TimeoutSeconds 0 } | Should -Throw '*超时*'
+        Mock Start-ScheduledTask -ModuleName QuietMode.Everything { throw 'task unavailable' }
+        { Confirm-QmEverythingForOffline -Root $TestDrive -Cycle $script:cycle -RequestExit } | Should -Throw '*task unavailable*'
+    }
+
+    It 'preserves a manual relaunch both before waiting and immediately before offline' {
+        Mock Get-QmEverythingClients -ModuleName QuietMode.Everything { [pscustomobject]@{ StartTime=[datetime]'2026-11-29' } }
+        { Confirm-QmEverythingForOffline -Root $TestDrive -Cycle $script:cycle -RequestExit } | Should -Throw '*重新打开*'
+        { Confirm-QmEverythingForOffline -Root $TestDrive -Cycle $script:cycle } | Should -Throw '*正在运行*'
+        Should -Invoke Start-ScheduledTask -ModuleName QuietMode.Everything -Times 0 -Exactly
+    }
+
+    It 'rejects stale requests after manual quiet is turned off' {
+        Set-EverythingTestState @{ everythingQuietCycle='' }
+        { Confirm-QmEverythingForOffline -Root $TestDrive -Cycle $script:cycle } | Should -Throw '*已改变*'
+        Should -Invoke Start-ScheduledTask -ModuleName QuietMode.Everything -Times 0 -Exactly
+    }
+}
